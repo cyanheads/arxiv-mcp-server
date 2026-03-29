@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.3 — 2026-03-29
+
+Added comprehensive test suite and finalized build/test configuration.
+
+### Added
+
+- Test suite with 9 test files covering all tools, resources, services, and domain types
+  - Tool tests: `arxiv_search`, `arxiv_get_metadata`, `arxiv_read_paper`, `arxiv_list_categories`
+  - Resource tests: `arxiv://paper/{paperId}`, `arxiv://categories`
+  - Service tests: `ArxivService` (search, getPapers, readContent with mocked fetch), category taxonomy, shared formatters
+- `ARXIV_CONTENT_TIMEOUT_MS` and `ARXIV_API_TIMEOUT_MS` env var definitions in `server.json`
+
+### Changed
+
+- Separated TypeScript build config: `rootDir` and `include` moved to `tsconfig.build.json`, `tsconfig.json` now includes `tests/**/*` for IDE support
+- Narrowed Vitest test include pattern to `tests/**/*.test.ts` only
+- Updated `CLAUDE.md` structure tree with `categories.ts`
+- Regenerated `docs/tree.md` with test file structure
+
 ## 0.1.2 — 2026-03-28
 
 Implemented the full MCP surface: all 4 tools, 2 resources, and the arXiv service layer.

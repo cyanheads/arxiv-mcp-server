@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 0.1.2
+**Version:** 0.1.3
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -173,6 +173,7 @@ src/
     arxiv/
       arxiv-service.ts                  # ArxivService — search, getPapers, readContent
       types.ts                          # PaperMetadata, SearchResult, PaperContent types
+      categories.ts                     # Static arXiv category taxonomy (~155 categories)
   mcp-server/
     tools/definitions/
       arxiv-search.tool.ts              # arxiv_search — query search with filters
