@@ -1,10 +1,11 @@
 # Agent Protocol
 
-**Server:** arxiv-mcp-server
+**Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
 **Version:** 0.1.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
+> **Design doc:** `docs/design.md` has full tool schemas, service design, API reference, and domain decisions.
 
 ---
 
@@ -36,39 +37,50 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ---
 
+## Domain Notes
+
+- **Read-only, no auth.** All tools are `readOnlyHint: true`. No API keys needed. `MCP_AUTH_MODE: none`.
+- **Rate limiting.** arXiv enforces a 3-second crawl delay between API requests. The `ArxivService` manages an internal request queue. HTML fetches to `arxiv.org/html` and `ar5iv` are separate domains and don't share this queue.
+- **HTML fallback.** `arxiv_read_paper` tries native arXiv HTML first (`arxiv.org/html/{id}`), falls back to ar5iv (`ar5iv.labs.arxiv.org/html/{id}`). ar5iv returns 307 redirect (not 404) for missing papers — don't follow redirects, treat 3xx as not-found.
+- **API quirks.** arXiv API returns HTTP 200 for everything — empty results, not-found IDs, and rate limiting. Rate limiting returns plain text `"Rate exceeded."` (not XML) — check content-type before parsing.
+- **Raw HTML output.** `arxiv_read_paper` returns raw HTML — no parsing or extraction. The LLM interprets the content directly. Responses can be large (500KB-3MB+); `max_characters` is the only size control.
+- **Paper ID normalization.** arXiv API always returns versioned IDs (`2401.12345v1`). Inputs accept both versioned and unversioned forms. Service strips version for API queries, preserves versioned ID from response. Returned `id` fields always include the version.
+- **Dependencies:** `fast-xml-parser` (v5, class-based API) for Atom XML parsing. No HTML parsing library needed.
+
+---
+
 ## Patterns
 
 ### Tool
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
+export const arxivSearch = tool('arxiv_search', {
+  description: 'Search arXiv papers by query with category and sort filters.',
   annotations: { readOnlyHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    query: z.string().describe('Search query with field prefixes: ti:, au:, abs:, cat:, all:. Boolean: AND, OR, ANDNOT.'),
+    max_results: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50).'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    total_results: z.number().describe('Total matching papers.'),
+    papers: z.array(PaperMetadataSchema).describe('Matching papers.'),
   }),
-  auth: ['inventory:read'],
 
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const service = getArxivService();
+    const result = await service.search(input.query, { maxResults: input.max_results }, ctx);
+    ctx.log.info('Search completed', { query: input.query, count: result.papers.length });
+    return result;
   },
 
-  // format() populates content[] — the only field most LLM clients forward to
-  // the model. Render all data the LLM needs, not just a count or title.
   format: (result) => [{
     type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
+    text: result.papers.map(p =>
+      `**${p.title}**\narXiv:${p.id} | ${p.primary_category} | ${p.published}\n${p.authors.join(', ')}\n${p.abstract}`
+    ).join('\n\n---\n\n'),
   }],
 });
 ```
@@ -77,33 +89,17 @@ export const searchItems = tool('search_items', {
 
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
+import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
+export const paperResource = resource('arxiv://paper/{paperId}', {
+  description: 'Paper metadata by arXiv ID.',
+  params: z.object({ paperId: z.string().describe('arXiv paper ID (e.g., "2401.12345").') }),
   async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw new Error(`Item ${params.itemId} not found`);
-    return item;
+    const service = getArxivService();
+    const result = await service.getPapers([params.paperId], ctx);
+    if (result.papers.length === 0) throw new Error(`Paper ${params.paperId} not found`);
+    return result.papers[0];
   },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
-  }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
 });
 ```
 
@@ -112,14 +108,18 @@ export const reviewCode = prompt('review_code', {
 ```ts
 // src/config/server-config.ts — lazy-parsed, separate from framework config
 const ServerConfigSchema = z.object({
-  myApiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
+  apiBaseUrl: z.string().default('https://export.arxiv.org/api').describe('arXiv API base URL'),
+  requestDelayMs: z.coerce.number().default(3000).describe('Minimum delay between arXiv API requests (ms)'),
+  contentTimeoutMs: z.coerce.number().default(30000).describe('Timeout for HTML content fetches (ms)'),
+  apiTimeoutMs: z.coerce.number().default(15000).describe('Timeout for API requests (ms)'),
 });
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= ServerConfigSchema.parse({
-    myApiKey: process.env.MY_API_KEY,
-    maxResults: process.env.MY_MAX_RESULTS,
+    apiBaseUrl: process.env.ARXIV_API_BASE_URL,
+    requestDelayMs: process.env.ARXIV_REQUEST_DELAY_MS,
+    contentTimeoutMs: process.env.ARXIV_CONTENT_TIMEOUT_MS,
+    apiTimeoutMs: process.env.ARXIV_API_TIMEOUT_MS,
   });
   return _config;
 }
@@ -150,17 +150,17 @@ Handlers throw — the framework catches, classifies, and formats. Three escalat
 
 ```ts
 // 1. Plain Error — framework auto-classifies from message patterns
-throw new Error('Item not found');           // → NotFound
-throw new Error('Invalid query format');     // → ValidationError
+throw new Error('Paper 2401.12345 not found');     // → NotFound
+throw new Error('Invalid arXiv ID format');         // → ValidationError
 
 // 2. Error factories — explicit code, concise
-import { notFound, validationError, forbidden, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-throw notFound('Item not found', { itemId });
-throw serviceUnavailable('API unavailable', { url }, { cause: err });
+import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+throw notFound('Paper not found', { paperId });
+throw serviceUnavailable('arXiv API unavailable', { url }, { cause: err });
 
 // 3. McpError — full control over code and data
 import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-throw new McpError(JsonRpcErrorCode.DatabaseError, 'Connection failed', { pool: 'primary' });
+throw new McpError(JsonRpcErrorCode.ServiceUnavailable, 'Rate exceeded', { retryAfterMs: 3000 });
 ```
 
 Plain `Error` is fine for most cases. Use factories when the error code matters. See framework CLAUDE.md for the full auto-classification table and all available factories.
@@ -173,18 +173,20 @@ Plain `Error` is fine for most cases. Use factories when the error code matters.
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # arXiv env vars (Zod schema)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    arxiv/
+      arxiv-service.ts                  # ArxivService — search, getPapers, readContent
+      types.ts                          # PaperMetadata, SearchResult, PaperContent types
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+      arxiv-search.tool.ts              # arxiv_search — query search with filters
+      arxiv-get-metadata.tool.ts        # arxiv_get_metadata — lookup by ID(s)
+      arxiv-read-paper.tool.ts          # arxiv_read_paper — raw HTML content
+      arxiv-list-categories.tool.ts     # arxiv_list_categories — category taxonomy
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      paper.resource.ts                 # arxiv://paper/{paperId}
+      categories.resource.ts            # arxiv://categories
 ```
 
 ---
@@ -193,10 +195,10 @@ src/
 
 | What | Convention | Example |
 |:-----|:-----------|:--------|
-| Files | kebab-case with suffix | `search-docs.tool.ts` |
-| Tool/resource/prompt names | snake_case | `search_docs` |
-| Directories | kebab-case | `src/services/doc-search/` |
-| Descriptions | Single string or template literal, no `+` concatenation | `'Search items by query and filter.'` |
+| Files | kebab-case with suffix | `arxiv-search.tool.ts` |
+| Tool/resource/prompt names | snake_case | `arxiv_search` |
+| Directories | kebab-case | `src/services/arxiv/` |
+| Descriptions | Single string or template literal, no `+` concatenation | `'Search arXiv papers by query.'` |
 
 ---
 
@@ -262,7 +264,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
 // Server's own code — via path alias
-import { getMyService } from '@/services/my-domain/my-service.js';
+import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 ```
 
 ---
