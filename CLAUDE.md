@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 0.1.0
+**Version:** 0.1.1
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -32,7 +32,6 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch`. Plain `Error` is fine; the framework catches, classifies, and formats. Use error factories (`notFound()`, `validationError()`, etc.) when the error code matters.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
 - **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
-- **Check `ctx.elicit` / `ctx.sample`** for presence before calling.
 - **Secrets in env vars only** — never hardcoded.
 
 ---
@@ -134,11 +133,7 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.list(prefix, { cursor, limit })`. Accepts any serializable value. |
-| `ctx.elicit` | Ask user for structured input. **Check for presence first:** `if (ctx.elicit) { ... }` |
-| `ctx.sample` | Request LLM completion from the client. **Check for presence first:** `if (ctx.sample) { ... }` |
-| `ctx.signal` | `AbortSignal` for cancellation. |
-| `ctx.progress` | Task progress (present when `task: true`) — `.setTotal(n)`, `.increment()`, `.update(message)`. |
+| `ctx.signal` | `AbortSignal` for cancellation. Pass to all `fetch()` calls. |
 | `ctx.requestId` | Unique request ID. |
 | `ctx.tenantId` | Tenant ID from JWT or `'default'` for stdio. |
 
@@ -253,6 +248,27 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run dev:http` | Dev mode (HTTP) |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
+
+---
+
+## Publishing
+
+When running `git_wrapup_instructions`, always apply a minimum **0.0.1** version bump unless the user specifies otherwise. After a successful wrapup flow:
+
+1. Create an annotated tag: `git tag -a v<version> -m "v<version>"`
+2. Push the commit and tag: `git push && git push --tags`
+3. Publish to npm and GHCR:
+
+```bash
+bun publish --access public
+
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/cyanheads/arxiv-mcp-server:<version> \
+  -t ghcr.io/cyanheads/arxiv-mcp-server:latest \
+  --push .
+```
+
+Remind the user to run publish commands after completing a release flow.
 
 ---
 

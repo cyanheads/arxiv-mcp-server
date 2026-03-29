@@ -1,19 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "cyanheads/arxiv-mcp-server",
-  "description": "MCP server for searching and retrieving papers from the arXiv API.",
+  "name": "io.github.cyanheads/arxiv-mcp-server",
+  "description": "MCP server for arXiv academic paper search, metadata retrieval, and full-text reading.",
   "repository": {
     "url": "https://github.com/cyanheads/arxiv-mcp-server",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "arxiv-mcp-server",
-      "runtimeHint": "node",
-      "version": "0.1.0",
+      "identifier": "@cyanheads/arxiv-mcp-server",
+      "runtimeHint": "bun",
+      "version": "0.1.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -25,6 +25,20 @@
         }
       ],
       "environmentVariables": [
+        {
+          "name": "ARXIV_API_BASE_URL",
+          "description": "arXiv API base URL.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://export.arxiv.org/api"
+        },
+        {
+          "name": "ARXIV_REQUEST_DELAY_MS",
+          "description": "Minimum delay between arXiv API requests (ms).",
+          "format": "string",
+          "isRequired": false,
+          "default": "3000"
+        },
         {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
@@ -40,9 +54,9 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "arxiv-mcp-server",
-      "runtimeHint": "node",
-      "version": "0.1.0",
+      "identifier": "@cyanheads/arxiv-mcp-server",
+      "runtimeHint": "bun",
+      "version": "0.1.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -54,6 +68,20 @@
         }
       ],
       "environmentVariables": [
+        {
+          "name": "ARXIV_API_BASE_URL",
+          "description": "arXiv API base URL.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://export.arxiv.org/api"
+        },
+        {
+          "name": "ARXIV_REQUEST_DELAY_MS",
+          "description": "Minimum delay between arXiv API requests (ms).",
+          "format": "string",
+          "isRequired": false,
+          "default": "3000"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",

@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-03-28 23:19:07
+Generated on: 2026-03-29 01:54:31
 
 ```text
 arxiv-mcp-server/
@@ -15,7 +15,8 @@ arxiv-mcp-server/
 │   └── settings.json
 ├── claude-plans/
 ├── docs/
-│   └── arxiv-mcp-server-research.md
+│   ├── arxiv-mcp-server-research.md
+│   └── design.md
 ├── scripts/
 │   ├── build.ts
 │   ├── clean.ts
@@ -90,21 +91,19 @@ arxiv-mcp-server/
 │   │       └── definitions/
 │   └── index.ts
 ├── tests/
-│   ├── prompts/
-│   │   └── echo.prompt.test.ts
-│   ├── resources/
-│   │   └── echo.resource.test.ts
-│   └── tools/
-│       └── echo.tool.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
 ├── biome.json
 ├── bun.lock
+├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
+├── LICENSE
 ├── package.json
+├── README.md
 ├── server.json
 ├── tsconfig.build.json
 ├── tsconfig.json
