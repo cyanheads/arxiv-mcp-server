@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.2 — 2026-03-28
+
+Implemented the full MCP surface: all 4 tools, 2 resources, and the arXiv service layer.
+
+### Added
+
+- `ArxivService` — unified service for arXiv API queries, HTML content fetching, rate-limited request queue (3s crawl delay), and retry with exponential backoff
+- `arxiv_search` tool — search papers by query with field prefixes, boolean operators, category filter, sorting, and pagination
+- `arxiv_get_metadata` tool — batch lookup of paper metadata by arXiv ID (up to 10 per request)
+- `arxiv_read_paper` tool — fetch full HTML content with native arXiv HTML → ar5iv fallback chain, optional `max_characters` truncation
+- `arxiv_list_categories` tool — list ~155 arXiv categories across 8 groups, with optional group filter
+- `arxiv://paper/{paperId}` resource — paper metadata by arXiv ID
+- `arxiv://categories` resource — full category taxonomy as JSON
+- `ServerConfig` — lazy-parsed Zod schema for arXiv-specific env vars (`ARXIV_API_BASE_URL`, `ARXIV_REQUEST_DELAY_MS`, `ARXIV_CONTENT_TIMEOUT_MS`, `ARXIV_API_TIMEOUT_MS`)
+- `PaperMetadataSchema` — shared Zod schema for paper metadata used across tools and resources
+- Static arXiv category taxonomy (~155 categories) embedded as typed data
+- `fast-xml-parser` v5 dependency for Atom XML parsing
+
+### Changed
+
+- Entry point now registers all tool and resource definitions and initializes ArxivService in `setup()`
+- Updated `docs/tree.md` to reflect implemented source structure
+
 ## 0.1.1 — 2026-03-28
 
 Project metadata, documentation, and packaging finalized for initial publish.

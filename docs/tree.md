@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-03-29 01:54:31
+Generated on: 2026-03-29 02:45:06
 
 ```text
 arxiv-mcp-server/
@@ -82,13 +82,28 @@ arxiv-mcp-server/
 │   └── setup/
 │       └── SKILL.md
 ├── src/
+│   ├── config/
+│   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
 │   │   │   └── definitions/
 │   │   ├── resources/
 │   │   │   └── definitions/
+│   │   │       ├── categories.resource.ts
+│   │   │       ├── index.ts
+│   │   │       └── paper.resource.ts
 │   │   └── tools/
 │   │       └── definitions/
+│   │           ├── arxiv-get-metadata.tool.ts
+│   │           ├── arxiv-list-categories.tool.ts
+│   │           ├── arxiv-read-paper.tool.ts
+│   │           ├── arxiv-search.tool.ts
+│   │           └── index.ts
+│   ├── services/
+│   │   └── arxiv/
+│   │       ├── arxiv-service.ts
+│   │       ├── categories.ts
+│   │       └── types.ts
 │   └── index.ts
 ├── tests/
 ├── .dockerignore
