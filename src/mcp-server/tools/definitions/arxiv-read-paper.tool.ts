@@ -8,8 +8,7 @@ import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
 export const arxivReadPaper = tool('arxiv_read_paper', {
   description:
-    'Fetch the full text content of an arXiv paper from its HTML rendering. ' +
-    'Tries native arXiv HTML first, falls back to ar5iv. Returns raw HTML for direct interpretation.',
+    'Fetch the full text content of an arXiv paper from its HTML rendering. Tries native arXiv HTML first, falls back to ar5iv. Returns raw HTML for direct interpretation.',
   annotations: { readOnlyHint: true },
 
   input: z.object({
@@ -18,10 +17,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       .number()
       .optional()
       .describe(
-        'Maximum characters of content to return. ' +
-          'Raw HTML can be 500KB-3MB+ for math-heavy papers. ' +
-          'Recommended: set a limit based on your context budget. ' +
-          'When truncated, a notice and total character count are included.',
+        'Maximum characters of content to return. Raw HTML can be 500KB-3MB+ for math-heavy papers. Recommended: set a limit based on your context budget. When truncated, a notice and total character count are included.',
       ),
   }),
 

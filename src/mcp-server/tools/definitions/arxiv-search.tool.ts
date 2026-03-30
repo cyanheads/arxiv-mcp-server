@@ -9,26 +9,20 @@ import { formatPaper, PaperMetadataSchema } from '@/services/arxiv/types.js';
 
 export const arxivSearch = tool('arxiv_search', {
   description:
-    'Search arXiv papers by query with category and sort filters. ' +
-    'Returns paper metadata including title, authors, abstract, categories, and links.',
+    'Search arXiv papers by query with category and sort filters. Returns paper metadata including title, authors, abstract, categories, and links.',
   annotations: { readOnlyHint: true },
 
   input: z.object({
     query: z
       .string()
       .describe(
-        'Search query. Supports field prefixes: ti: (title), au: (author), ' +
-          'abs: (abstract), cat: (category), co: (comment), jr: (journal ref), ' +
-          'all: (all fields). Boolean operators: AND, OR, ANDNOT. ' +
-          'Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".',
+        `Search query. Supports field prefixes: ti: (title), au: (author), abs: (abstract), cat: (category), co: (comment), jr: (journal ref), all: (all fields). Boolean operators: AND, OR, ANDNOT. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
       ),
     category: z
       .string()
       .optional()
       .describe(
-        'Filter by arXiv category (e.g., "cs.CL", "math.AG"). ' +
-          'Prepended as "AND cat:{category}" to the query. ' +
-          'Use arxiv_list_categories to discover valid codes.',
+        'Filter by arXiv category (e.g., "cs.CL", "math.AG"). Prepended as "AND cat:{category}" to the query. Use arxiv_list_categories to discover valid codes.',
       ),
     max_results: z
       .number()
@@ -36,8 +30,7 @@ export const arxivSearch = tool('arxiv_search', {
       .max(50)
       .default(10)
       .describe(
-        'Maximum results to return (1-50). Default 10. ' +
-          'Each result includes title, authors, abstract, and metadata — keep low to manage context budget.',
+        'Maximum results to return (1-50). Default 10. Each result includes title, authors, abstract, and metadata — keep low to manage context budget.',
       ),
     sort_by: z
       .enum(['relevance', 'submitted', 'updated'])
@@ -54,8 +47,7 @@ export const arxivSearch = tool('arxiv_search', {
       .min(0)
       .default(0)
       .describe(
-        'Pagination offset. Use with max_results to page through results. ' +
-          'E.g., start=10 with max_results=10 returns results 11-20.',
+        'Pagination offset. Use with max_results to page through results. E.g., start=10 with max_results=10 returns results 11-20.',
       ),
   }),
 

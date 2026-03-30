@@ -10,17 +10,14 @@ import { formatPaper, PaperMetadataSchema } from '@/services/arxiv/types.js';
 
 export const arxivGetMetadata = tool('arxiv_get_metadata', {
   description:
-    'Get full metadata for one or more arXiv papers by ID. ' +
-    'Use when you have known IDs from citations, prior search results, or memory.',
+    'Get full metadata for one or more arXiv papers by ID. Use when you have known IDs from citations, prior search results, or memory.',
   annotations: { readOnlyHint: true },
 
   input: z.object({
     paper_ids: z
       .union([z.string(), z.array(z.string()).min(1).max(10)])
       .describe(
-        'arXiv paper ID or array of up to 10 IDs. ' +
-          'Format: "2401.12345" or "2401.12345v2" (with version). ' +
-          'Also accepts legacy IDs like "hep-th/9901001".',
+        'arXiv paper ID or array of up to 10 IDs. Format: "2401.12345" or "2401.12345v2" (with version). Also accepts legacy IDs like "hep-th/9901001".',
       ),
   }),
 

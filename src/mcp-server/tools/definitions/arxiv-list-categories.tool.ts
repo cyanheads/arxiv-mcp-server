@@ -38,15 +38,7 @@ export const arxivListCategories = tool('arxiv_list_categories', {
   },
 
   format: (result) => {
-    const grouped = new Map<string, typeof result.categories>();
-    for (const cat of result.categories) {
-      const list = grouped.get(cat.group);
-      if (list) {
-        list.push(cat);
-      } else {
-        grouped.set(cat.group, [cat]);
-      }
-    }
+    const grouped = Map.groupBy(result.categories, (cat) => cat.group);
     const sections = [...grouped.entries()]
       .map(([group, cats]) => `## ${group}\n${cats.map((c) => `${c.code} — ${c.name}`).join('\n')}`)
       .join('\n\n');
