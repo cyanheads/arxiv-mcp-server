@@ -15,6 +15,10 @@ export const arxivSearch = tool('arxiv_search', {
   input: z.object({
     query: z
       .string()
+      .min(
+        1,
+        'Query cannot be empty. Provide a search term with optional field prefixes (ti:, au:, abs:, cat:).',
+      )
       .describe(
         `Search query. Supports field prefixes: ti: (title), au: (author), abs: (abstract), cat: (category), co: (comment), jr: (journal ref), all: (all fields). Boolean operators: AND, OR, ANDNOT. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
       ),

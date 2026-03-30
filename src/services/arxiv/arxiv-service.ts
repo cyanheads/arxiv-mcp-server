@@ -94,9 +94,34 @@ interface RawAtomEntry {
  */
 function buildApiUrl(baseUrl: string, params: Record<string, string>): string {
   const query = Object.entries(params)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v).replace(/%3A/gi, ':').replace(/%2C/gi, ',')}`)
+    .map(
+      ([k, v]) =>
+        `${encodeURIComponent(k)}=${encodeURIComponent(v).replace(/%3A/gi, ':').replace(/%2C/gi, ',')}`,
+    )
     .join('&');
   return `${baseUrl}/query?${query}`;
+}
+
+/**
+ * Strip HTML boilerplate (head, site shell, nav chrome) so truncation targets paper content.
+ * Tries to find the LaTeXML article element; falls back to stripping just <head>.
+ */
+function stripHtmlHead(html: string): string {
+  // Best: find <article> which wraps the actual paper in arXiv/ar5iv HTML
+  const articleMatch = html.match(/<article\b[^>]*>/i);
+  if (articleMatch) return html.slice(html.indexOf(articleMatch[0]));
+
+  // Fallback: find LaTeXML page main content
+  const ltxMain = html.match(/<div\s+class="ltx_page_main"/i);
+  if (ltxMain) return html.slice(html.indexOf(ltxMain[0]));
+
+  // Last resort: strip <head> and <body> tag
+  const headEnd = html.indexOf('</head>');
+  if (headEnd === -1) return html;
+  let bodyStart = headEnd + '</head>'.length;
+  const bodyTagMatch = html.slice(bodyStart, bodyStart + 200).match(/^\s*<body[^>]*>/i);
+  if (bodyTagMatch) bodyStart += bodyTagMatch[0].length;
+  return html.slice(bodyStart);
 }
 
 function stripVersion(id: string): string {
@@ -191,13 +216,15 @@ export class ArxivService {
       baseDelayMs: 2000,
     });
 
-    const totalCharacters = content.length;
+    // Strip <head> boilerplate so max_characters budget goes toward actual paper content
+    const bodyContent = stripHtmlHead(content);
+    const totalCharacters = bodyContent.length;
     const truncated = maxCharacters != null && totalCharacters > maxCharacters;
 
     return {
       paper_id: paper.id,
       title: paper.title,
-      content: truncated ? content.slice(0, maxCharacters) : content,
+      content: truncated ? bodyContent.slice(0, maxCharacters) : bodyContent,
       source,
       truncated,
       total_characters: totalCharacters,

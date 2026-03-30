@@ -12,12 +12,15 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
   annotations: { readOnlyHint: true },
 
   input: z.object({
-    paper_id: z.string().describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
+    paper_id: z
+      .string()
+      .min(1, 'Paper ID cannot be empty. Provide an arXiv ID (e.g., "2401.12345").')
+      .describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
     max_characters: z
       .number()
-      .optional()
+      .default(100_000)
       .describe(
-        'Maximum characters of content to return. Raw HTML can be 500KB-3MB+ for math-heavy papers. Recommended: set a limit based on your context budget. When truncated, a notice and total character count are included.',
+        'Maximum characters of paper body content to return. Defaults to 100,000. HTML head/boilerplate is stripped before counting. When truncated, a notice and total character count are included.',
       ),
   }),
 

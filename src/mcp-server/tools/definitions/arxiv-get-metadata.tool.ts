@@ -15,7 +15,10 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
 
   input: z.object({
     paper_ids: z
-      .union([z.string(), z.array(z.string()).min(1).max(10)])
+      .union([
+        z.string().min(1, 'Paper ID cannot be empty. Provide an arXiv ID (e.g., "2401.12345").'),
+        z.array(z.string().min(1)).min(1).max(10),
+      ])
       .describe(
         'arXiv paper ID or array of up to 10 IDs. Format: "2401.12345" or "2401.12345v2" (with version). Also accepts legacy IDs like "hep-th/9901001".',
       ),
