@@ -82,7 +82,12 @@ export const arxivSearch = tool('arxiv_search', {
 
   format: (result) => {
     if (result.papers.length === 0) {
-      return [{ type: 'text' as const, text: 'No papers found.' }];
+      return [
+        {
+          type: 'text' as const,
+          text: 'No papers found. Try broader search terms, remove field prefixes (ti:, au:), or check category codes with arxiv_list_categories.',
+        },
+      ];
     }
     const range = `${result.start + 1}-${result.start + result.papers.length}`;
     const header = `Found ${result.total_results} papers (showing ${range}):\n\n`;

@@ -87,6 +87,18 @@ interface RawAtomEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Build an arXiv API URL preserving raw colons and commas in query values.
+ * arXiv's API interprets `%3A` differently than `:` in field prefixes
+ * (ti:, au:, cat:, etc.), so standard URLSearchParams encoding breaks queries.
+ */
+function buildApiUrl(baseUrl: string, params: Record<string, string>): string {
+  const query = Object.entries(params)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v).replace(/%3A/gi, ':').replace(/%2C/gi, ',')}`)
+    .join('&');
+  return `${baseUrl}/query?${query}`;
+}
+
 function stripVersion(id: string): string {
   return id.replace(/v\d+$/, '');
 }
@@ -120,15 +132,16 @@ export class ArxivService {
     const config = getServerConfig();
     const searchQuery = options.category ? `${query} AND cat:${options.category}` : query;
 
-    const url = new URL(`${config.apiBaseUrl}/query`);
-    url.searchParams.set('search_query', searchQuery);
-    url.searchParams.set('start', String(options.start ?? 0));
-    url.searchParams.set('max_results', String(options.maxResults ?? 10));
-    url.searchParams.set('sortBy', SORT_BY_MAP[options.sortBy ?? 'relevance'] ?? 'relevance');
-    url.searchParams.set('sortOrder', options.sortOrder ?? 'descending');
+    const url = buildApiUrl(config.apiBaseUrl, {
+      search_query: searchQuery,
+      start: String(options.start ?? 0),
+      max_results: String(options.maxResults ?? 10),
+      sortBy: SORT_BY_MAP[options.sortBy ?? 'relevance'] ?? 'relevance',
+      sortOrder: options.sortOrder ?? 'descending',
+    });
 
     return withRetry(async () => {
-      const xml = await this.fetchApi(url.toString(), ctx);
+      const xml = await this.fetchApi(url, ctx);
       const feed = this.parseAtomFeed(xml);
       return { total_results: feed.totalResults, start: feed.startIndex, papers: feed.entries };
     });
@@ -137,12 +150,13 @@ export class ArxivService {
   /** Get full metadata for one or more papers by arXiv ID. */
   async getPapers(ids: string[], ctx: Context): Promise<PaperLookupResult> {
     const config = getServerConfig();
-    const url = new URL(`${config.apiBaseUrl}/query`);
-    url.searchParams.set('id_list', ids.join(','));
-    url.searchParams.set('max_results', String(ids.length));
+    const url = buildApiUrl(config.apiBaseUrl, {
+      id_list: ids.join(','),
+      max_results: String(ids.length),
+    });
 
     const result = await withRetry(async () => {
-      const xml = await this.fetchApi(url.toString(), ctx);
+      const xml = await this.fetchApi(url, ctx);
       return this.parseAtomFeed(xml);
     });
 

@@ -99,6 +99,8 @@ describe('arxivSearch', () => {
   it('formats empty results', () => {
     const blocks = arxivSearch.format?.({ total_results: 0, start: 0, papers: [] }) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toBe('No papers found.');
+    expect(text).toBe(
+      'No papers found. Try broader search terms, remove field prefixes (ti:, au:), or check category codes with arxiv_list_categories.',
+    );
   });
 });
