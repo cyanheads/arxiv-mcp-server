@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-03-29 03:29:11
+Generated on: 2026-03-30 09:53:57
 
 ```text
 arxiv-mcp-server/
@@ -14,6 +14,7 @@ arxiv-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── claude-plans/
+├── dev-logs/
 ├── docs/
 │   ├── arxiv-mcp-server-research.md
 │   └── design.md

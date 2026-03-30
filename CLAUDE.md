@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 0.1.3
+**Version:** 0.1.4
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -244,7 +244,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run devcheck` | Lint + format + typecheck + security |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting |
-| `bun test` | Run tests |
+| `bun run lint:mcp` | Validate MCP tool/resource definitions |
+| `bun run test` | Run tests (vitest) |
 | `bun run dev:stdio` | Dev mode (stdio) |
 | `bun run dev:http` | Dev mode (HTTP) |
 | `bun run start:stdio` | Production mode (stdio) |
