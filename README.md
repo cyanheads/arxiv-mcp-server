@@ -1,6 +1,6 @@
 <div align="center">
   <h1>@cyanheads/arxiv-mcp-server</h1>
-  <p><b>Search arXiv, fetch paper metadata, and read full-text content — accessible to any LLM via MCP. STDIO & Streamable HTTP.</b></p>
+  <p><b>Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO & Streamable HTTP.</b></p>
   <p><b>4 Tools · 2 Resources</b></p>
 </div>
 
