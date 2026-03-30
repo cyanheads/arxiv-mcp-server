@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6 — 2026-03-30
+
+Input validation and smarter content truncation.
+
+### Changed
+
+- `arxiv_read_paper` `max_characters` now defaults to 100,000 instead of being optional — prevents unbounded responses
+- `arxiv_read_paper` strips HTML head/boilerplate before applying `max_characters` so the character budget targets actual paper content
+- Added `.min(1)` input validation with descriptive error messages to `arxiv_search` query, `arxiv_get_metadata` paper_ids, and `arxiv_read_paper` paper_id
+
 ## 0.1.5 — 2026-03-30
 
 Search reliability and dependency update.
