@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.4 — 2026-03-30
+
+Dependency update, tool description cleanup, and modern API usage.
+
+### Changed
+
+- Updated `@cyanheads/mcp-ts-core` from ^0.2.8 to ^0.2.9
+- Added `@opentelemetry/api` as dev dependency (peer dep of mcp-ts-core)
+- Replaced string concatenation (`+`) with inline strings in all tool and field descriptions
+- Replaced manual Map grouping with `Map.groupBy()` in `arxiv_list_categories` formatter
+- Updated CLAUDE.md commands table: added `bun run lint:mcp`, fixed `bun test` → `bun run test`
+- Regenerated `docs/tree.md`
+
 ## 0.1.3 — 2026-03-29
 
 Added comprehensive test suite and finalized build/test configuration.
