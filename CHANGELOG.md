@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.7 — 2026-03-30
+
+Documentation, metadata, and public hosting updates.
+
+### Added
+
+- Public hosted instance at `https://arxiv.caseyjhand.com/mcp` — documented in README and `server.json` remotes
+- npm and Docker badges in README header
+- Funding links (GitHub Sponsors, Buy Me a Coffee) in `package.json`
+
+### Changed
+
+- Rewrote README tagline to be more descriptive and action-oriented
+- Added "Public Hosted Instance" section with Streamable HTTP client config
+- Renamed "MCP Client Configuration" to "Self-Hosted / Local" and simplified example (removed unnecessary env var)
+- Updated author field in `package.json` with email and homepage
+- Added `remotes` entry in `server.json` for the public Streamable HTTP endpoint
+
 ## 0.1.6 — 2026-03-30
 
 Input validation and smarter content truncation.
