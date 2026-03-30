@@ -1,12 +1,22 @@
 <div align="center">
   <h1>@cyanheads/arxiv-mcp-server</h1>
-  <p><b>MCP server for arXiv academic paper search, metadata retrieval, and full-text reading. STDIO & Streamable HTTP</b></p>
+  <p><b>Search arXiv, fetch paper metadata, and read full-text content — accessible to any LLM via MCP. STDIO & Streamable HTTP.</b></p>
   <p><b>4 Tools · 2 Resources</b></p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.28.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
+[![npm](https://img.shields.io/npm/v/@cyanheads/arxiv-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/arxiv-mcp-server)
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/arxiv-mcp-server)
+[![Version](https://img.shields.io/badge/Version-0.1.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
+
+[![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.28.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-6.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
+
+</div>
+
+<div align="center">
+
+**Public Hosted Server:** [https://arxiv.caseyjhand.com/mcp](https://arxiv.caseyjhand.com/mcp)
 
 </div>
 
@@ -91,20 +101,32 @@ arXiv-specific:
 
 ## Getting Started
 
-### MCP Client Configuration
+### Public Hosted Instance
+
+A public instance is available at `https://arxiv.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "arxiv": {
+      "type": "streamable-http",
+      "url": "https://arxiv.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
 
 Add to your MCP client config (e.g., `claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
-    "arxiv-mcp-server": {
+    "arxiv": {
       "type": "stdio",
       "command": "bunx",
-      "args": ["@cyanheads/arxiv-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
-      }
+      "args": ["@cyanheads/arxiv-mcp-server@latest"]
     }
   }
 }

@@ -6,14 +6,20 @@
     "url": "https://github.com/cyanheads/arxiv-mcp-server",
     "source": "github"
   },
-  "version": "0.1.6",
+  "version": "0.1.7",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://arxiv.caseyjhand.com/mcp"
+    }
+  ],
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/arxiv-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "packageArguments": [
         {
           "type": "positional",
@@ -70,7 +76,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/arxiv-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "packageArguments": [
         {
           "type": "positional",
