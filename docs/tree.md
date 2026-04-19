@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-03-30 09:53:57
+Generated on: 2026-04-19 22:05:31
 
 ```text
 arxiv-mcp-server/
@@ -25,6 +25,8 @@ arxiv-mcp-server/
 │   ├── lint-mcp.ts
 │   └── tree.ts
 ├── skills/
+│   ├── add-app-tool/
+│   │   └── SKILL.md
 │   ├── add-prompt/
 │   │   └── SKILL.md
 │   ├── add-resource/
