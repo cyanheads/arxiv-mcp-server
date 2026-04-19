@@ -55,7 +55,8 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     const lines = [
       `# ${result.title}`,
       `arXiv:${result.paper_id} | Source: ${result.source}`,
-      result.abstract_url,
+      `Abstract: ${result.abstract_url}`,
+      `PDF: ${result.pdf_url}`,
     ];
     if (result.truncated) {
       lines.push(

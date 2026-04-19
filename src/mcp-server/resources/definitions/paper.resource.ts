@@ -4,6 +4,7 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
+import { notFound } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
 export const paperResource = resource('arxiv://paper/{paperId}', {
@@ -18,7 +19,9 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     const service = getArxivService();
     const result = await service.getPapers([params.paperId], ctx);
     const [paper] = result.papers;
-    if (!paper) throw new Error(`Paper ${params.paperId} not found`);
+    if (!paper) {
+      throw notFound(`Paper '${params.paperId}' not found.`, { paperId: params.paperId });
+    }
     return paper;
   },
 });

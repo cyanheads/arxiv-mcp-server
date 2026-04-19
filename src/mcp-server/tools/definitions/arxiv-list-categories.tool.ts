@@ -39,9 +39,15 @@ export const arxivListCategories = tool('arxiv_list_categories', {
 
   format: (result) => {
     const grouped = Map.groupBy(result.categories, (cat) => cat.group);
+    const groupCount = grouped.size;
+    const total = result.categories.length;
+    const header =
+      groupCount === 1
+        ? `Showing ${total} categories in group "${[...grouped.keys()][0]}":`
+        : `Showing ${total} categories across ${groupCount} groups:`;
     const sections = [...grouped.entries()]
       .map(([group, cats]) => `## ${group}\n${cats.map((c) => `${c.code} — ${c.name}`).join('\n')}`)
       .join('\n\n');
-    return [{ type: 'text' as const, text: sections }];
+    return [{ type: 'text' as const, text: `${header}\n\n${sections}` }];
   },
 });

@@ -65,4 +65,11 @@ describe('arxivReadPaper', () => {
     expect(text).not.toContain('Truncated');
     expect(text).toContain('<html><body>Full paper content</body></html>');
   });
+
+  it('renders pdf_url so the LLM can reach the PDF without inspecting structuredContent', () => {
+    const blocks = arxivReadPaper.format?.(MOCK_CONTENT) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('PDF: https://arxiv.org/pdf/2401.12345v1');
+    expect(text).toContain('Abstract: https://arxiv.org/abs/2401.12345v1');
+  });
 });

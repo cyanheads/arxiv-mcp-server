@@ -56,13 +56,18 @@ export interface PaperContent {
 
 /** Format a PaperMetadata into a readable text block. Shared by search and get_metadata tools. */
 export function formatPaper(p: PaperMetadata): string {
-  const lines = [
-    `**${p.title}**`,
-    `arXiv:${p.id} | ${p.primary_category} | ${p.published.split('T')[0]}`,
-    p.authors.join(', '),
-    '',
-    p.abstract,
-  ];
+  const cats = [p.primary_category, ...p.categories.filter((c) => c !== p.primary_category)]
+    .filter(Boolean)
+    .join(', ');
+  const published = p.published?.split('T')[0];
+  const updated = p.updated?.split('T')[0];
+  const dateStr =
+    published && updated && updated !== published
+      ? `${published} (updated ${updated})`
+      : published || updated;
+  const meta = [`arXiv:${p.id}`, cats, dateStr].filter(Boolean).join(' | ');
+
+  const lines = [`**${p.title}**`, meta, p.authors.join(', '), '', p.abstract];
   if (p.comment) lines.push(`\nComment: ${p.comment}`);
   if (p.journal_ref) lines.push(`Journal: ${p.journal_ref}`);
   if (p.doi) lines.push(`DOI: ${p.doi}`);

@@ -7,6 +7,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
+import { PaperMetadataSchema } from '@/services/arxiv/types.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: () => ({
@@ -56,6 +57,25 @@ const ATOM_EMPTY = `<?xml version="1.0" encoding="UTF-8"?>
       xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
   <opensearch:totalResults>0</opensearch:totalResults>
   <opensearch:startIndex>0</opensearch:startIndex>
+</feed>`;
+
+// Sparse entry: omits arxiv:comment, arxiv:journal_ref, arxiv:doi,
+// arxiv:primary_category, and link elements entirely.
+const ATOM_SPARSE = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.99999v1</id>
+    <title>Sparse Paper</title>
+    <summary>Minimal abstract.</summary>
+    <author><name>Single Author</name></author>
+    <category term="cs.AI" />
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-01-22T00:00:00Z</updated>
+  </entry>
 </feed>`;
 
 function atomResponse(xml: string): Response {
@@ -180,6 +200,27 @@ describe('ArxivService.getPapers', () => {
 
     expect(result.papers).toHaveLength(1);
     expect(result.not_found).toEqual(['9999.99999']);
+  });
+
+  it('handles sparse upstream entries without fabricating optional fields', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SPARSE));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.getPapers(['2401.99999'], ctx);
+    const [paper] = result.papers;
+
+    expect(paper).toBeDefined();
+    // Output validates against the published schema even with omitted upstream fields
+    expect(() => PaperMetadataSchema.parse(paper)).not.toThrow();
+    // Genuinely-optional fields stay unset, not coerced into empty strings
+    expect(paper?.comment).toBeUndefined();
+    expect(paper?.journal_ref).toBeUndefined();
+    expect(paper?.doi).toBeUndefined();
+    // Primary category falls back to first <category> element when arxiv:primary_category is omitted
+    expect(paper?.primary_category).toBe('cs.AI');
+    // URLs derive deterministically from the paper ID when <link> elements are omitted
+    expect(paper?.pdf_url).toBe('https://arxiv.org/pdf/2401.99999v1');
+    expect(paper?.abstract_url).toBe('https://arxiv.org/abs/2401.99999v1');
   });
 });
 
