@@ -4,6 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
   apiBaseUrl: z.string().default('https://export.arxiv.org/api'),
@@ -18,11 +19,11 @@ let _config: ServerConfig | undefined;
 
 /** Lazy-parsed server config from env vars. */
 export function getServerConfig(): ServerConfig {
-  _config ??= ServerConfigSchema.parse({
-    apiBaseUrl: process.env.ARXIV_API_BASE_URL,
-    requestDelayMs: process.env.ARXIV_REQUEST_DELAY_MS,
-    contentTimeoutMs: process.env.ARXIV_CONTENT_TIMEOUT_MS,
-    apiTimeoutMs: process.env.ARXIV_API_TIMEOUT_MS,
+  _config ??= parseEnvConfig(ServerConfigSchema, {
+    apiBaseUrl: 'ARXIV_API_BASE_URL',
+    requestDelayMs: 'ARXIV_REQUEST_DELAY_MS',
+    contentTimeoutMs: 'ARXIV_CONTENT_TIMEOUT_MS',
+    apiTimeoutMs: 'ARXIV_API_TIMEOUT_MS',
   });
   return _config;
 }
