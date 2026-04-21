@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 0.1.7
+**Version:** 0.1.9
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -106,6 +106,9 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
 
 ```ts
 // src/config/server-config.ts — lazy-parsed, separate from framework config
+import { z } from '@cyanheads/mcp-ts-core';
+import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
+
 const ServerConfigSchema = z.object({
   apiBaseUrl: z.string().default('https://export.arxiv.org/api').describe('arXiv API base URL'),
   requestDelayMs: z.coerce.number().default(3000).describe('Minimum delay between arXiv API requests (ms)'),
@@ -114,15 +117,17 @@ const ServerConfigSchema = z.object({
 });
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
-  _config ??= ServerConfigSchema.parse({
-    apiBaseUrl: process.env.ARXIV_API_BASE_URL,
-    requestDelayMs: process.env.ARXIV_REQUEST_DELAY_MS,
-    contentTimeoutMs: process.env.ARXIV_CONTENT_TIMEOUT_MS,
-    apiTimeoutMs: process.env.ARXIV_API_TIMEOUT_MS,
+  _config ??= parseEnvConfig(ServerConfigSchema, {
+    apiBaseUrl: 'ARXIV_API_BASE_URL',
+    requestDelayMs: 'ARXIV_REQUEST_DELAY_MS',
+    contentTimeoutMs: 'ARXIV_CONTENT_TIMEOUT_MS',
+    apiTimeoutMs: 'ARXIV_API_TIMEOUT_MS',
   });
   return _config;
 }
 ```
+
+`parseEnvConfig` maps Zod schema paths → env var names so validation errors name the actual variable (`ARXIV_API_BASE_URL`) rather than the internal path (`apiBaseUrl`).
 
 ---
 
