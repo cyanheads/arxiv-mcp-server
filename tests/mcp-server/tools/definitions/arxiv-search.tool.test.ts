@@ -92,7 +92,9 @@ describe('arxivSearch', () => {
     const result: SearchResult = { total_results: 42, start: 0, papers: [MOCK_PAPER] };
     const blocks = arxivSearch.format?.(result) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('Found 42 papers (showing 1-1)');
+    expect(text).toContain('Found 42 papers');
+    expect(text).toContain('offset 0');
+    expect(text).toContain('showing 1-1');
     expect(text).toContain('**Attention Is All You Need**');
   });
 

@@ -94,7 +94,7 @@ export const arxivSearch = tool('arxiv_search', {
       ];
     }
     const range = `${result.start + 1}-${result.start + result.papers.length}`;
-    const header = `Found ${result.total_results} papers (showing ${range}):\n\n`;
+    const header = `Found ${result.total_results} papers (offset ${result.start}, showing ${range}):\n\n`;
     const papers = result.papers.map(formatPaper).join('\n\n---\n\n');
     return [{ type: 'text' as const, text: header + papers }];
   },

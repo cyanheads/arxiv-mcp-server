@@ -71,6 +71,8 @@ export function formatPaper(p: PaperMetadata): string {
   if (p.comment) lines.push(`\nComment: ${p.comment}`);
   if (p.journal_ref) lines.push(`Journal: ${p.journal_ref}`);
   if (p.doi) lines.push(`DOI: ${p.doi}`);
+  lines.push(`Published: ${p.published} | Updated: ${p.updated}`);
+  lines.push(`Abstract: ${p.abstract_url}`);
   lines.push(`PDF: ${p.pdf_url}`);
   return lines.join('\n');
 }
