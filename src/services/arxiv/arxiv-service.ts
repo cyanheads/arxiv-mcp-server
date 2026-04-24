@@ -6,7 +6,7 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { notFound, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { XMLParser } from 'fast-xml-parser';
 import { getServerConfig } from '@/config/server-config.js';
 import type {
@@ -266,7 +266,13 @@ export class ArxivService {
       }
 
       if (!response.ok) {
-        throw new TransientError(`arXiv API returned HTTP ${response.status}`);
+        // 429 and 5xx are transient — retry. Other 4xx are permanent client
+        // errors (bad query, malformed ID list); retrying wastes latency and
+        // amplifies upstream load without any chance of success.
+        if (response.status === 429 || response.status >= 500) {
+          throw new TransientError(`arXiv API returned HTTP ${response.status}`);
+        }
+        throw validationError(`arXiv API returned HTTP ${response.status}`);
       }
 
       return text;

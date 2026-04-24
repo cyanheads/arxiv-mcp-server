@@ -171,6 +171,59 @@ describe('ArxivService.search', () => {
     expect(result.papers).toHaveLength(1);
     expect(mockFetch).toHaveBeenCalledTimes(2);
   }, 10_000);
+
+  it('fails fast on 4xx without retrying', async () => {
+    // arXiv returns HTTP 400 for bad input (e.g., non-integer max_results) with
+    // an atom+xml content-type. These are permanent client errors and must not
+    // be retried — see https://github.com/cyanheads/arxiv-mcp-server/issues/1.
+    mockFetch.mockResolvedValueOnce(
+      new Response('<feed/>', {
+        status: 400,
+        headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
+      }),
+    );
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.search('bad query', {}, ctx)).rejects.toThrow(/HTTP 400/);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries on 5xx transient server error', async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response('<feed/>', {
+          status: 503,
+          headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
+        }),
+      )
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.search('all:test', {}, ctx);
+
+    expect(result.papers).toHaveLength(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  }, 10_000);
+
+  it('retries on HTTP 429 rate-limit status', async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response('<feed/>', {
+          status: 429,
+          headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
+        }),
+      )
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.search('all:test', {}, ctx);
+
+    expect(result.papers).toHaveLength(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  }, 10_000);
 });
 
 // ---------------------------------------------------------------------------
