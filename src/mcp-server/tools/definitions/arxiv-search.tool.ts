@@ -15,10 +15,18 @@ export const arxivSearch = tool('arxiv_search', {
   input: z.object({
     query: z
       .string()
+      .trim()
       .min(
         1,
         'Query cannot be empty. Provide a search term with optional field prefixes (ti:, au:, abs:, cat:).',
       )
+      .max(
+        1000,
+        'Query is too long (max 1000 chars). Use arXiv field prefixes (ti:, au:, abs:, cat:) to narrow the search instead.',
+      )
+      // Reject C0 control characters except tab (\x09), LF (\x0A), CR (\x0D); arXiv tolerates those in query whitespace.
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — this regex filters them out.
+      .regex(/^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$/, 'Query contains control characters.')
       .describe(
         `Search query. Supports field prefixes: ti: (title), au: (author), abs: (abstract), cat: (category), co: (comment), jr: (journal ref), all: (all fields). Boolean operators: AND, OR, ANDNOT. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
       ),
@@ -30,6 +38,7 @@ export const arxivSearch = tool('arxiv_search', {
       ),
     max_results: z
       .number()
+      .int()
       .min(1)
       .max(50)
       .default(10)
@@ -48,10 +57,15 @@ export const arxivSearch = tool('arxiv_search', {
       .describe('Sort direction. "descending" returns newest/most relevant first.'),
     start: z
       .number()
+      .int()
       .min(0)
+      .max(
+        10_000,
+        'Pagination offset too deep (max 10000). arXiv returns 500s for very deep offsets.',
+      )
       .default(0)
       .describe(
-        'Pagination offset. Use with max_results to page through results. E.g., start=10 with max_results=10 returns results 11-20.',
+        'Pagination offset (0-10000). Use with max_results to page through results. E.g., start=10 with max_results=10 returns results 11-20.',
       ),
   }),
 
