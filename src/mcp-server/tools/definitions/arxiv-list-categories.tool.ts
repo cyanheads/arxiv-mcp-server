@@ -6,11 +6,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { ARXIV_CATEGORIES, GROUPS } from '@/services/arxiv/categories.js';
 
-const CategorySchema = z.object({
-  code: z.string().describe('Category code (e.g., "cs.AI").'),
-  name: z.string().describe('Full name (e.g., "Artificial Intelligence").'),
-  group: z.string().describe('Top-level group (e.g., "cs").'),
-});
+const CategorySchema = z
+  .object({
+    code: z.string().describe('Category code (e.g., "cs.AI").'),
+    name: z.string().describe('Full name (e.g., "Artificial Intelligence").'),
+    group: z.string().describe('Top-level group (e.g., "cs").'),
+  })
+  .describe('arXiv category — subject code, full name, and top-level group.');
 
 export const arxivListCategories = tool('arxiv_list_categories', {
   description:

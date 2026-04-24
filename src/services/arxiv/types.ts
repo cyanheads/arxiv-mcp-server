@@ -6,21 +6,23 @@
 import { z } from '@cyanheads/mcp-ts-core';
 
 /** Shared schema for paper metadata — used by search, get_metadata, and resource outputs. */
-export const PaperMetadataSchema = z.object({
-  id: z.string().describe('arXiv paper ID (e.g., "2401.12345v1").'),
-  title: z.string().describe('Paper title.'),
-  authors: z.array(z.string()).describe('Author names.'),
-  abstract: z.string().describe('Full abstract text.'),
-  primary_category: z.string().describe('Primary arXiv category (e.g., "cs.CL").'),
-  categories: z.array(z.string()).describe('All arXiv categories assigned to this paper.'),
-  published: z.string().describe('Original submission date (ISO 8601).'),
-  updated: z.string().describe('Last update date (ISO 8601).'),
-  comment: z.string().optional().describe('Author comment (e.g., page count, conference).'),
-  journal_ref: z.string().optional().describe('Journal reference if published.'),
-  doi: z.string().optional().describe('DOI if available.'),
-  pdf_url: z.string().describe('Direct PDF download URL.'),
-  abstract_url: z.string().describe('arXiv abstract page URL.'),
-});
+export const PaperMetadataSchema = z
+  .object({
+    id: z.string().describe('arXiv paper ID (e.g., "2401.12345v1").'),
+    title: z.string().describe('Paper title.'),
+    authors: z.array(z.string()).describe('Author names.'),
+    abstract: z.string().describe('Full abstract text.'),
+    primary_category: z.string().describe('Primary arXiv category (e.g., "cs.CL").'),
+    categories: z.array(z.string()).describe('All arXiv categories assigned to this paper.'),
+    published: z.string().describe('Original submission date (ISO 8601).'),
+    updated: z.string().describe('Last update date (ISO 8601).'),
+    comment: z.string().optional().describe('Author comment (e.g., page count, conference).'),
+    journal_ref: z.string().optional().describe('Journal reference if published.'),
+    doi: z.string().optional().describe('DOI if available.'),
+    pdf_url: z.string().describe('Direct PDF download URL.'),
+    abstract_url: z.string().describe('arXiv abstract page URL.'),
+  })
+  .describe('arXiv paper metadata — identifier, title, authors, abstract, categories, and links.');
 
 export type PaperMetadata = z.infer<typeof PaperMetadataSchema>;
 
