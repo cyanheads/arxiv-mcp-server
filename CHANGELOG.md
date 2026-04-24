@@ -1,187 +1,47 @@
 # Changelog
 
-## 0.1.9 — 2026-04-20
+All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
-Framework refresh to `@cyanheads/mcp-ts-core` 0.5.3, with format-parity fixes and better config error messages.
+## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-04-24
 
-### Added
+Framework refresh to @cyanheads/mcp-ts-core 0.6.16 — adopted directory-based changelog, recursive describe-on-fields lint fixes, synced skills/scripts
 
-- `arxiv_search` `format()` header now includes raw `start` offset — `Found N papers (offset X, showing Y-Z):`
-- `formatPaper` (shared by search + get_metadata) now emits raw `Published: <ISO>`, `Updated: <ISO>`, and `Abstract: <url>` lines alongside the existing human-readable meta line
-- `arxiv_read_paper` `format()` now always renders `Total: N chars` (with `(truncated)` suffix when applicable), not just on truncation
+## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-04-20
 
-### Changed
+Framework refresh to @cyanheads/mcp-ts-core 0.5.3 — format-parity fixes across tools, parseEnvConfig for better env-var validation errors
 
-- Updated `@cyanheads/mcp-ts-core` from `^0.3.7` to `^0.5.3` — brings `format-parity` lint rule (v0.5.2), `parseEnvConfig` helper (v0.5.0), and the new CLAUDE.md/AGENTS.md docs-sync devcheck step (v0.5.3)
-- `src/config/server-config.ts` now uses `parseEnvConfig` so validation errors name the actual env var (e.g., `ARXIV_API_BASE_URL`) instead of the internal Zod path (`apiBaseUrl`)
-- Bumped `@hono/node-server` 1 → 2 transitively via framework
-- Synced 7 project skills to framework 0.5.3 (`add-tool`, `api-config`, `design-mcp-server`, `field-test`, `maintenance`, `polish-docs-meta`, `setup`) and refreshed `.claude/skills/` copies, including the previously-missing `add-app-tool`
-- Updated `CLAUDE.md` server-config example to show the `parseEnvConfig` pattern
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-04-19
 
-### Fixed
+Tool/resource quality improvements aligned with new framework skill patterns, plus a dependency refresh to mcp-ts-core 0.3.7
 
-- Four `arxiv_search` + two `arxiv_get_metadata` + one `arxiv_read_paper` format-parity lint violations surfaced by v0.5.2 — every output field now appears in the rendered `content[]`, not just `structuredContent`
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-03-30
 
-## 0.1.8 — 2026-04-19
+Public hosted instance at arxiv.caseyjhand.com/mcp, README tagline rewrite, npm/Docker badges, funding links
 
-Tool/resource quality improvements aligned with the new framework skill patterns, plus a dependency refresh.
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-03-30
 
-### Added
+arxiv_read_paper max_characters defaults to 100k, strips HTML head/boilerplate before truncation, descriptive input validation
 
-- `arxiv_read_paper` `format()` now renders both `Abstract:` and `PDF:` URLs in `content[]` so chaining links are visible to LLM clients that don't surface `structuredContent`
-- `arxiv_list_categories` `format()` prepends an operational header — `Showing N categories in group "X":` for filtered queries, `Showing N categories across M groups:` for the full taxonomy
-- `formatPaper` (shared by search + get_metadata) renders the full categories list and appends `(updated YYYY-MM-DD)` when the paper has been revised
-- Sparse-upstream test fixture (`ATOM_SPARSE`) and four new `formatPaper` tests covering trailing-pipe guards, multi-category rendering, and update-date branches
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-03-30
 
-### Changed
+Search reliability — raw-colon field prefixes instead of percent-encoded, better empty-result messaging, mcp-ts-core 0.2.10
 
-- `paper.resource` throws `notFound()` factory instead of plain `Error` — error now surfaces as JSON-RPC `-32001 NotFound` instead of `-32603 InternalError`
-- `formatPaper` filters empty meta segments — sparse upstream entries no longer produce trailing-pipe artifacts like `arXiv:X | cs.CL | `
-- Updated `@cyanheads/mcp-ts-core` from `^0.2.10` to `^0.3.7`
-- Updated `fast-xml-parser` from `^5.5.9` to `^5.7.1`
-- Updated `@biomejs/biome`, `@types/node`, `typescript`, `vitest` to latest patch releases
-- Synced project skills to framework 0.3.7 (added `add-app-tool`, updated 13 existing)
+## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-03-30
 
-### Fixed
+mcp-ts-core 0.2.9 refresh, description cleanup (no string concat), Map.groupBy() modernization
 
-- Cleared transitive `vite` (8.0.3 → 8.0.8) and `lodash` (4.17.23 → 4.18.1) advisories by regenerating `bun.lock` — `bun audit` now clean
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-03-29
 
-## 0.1.7 — 2026-03-30
+Comprehensive test suite (9 files, all tools/resources/services covered); finalized TypeScript build and Vitest config
 
-Documentation, metadata, and public hosting updates.
+## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-03-28
 
-### Added
+Full MCP surface implemented — 4 tools, 2 resources, ArxivService with rate-limited request queue and HTML fallback chain
 
-- Public hosted instance at `https://arxiv.caseyjhand.com/mcp` — documented in README and `server.json` remotes
-- npm and Docker badges in README header
-- Funding links (GitHub Sponsors, Buy Me a Coffee) in `package.json`
+## [0.1.1](changelog/0.1.x/0.1.1.md) — 2026-03-28
 
-### Changed
+Project metadata, documentation, and packaging finalized for initial publish — README, LICENSE, scoped package name
 
-- Rewrote README tagline to be more descriptive and action-oriented
-- Added "Public Hosted Instance" section with Streamable HTTP client config
-- Renamed "MCP Client Configuration" to "Self-Hosted / Local" and simplified example (removed unnecessary env var)
-- Updated author field in `package.json` with email and homepage
-- Added `remotes` entry in `server.json` for the public Streamable HTTP endpoint
+## [0.1.0](changelog/0.1.x/0.1.0.md) — 2026-03-28
 
-## 0.1.6 — 2026-03-30
-
-Input validation and smarter content truncation.
-
-### Changed
-
-- `arxiv_read_paper` `max_characters` now defaults to 100,000 instead of being optional — prevents unbounded responses
-- `arxiv_read_paper` strips HTML head/boilerplate before applying `max_characters` so the character budget targets actual paper content
-- Added `.min(1)` input validation with descriptive error messages to `arxiv_search` query, `arxiv_get_metadata` paper_ids, and `arxiv_read_paper` paper_id
-
-## 0.1.5 — 2026-03-30
-
-Search reliability and dependency update.
-
-### Changed
-
-- Built arXiv API URLs without `URLSearchParams` encoding — raw colons in field prefixes (`ti:`, `au:`, `cat:`) are handled ~100x faster by arXiv than percent-encoded `%3A`
-- Improved empty search results message with actionable suggestions (broader terms, field prefix removal, category code check)
-- Updated `@cyanheads/mcp-ts-core` from ^0.2.9 to ^0.2.10
-
-### Fixed
-
-- Search queries with field prefixes (`ti:`, `au:`, `cat:`) no longer percent-encode colons, which caused arXiv API to return fewer or no results
-
-## 0.1.4 — 2026-03-30
-
-Dependency update, tool description cleanup, and modern API usage.
-
-### Changed
-
-- Updated `@cyanheads/mcp-ts-core` from ^0.2.8 to ^0.2.9
-- Added `@opentelemetry/api` as dev dependency (peer dep of mcp-ts-core)
-- Replaced string concatenation (`+`) with inline strings in all tool and field descriptions
-- Replaced manual Map grouping with `Map.groupBy()` in `arxiv_list_categories` formatter
-- Updated CLAUDE.md commands table: added `bun run lint:mcp`, fixed `bun test` → `bun run test`
-- Regenerated `docs/tree.md`
-
-## 0.1.3 — 2026-03-29
-
-Added comprehensive test suite and finalized build/test configuration.
-
-### Added
-
-- Test suite with 9 test files covering all tools, resources, services, and domain types
-  - Tool tests: `arxiv_search`, `arxiv_get_metadata`, `arxiv_read_paper`, `arxiv_list_categories`
-  - Resource tests: `arxiv://paper/{paperId}`, `arxiv://categories`
-  - Service tests: `ArxivService` (search, getPapers, readContent with mocked fetch), category taxonomy, shared formatters
-- `ARXIV_CONTENT_TIMEOUT_MS` and `ARXIV_API_TIMEOUT_MS` env var definitions in `server.json`
-
-### Changed
-
-- Separated TypeScript build config: `rootDir` and `include` moved to `tsconfig.build.json`, `tsconfig.json` now includes `tests/**/*` for IDE support
-- Narrowed Vitest test include pattern to `tests/**/*.test.ts` only
-- Updated `CLAUDE.md` structure tree with `categories.ts`
-- Regenerated `docs/tree.md` with test file structure
-
-## 0.1.2 — 2026-03-28
-
-Implemented the full MCP surface: all 4 tools, 2 resources, and the arXiv service layer.
-
-### Added
-
-- `ArxivService` — unified service for arXiv API queries, HTML content fetching, rate-limited request queue (3s crawl delay), and retry with exponential backoff
-- `arxiv_search` tool — search papers by query with field prefixes, boolean operators, category filter, sorting, and pagination
-- `arxiv_get_metadata` tool — batch lookup of paper metadata by arXiv ID (up to 10 per request)
-- `arxiv_read_paper` tool — fetch full HTML content with native arXiv HTML → ar5iv fallback chain, optional `max_characters` truncation
-- `arxiv_list_categories` tool — list ~155 arXiv categories across 8 groups, with optional group filter
-- `arxiv://paper/{paperId}` resource — paper metadata by arXiv ID
-- `arxiv://categories` resource — full category taxonomy as JSON
-- `ServerConfig` — lazy-parsed Zod schema for arXiv-specific env vars (`ARXIV_API_BASE_URL`, `ARXIV_REQUEST_DELAY_MS`, `ARXIV_CONTENT_TIMEOUT_MS`, `ARXIV_API_TIMEOUT_MS`)
-- `PaperMetadataSchema` — shared Zod schema for paper metadata used across tools and resources
-- Static arXiv category taxonomy (~155 categories) embedded as typed data
-- `fast-xml-parser` v5 dependency for Atom XML parsing
-
-### Changed
-
-- Entry point now registers all tool and resource definitions and initializes ArxivService in `setup()`
-- Updated `docs/tree.md` to reflect implemented source structure
-
-## 0.1.1 — 2026-03-28
-
-Project metadata, documentation, and packaging finalized for initial publish.
-
-### Added
-
-- README with full tool/resource docs, configuration table, getting started guide, and project structure
-- LICENSE file (Apache 2.0)
-- `bunfig.toml` for Bun runtime and install configuration
-- arXiv-specific environment variables in `.env.example`
-- arXiv env vars (`ARXIV_API_BASE_URL`, `ARXIV_REQUEST_DELAY_MS`) in `server.json` package definitions
-- OCI image labels (description, source) in Dockerfile
-
-### Changed
-
-- Scoped package name to `@cyanheads/arxiv-mcp-server`
-- Server manifest name to `io.github.cyanheads/arxiv-mcp-server` with `bun` runtimeHint
-- Package metadata: added description, keywords, repository/homepage/bugs URLs, author, bun engine requirement, packageManager
-- Simplified CLAUDE.md context table — removed unused `ctx.elicit`, `ctx.sample`, `ctx.state`, `ctx.progress` references
-- Regenerated `docs/tree.md` with current directory structure
-- Added `tsx` to devcheck ignored dependencies
-
-## 0.1.0 — 2026-03-28
-
-Initial release. Scaffolded from `@cyanheads/mcp-ts-core` and designed the full MCP surface for arXiv paper search, metadata retrieval, and content reading.
-
-### Added
-
-- Project scaffold via `@cyanheads/mcp-ts-core` with stdio and HTTP transport support
-- Design document (`docs/design.md`) covering tool schemas, service architecture, API reference, and domain decisions
-- Agent protocol (`CLAUDE.md`) with arXiv-specific domain notes, patterns, error handling, and naming conventions
-- Directory structure documentation (`docs/tree.md`)
-
-### Designed (not yet implemented)
-
-- `arxiv_search` — search papers by query with category and sort filters
-- `arxiv_get_metadata` — lookup paper metadata by arXiv ID(s)
-- `arxiv_read_paper` — fetch full HTML content with ar5iv fallback
-- `arxiv_list_categories` — list arXiv category taxonomy
-- `arxiv://paper/{paperId}` resource — paper metadata by ID
-- `arxiv://categories` resource — full category taxonomy
-- `ArxivService` — unified service for API queries, HTML content fetching, rate limiting, and retry
+Initial release — scaffolded from @cyanheads/mcp-ts-core with full MCP surface design for arXiv paper search, metadata, and content reading
