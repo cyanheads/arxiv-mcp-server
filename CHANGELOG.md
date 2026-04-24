@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-04-24
+
+Fail fast on permanent 4xx from arXiv API, and harden arxiv_search / arxiv_read_paper input schemas to reject values arXiv would return 400/500 for
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-04-24
 
 Framework refresh to @cyanheads/mcp-ts-core 0.6.16 — adopted directory-based changelog, recursive describe-on-fields lint fixes, synced skills/scripts
