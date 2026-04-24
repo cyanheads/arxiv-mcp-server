@@ -4,7 +4,7 @@ description: >
   Investigate, adopt, and verify dependency updates — with special handling for `@cyanheads/mcp-ts-core`. Captures what changed, understands why, cross-references against the codebase, adopts framework improvements, syncs project skills, and runs final checks. Supports two entry modes: run the full flow end-to-end, or review updates you already applied.
 metadata:
   author: cyanheads
-  version: "1.3"
+  version: "1.4"
   audience: external
   type: workflow
 ---
@@ -50,13 +50,18 @@ Do not redo this investigation inline — the `changelog` skill handles tag-form
 
 ### 4. Framework review (`@cyanheads/mcp-ts-core`)
 
-If `@cyanheads/mcp-ts-core` was updated, do a deeper pass beyond what the `changelog` skill covers. Read:
+If `@cyanheads/mcp-ts-core` was updated, do a deeper pass beyond what the `changelog` skill covers. The framework ships a **directory-based changelog** grouped by minor series (`.x` semver-wildcard convention) — one file per released version at `node_modules/@cyanheads/mcp-ts-core/changelog/<major.minor>.x/<version>.md`. Read only the files between old and new rather than scanning a monolithic file.
 
-```bash
-node_modules/@cyanheads/mcp-ts-core/CHANGELOG.md
-```
+Example — `0.5.2 → 0.5.4` means reading two new version files:
 
-Extract entries between the old and new version. Scan specifically for:
+- `node_modules/@cyanheads/mcp-ts-core/changelog/0.5.x/0.5.3.md`
+- `node_modules/@cyanheads/mcp-ts-core/changelog/0.5.x/0.5.4.md`
+
+Cross-series updates span multiple directories — e.g., `0.4.1 → 0.5.2` reads `0.5.x/0.5.0.md`, `0.5.x/0.5.1.md`, `0.5.x/0.5.2.md`. Enumerate the series directories under `node_modules/@cyanheads/mcp-ts-core/changelog/` to find the relevant files.
+
+If the per-version directory isn't present (pre-0.5.5 releases, or downstream package that hasn't adopted the convention), fall back to the monolithic rollup at `node_modules/@cyanheads/mcp-ts-core/CHANGELOG.md` and extract the relevant sections manually.
+
+Scan specifically for:
 
 | Area | Adoption Check |
 |:-----|:---------------|
@@ -70,17 +75,13 @@ Extract entries between the old and new version. Scan specifically for:
 
 Cross-reference each finding against the server's code. Collect adoption opportunities for Step 6.
 
-**Template review.** The framework also ships `templates/CLAUDE.md` and `templates/AGENTS.md` as scaffolding for consumer agent protocol files. The consumer's `CLAUDE.md`/`AGENTS.md` was copied at init time and has since diverged (local customizations, echo replacements, server-specific sections). Read the upstream template fresh:
-
-```bash
-node_modules/@cyanheads/mcp-ts-core/templates/CLAUDE.md
-```
+**Template review.** The framework also ships `templates/CLAUDE.md` and `templates/AGENTS.md` as scaffolding for consumer agent protocol files. The consumer's `CLAUDE.md`/`AGENTS.md` was copied at init time and has since diverged (local customizations, echo replacements, server-specific sections). Read the upstream template fresh at `node_modules/@cyanheads/mcp-ts-core/templates/CLAUDE.md`.
 
 Skip the mechanical diff — consumer customizations create too much noise to filter. Instead, read end-to-end with fresh eyes, mentally comparing against the current `CLAUDE.md`. Look for: new conventions, updated skill references, expanded checklists, new callouts, clearer explanations, restructured sections. Present findings; let the user cherry-pick what to adopt. Never auto-merge — the consumer's file is theirs.
 
-### 5. Sync project skills
+### 5. Sync project skills and scripts
 
-Skills flow in two hops: package → project `skills/` → agent directories.
+Skills flow in two hops: package → project `skills/` → agent directories. Framework scripts flow in one: package → project `scripts/`. Both drift silently unless resynced.
 
 **Phase A — Package → Project `skills/`**
 
@@ -115,7 +116,27 @@ For each agent directory that exists:
 
 If no agent directory exists, skip Phase B — the project hasn't opted in to per-agent skill copies.
 
-**Report** which skills were added/updated in Phase A (with version deltas) and which agent directories were refreshed in Phase B. The user needs to know what new guidance is now available and where.
+**Phase C — Package scripts → Project `scripts/`**
+
+The `init` CLI scaffolds a fixed set of framework scripts into consumer projects — these underpin `bun run build`, `bun run devcheck`, `bun run lint:mcp`, `bun run tree`, and the changelog build. They drift silently when the framework updates them. Compare by content hash and overwrite on mismatch:
+
+```bash
+for s in build-changelog.ts build.ts check-docs-sync.ts check-skills-sync.ts clean.ts devcheck.ts lint-mcp.ts tree.ts; do
+  src="node_modules/@cyanheads/mcp-ts-core/scripts/$s"
+  dst="scripts/$s"
+  [ -f "$src" ] || continue
+  if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+    cp "$src" "$dst"
+    echo "synced: $s"
+  fi
+done
+```
+
+Do not touch scripts in `scripts/` that aren't in the list above — those are project-specific (custom deploy, codegen, etc.).
+
+If the consumer customized a framework script, the overwrite discards those changes. `git diff scripts/` surfaces the replacements immediately after the sync runs — review the diff before committing, and use `git restore scripts/<file>` if a specific local customization needs to be preserved.
+
+**Report** which skills were added/updated in Phase A (with version deltas), which agent directories were refreshed in Phase B, and which scripts were resynced in Phase C. The user needs to know what new guidance and tooling is now in play.
 
 ### 6. Adopt changes in the codebase
 
@@ -161,6 +182,7 @@ Present a concise numbered summary to the user:
 - [ ] Adoption opportunities identified and applied
 - [ ] Project `skills/` synced from package (Phase A), with a change report
 - [ ] Agent skill directories (`.claude/skills/`, `.agents/skills/`, etc.) refreshed from project `skills/` (Phase B)
+- [ ] Framework `scripts/` resynced from package via content-hash compare (Phase C), with a change report; `git diff scripts/` reviewed before committing
 - [ ] `bun run rebuild` succeeds
 - [ ] `bun run devcheck` passes (includes audit + outdated)
 - [ ] `bun run test` passes
