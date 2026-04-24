@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "MCP server for arXiv academic paper search, metadata retrieval, and full-text reading.",
   "mcpName": "io.github.cyanheads/arxiv-mcp-server",
   "type": "module",
@@ -64,7 +64,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.6.16",
+    "@cyanheads/mcp-ts-core": "^0.6.17",
     "fast-xml-parser": "^5.7.1",
     "pino-pretty": "^13.1.3"
   },
