@@ -18,6 +18,8 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       .describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
     max_characters: z
       .number()
+      .int()
+      .min(1)
       .default(100_000)
       .describe(
         'Maximum characters of paper body content to return. Defaults to 100,000. HTML head/boilerplate is stripped before counting. When truncated, a notice and total character count are included.',
