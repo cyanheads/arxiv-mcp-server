@@ -221,3 +221,57 @@ export const ARXIV_CATEGORIES: readonly ArxivCategory[] = [
   c('stat.OT', 'Other Statistics'),
   c('stat.TH', 'Statistics Theory'),
 ];
+
+/** Fast lookup set for validating category codes against the taxonomy. */
+export const VALID_CATEGORY_CODES: ReadonlySet<string> = new Set(
+  ARXIV_CATEGORIES.map((c) => c.code),
+);
+
+/**
+ * Suggest up to `limit` valid category codes closest to an invalid input.
+ * Prefers codes sharing the archive prefix ("cs.INVALID" → "cs.AI", "cs.CC", ...);
+ * falls back to closest match by edit distance when no prefix matches.
+ */
+export function suggestCategories(code: string, limit = 5): string[] {
+  const trimmed = code.trim();
+  if (!trimmed) return [];
+  const prefix = trimmed.split('.')[0]?.toLowerCase();
+
+  if (prefix) {
+    const prefixed = ARXIV_CATEGORIES.filter(
+      (cat) => cat.code.toLowerCase().startsWith(`${prefix}.`) || cat.code.toLowerCase() === prefix,
+    );
+    if (prefixed.length > 0) return prefixed.slice(0, limit).map((cat) => cat.code);
+  }
+
+  const lower = trimmed.toLowerCase();
+  return ARXIV_CATEGORIES.map((cat) => ({
+    code: cat.code,
+    d: editDistance(lower, cat.code.toLowerCase()),
+  }))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, limit)
+    .map((x) => x.code);
+}
+
+/** Iterative Levenshtein distance — O(m*n) time, O(min(m,n)) space. */
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  const curr = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const del = (prev[j] ?? 0) + 1;
+      const ins = (curr[j - 1] ?? 0) + 1;
+      const sub = (prev[j - 1] ?? 0) + cost;
+      curr[j] = Math.min(del, ins, sub);
+    }
+    prev = [...curr];
+  }
+  return prev[n] ?? 0;
+}

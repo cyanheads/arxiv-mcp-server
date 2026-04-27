@@ -4,7 +4,7 @@ description: >
   MCP definition linter rules reference. Use when `bun run lint:mcp`, `bun run devcheck`, or `createApp()` startup reports a lint error or warning (`format-parity`, `schema-is-object`, `name-format`, `server-json-*`, etc.) and you need to understand the rule, its severity, and how to fix it. Every rule ID the linter emits has an entry in this doc.
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.2"
   audience: external
   type: reference
 ---
@@ -134,7 +134,34 @@ input: z.object({ items: z.array(z.string()).describe('List of items') })
 
 Every field in `input`, `output`, `params`, or `args` needs a `.describe('...')` call. Descriptions ship to the client and the LLM — missing ones make tools harder to use correctly.
 
-**Fix:** add `.describe('...')` to every leaf. The linter reports which path is missing a description (e.g., `input.filters.status`), so it's a mechanical fix.
+**Fix:** add `.describe('...')` to the paths the linter flags. The diagnostic names which path is missing a description (e.g., `input.filters.status`).
+
+**Recursion rules** — the linter walks selectively; primitive array elements are intentionally skipped. Knowing what's walked prevents over-application of describes that end up as noise in the generated JSON Schema.
+
+| Schema position | Walked? | Describe required on inner? |
+|:---|:---|:---|
+| `z.object({ ... })` field | Yes | Yes, on each field |
+| `z.array(compound)` element — object, array, or union | Yes | Yes, on the element |
+| `z.array(primitive)` element — string, number, enum, regex-branded primitive, etc. | **No** | No — outer array describe is sufficient |
+| `z.union([a, b, ...])` non-literal option | Yes | Yes, on each option |
+| `z.union([..., z.literal(X), ...])` literal option | **No** | No — outer union describe is sufficient |
+
+The asymmetry that catches agents: inside `z.union([z.string(), z.array(z.string())])`, the outer `z.string()` option **does** need a describe (unions walk non-literal options), but the `z.string()` inside the inner array does **not** (arrays don't walk primitive elements). If the linter didn't flag a path, don't add a describe there — the redundant describe ships to the JSON Schema as clutter.
+
+**Literal variants are exempt** because they carry no independent semantic content — they're structural markers. The canonical case is form-client blank tolerance, where a `z.literal('')` variant is threaded into a union alongside a validated string so empty submissions from MCP Inspector / web UIs round-trip without breaking schema-level validation:
+
+```ts
+variable: z
+  .union([
+    z.literal(''),                                    // form-client sentinel — no describe needed
+    z.string().max(50).regex(/^[a-z_][a-z0-9_]*$/i)
+      .describe('Identifier matching [a-zA-Z_][a-zA-Z0-9_]*, max 50 chars'),
+  ])
+  .optional()
+  .describe('Variable name. Blank values from form-based clients are treated as omitted.'),
+```
+
+The outer describe on the union carries the semantic load; the non-literal variant still gets its own describe so the LLM sees the regex/length constraints in JSON Schema. Only the `z.literal` is skipped.
 
 ### schema-serializable
 

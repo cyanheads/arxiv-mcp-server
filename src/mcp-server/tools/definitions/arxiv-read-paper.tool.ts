@@ -8,7 +8,7 @@ import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
 export const arxivReadPaper = tool('arxiv_read_paper', {
   description:
-    'Fetch the full text content of an arXiv paper from its HTML rendering. Tries native arXiv HTML first, falls back to ar5iv. Returns raw HTML for direct interpretation.',
+    'Fetch the full text of an arXiv paper as HTML, with automatic fallback if the primary source is unavailable.',
   annotations: { readOnlyHint: true },
 
   input: z.object({
@@ -29,14 +29,17 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
   output: z.object({
     paper_id: z.string().describe('arXiv paper ID.'),
     title: z.string().describe('Paper title (from metadata, not parsed from HTML).'),
-    content: z.string().describe('Raw HTML content of the paper.'),
+    content: z.string().describe('Cleaned paper body HTML, truncated to max_characters.'),
     source: z
       .enum(['arxiv_html', 'ar5iv'])
       .describe('Which HTML source the content was fetched from.'),
     truncated: z.boolean().describe('Whether content was truncated due to max_characters.'),
-    total_characters: z
+    total_characters: z.number().describe('Character count of the original unprocessed HTML body.'),
+    body_characters: z
       .number()
-      .describe('Total character count of the full (untruncated) content.'),
+      .describe(
+        'Character count of the cleaned body HTML — what fits into max_characters. Typically 3-4× smaller than total_characters for math-heavy papers.',
+      ),
     pdf_url: z.string().describe('Direct PDF download URL.'),
     abstract_url: z.string().describe('arXiv abstract page URL for attribution.'),
   }),
@@ -56,13 +59,15 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
   format: (result) => {
     const lines = [
       `# ${result.title}`,
-      `arXiv:${result.paper_id} | Source: ${result.source} | Total: ${result.total_characters} chars${result.truncated ? ' (truncated)' : ''}`,
+      // Raw integer values in the header so both character counts are discoverable
+      // by text-only clients (format-parity) without locale formatting interfering.
+      `arXiv:${result.paper_id} | Source: ${result.source} | Raw HTML: ${result.total_characters} chars | Body: ${result.body_characters} chars${result.truncated ? ' (truncated)' : ''}`,
       `Abstract: ${result.abstract_url}`,
       `PDF: ${result.pdf_url}`,
     ];
     if (result.truncated) {
       lines.push(
-        `\n[Truncated: showing ${result.content.length.toLocaleString()} of ${result.total_characters.toLocaleString()} characters]`,
+        `\n[Truncated: showing ${result.content.length.toLocaleString()} of ${result.body_characters.toLocaleString()} body characters]`,
       );
     }
     lines.push('', result.content);

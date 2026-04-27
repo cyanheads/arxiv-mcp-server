@@ -34,7 +34,7 @@ export const arxivSearch = tool('arxiv_search', {
       .string()
       .optional()
       .describe(
-        'Filter by arXiv category (e.g., "cs.CL", "math.AG"). Prepended as "AND cat:{category}" to the query. Use arxiv_list_categories to discover valid codes.',
+        'Filter results to a specific arXiv category (e.g., "cs.CL", "math.AG"). Use arxiv_list_categories to discover valid codes.',
       ),
     max_results: z
       .number()
@@ -43,7 +43,7 @@ export const arxivSearch = tool('arxiv_search', {
       .max(50)
       .default(10)
       .describe(
-        'Maximum results to return (1-50). Default 10. Each result includes title, authors, abstract, and metadata — keep low to manage context budget.',
+        'Maximum results to return (1-50). Default 10. Each result includes title, authors, abstract, and metadata — keep low to limit response size.',
       ),
     sort_by: z
       .enum(['relevance', 'submitted', 'updated'])
@@ -100,6 +100,16 @@ export const arxivSearch = tool('arxiv_search', {
 
   format: (result) => {
     if (result.papers.length === 0) {
+      // Paging past the end of a valid result set — distinguish from no matches.
+      if (result.total_results > 0 && result.start >= result.total_results) {
+        const lastValidStart = Math.max(0, result.total_results - 1);
+        return [
+          {
+            type: 'text' as const,
+            text: `Offset ${result.start} exceeds total results (${result.total_results}). Last valid page starts at ${lastValidStart}.`,
+          },
+        ];
+      }
       return [
         {
           type: 'text' as const,

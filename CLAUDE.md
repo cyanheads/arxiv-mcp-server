@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 0.1.12
+**Version:** 0.1.13
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -208,7 +208,7 @@ src/
 
 Skills are modular instructions in `skills/` at the project root. Read them directly when a task matches — e.g., `skills/add-tool/SKILL.md` when adding a tool.
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `skills/` paths manually. After framework updates, re-copy to pick up changes.
+**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). This makes skills available as context without needing to reference `skills/` paths manually. After framework updates, run the `maintenance` skill — it re-syncs the agent directory automatically (Phase B).
 
 Available skills:
 
@@ -217,6 +217,7 @@ Available skills:
 | `setup` | Post-init project orientation |
 | `design-mcp-server` | Design tool surface, resources, and services for a new server |
 | `add-tool` | Scaffold a new tool definition |
+| `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
 | `add-service` | Scaffold a new service integration |
@@ -227,6 +228,7 @@ Available skills:
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `release-and-publish` | Post-wrapup ship workflow — verify, push, publish to npm/MCP Registry/GHCR |
 | `maintenance` | Sync skills, scripts, and dependencies after updates |
+| `migrate-mcp-ts-template` | Migrate legacy template fork to package dependency |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
 | `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |

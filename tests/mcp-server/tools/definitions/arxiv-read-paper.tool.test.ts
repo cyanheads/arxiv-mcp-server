@@ -21,6 +21,7 @@ const MOCK_CONTENT: PaperContent = {
   source: 'arxiv_html',
   truncated: false,
   total_characters: 44,
+  body_characters: 44,
   pdf_url: 'https://arxiv.org/pdf/2401.12345v1',
   abstract_url: 'https://arxiv.org/abs/2401.12345v1',
 };
@@ -49,13 +50,26 @@ describe('arxivReadPaper', () => {
       ...MOCK_CONTENT,
       content: '<html>partial',
       truncated: true,
-      total_characters: 50000,
+      total_characters: 150000,
+      body_characters: 50000,
     };
     const blocks = arxivReadPaper.format?.(truncated) ?? [];
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('# Test Paper');
     expect(text).toContain('[Truncated:');
-    expect(text).toContain('50,000 characters');
+    expect(text).toContain('50,000 body characters');
+  });
+
+  it('surfaces raw HTML and body character counts distinctly in the header', () => {
+    const mixed: PaperContent = {
+      ...MOCK_CONTENT,
+      total_characters: 150_000,
+      body_characters: 40_000,
+    };
+    const blocks = arxivReadPaper.format?.(mixed) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Raw HTML: 150000 chars');
+    expect(text).toContain('Body: 40000 chars');
   });
 
   it('formats without truncation notice when not truncated', () => {

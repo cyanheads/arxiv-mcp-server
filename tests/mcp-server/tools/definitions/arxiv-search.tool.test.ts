@@ -105,4 +105,12 @@ describe('arxivSearch', () => {
       'No papers found. Try broader search terms, remove field prefixes (ti:, au:), or check category codes with arxiv_list_categories.',
     );
   });
+
+  it('distinguishes pagination overflow from genuine no-results', () => {
+    // start past the last result of a non-empty set — user paged past the end.
+    const blocks = arxivSearch.format?.({ total_results: 27, start: 100, papers: [] }) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Offset 100 exceeds total results (27)');
+    expect(text).toContain('Last valid page starts at 26');
+  });
 });

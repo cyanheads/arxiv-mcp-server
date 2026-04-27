@@ -144,14 +144,46 @@ describe('ArxivService.search', () => {
     expect(url.searchParams.get('start')).toBe('10');
   });
 
-  it('appends category filter to query', async () => {
+  it('appends category filter to query with user query wrapped in parens', async () => {
+    // Parens scope AND to the whole expression, not just the last bare token —
+    // prevents "mixture of experts AND cat:cs.CL" from leaking across categories.
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
     const service = getArxivService();
     await service.search('all:testing', { category: 'cs.AI' }, ctx);
 
     const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
-    expect(url.searchParams.get('search_query')).toBe('all:testing AND cat:cs.AI');
+    expect(url.searchParams.get('search_query')).toBe('(all:testing) AND cat:cs.AI');
+  });
+
+  it('wraps multi-word unprefixed queries so category scopes the whole expression', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('mixture of experts', { category: 'cs.CL' }, ctx);
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('search_query')).toBe('(mixture of experts) AND cat:cs.CL');
+  });
+
+  it('rejects unknown categories with a near-match suggestion', async () => {
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.search('llm', { category: 'cs.INVALID' }, ctx)).rejects.toThrow(
+      /Unknown arXiv category 'cs\.INVALID'\. Did you mean: cs\./,
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown categories outside the taxonomy with edit-distance fallback', async () => {
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.search('anything', { category: 'foo.BAR' }, ctx)).rejects.toThrow(
+      /Unknown arXiv category 'foo\.BAR'/,
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('retries on rate limit', async () => {
@@ -297,6 +329,7 @@ describe('ArxivService.readContent', () => {
     expect(result.content).toBe('<html><body>Paper content</body></html>');
     expect(result.truncated).toBe(false);
     expect(result.total_characters).toBe(39);
+    expect(result.body_characters).toBe(39);
   });
 
   it('truncates content when max_characters is set', async () => {
@@ -350,6 +383,53 @@ describe('ArxivService.readContent', () => {
     await expect(service.readContent('2401.12345', undefined, ctx)).rejects.toThrow(
       /not available/i,
     );
+  });
+
+  it('strips LaTeXML class/id noise and reports body_characters distinct from total', async () => {
+    const raw =
+      '<article><span class="ltx_text" id="S1.p1">Hello</span>' +
+      '<br class="ltx_break"/><br class="ltx_break"/>' +
+      '<p class="ltx_para" id="p2">World</p></article>';
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.readContent('2401.12345', undefined, ctx);
+
+    // Content should no longer contain ltx_* class or id attributes
+    expect(result.content).not.toMatch(/class="ltx_/);
+    expect(result.content).not.toMatch(/\sid="/);
+    // Runs of <br> should collapse to a single <br>
+    expect(result.content).not.toMatch(/<br[^>]*>\s*<br/i);
+    // Content should still contain the actual text and tag skeleton
+    expect(result.content).toContain('Hello');
+    expect(result.content).toContain('World');
+    expect(result.content).toContain('<span>');
+    expect(result.content).toContain('<p>');
+    // Both char counts are reported; body is strictly smaller after stripping
+    expect(result.total_characters).toBe(raw.length);
+    expect(result.body_characters).toBe(result.content.length);
+    expect(result.body_characters).toBeLessThan(result.total_characters);
+  });
+
+  it('truncates based on body_characters, not raw total', async () => {
+    // Raw HTML with lots of ltx noise that strips down to a small body.
+    const raw = `<article>${'<span class="ltx_text" id="x">a</span>'.repeat(20)}</article>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.readContent('2401.12345', 50, ctx);
+
+    expect(result.total_characters).toBe(raw.length);
+    // Cleaned content is much smaller than raw; truncation applies to cleaned form
+    expect(result.body_characters).toBeLessThan(raw.length);
+    expect(result.content.length).toBeLessThanOrEqual(50);
+    if (result.body_characters > 50) {
+      expect(result.truncated).toBe(true);
+    }
   });
 
   it('throws on unexpected content-type from API', async () => {

@@ -47,6 +47,7 @@ export interface PaperLookupResult {
 
 export interface PaperContent {
   abstract_url: string;
+  body_characters: number;
   content: string;
   paper_id: string;
   pdf_url: string;

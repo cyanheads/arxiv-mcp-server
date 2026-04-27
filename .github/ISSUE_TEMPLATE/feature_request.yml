@@ -1,5 +1,5 @@
 name: Feature Request
-description: Suggest a new feature or improvement for arxiv-mcp-server
+description: Suggest a new feature or improvement for @cyanheads/arxiv-mcp-server
 labels: ["enhancement"]
 body:
   - type: textarea

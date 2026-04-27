@@ -9,6 +9,7 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import { notFound, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
 import { XMLParser } from 'fast-xml-parser';
 import { getServerConfig } from '@/config/server-config.js';
+import { suggestCategories, VALID_CATEGORY_CODES } from './categories.js';
 import type {
   PaperContent,
   PaperLookupResult,
@@ -124,6 +125,22 @@ function stripHtmlHead(html: string): string {
   return html.slice(bodyStart);
 }
 
+/**
+ * Strip LaTeXML-generated class/id noise and collapse redundant break runs.
+ * LaTeXML emits `class="ltx_..."` and generated `id="..."` on nearly every element;
+ * neither carries information a reader (human or LLM) benefits from. Stripping
+ * them typically shrinks a math-heavy paper's HTML by 3-4x with zero content loss.
+ */
+function stripLatexmlNoise(html: string): string {
+  return (
+    html
+      .replace(/\s+class="ltx_[^"]*"/gi, '')
+      .replace(/\s+id="[^"]*"/gi, '')
+      // Collapse runs of 2+ <br> tags (LaTeXML emits these around display math)
+      .replace(/(?:<br\s*\/?>\s*){2,}/gi, '<br>\n')
+  );
+}
+
 function stripVersion(id: string): string {
   return id.replace(/v\d+$/, '');
 }
@@ -153,9 +170,27 @@ export class ArxivService {
   }
 
   /** Search arXiv papers by query with optional category filter, sorting, and pagination. */
-  search(query: string, options: SearchOptions, ctx: Context): Promise<SearchResult> {
+  async search(query: string, options: SearchOptions, ctx: Context): Promise<SearchResult> {
     const config = getServerConfig();
-    const searchQuery = options.category ? `${query} AND cat:${options.category}` : query;
+
+    if (options.category && !VALID_CATEGORY_CODES.has(options.category)) {
+      const suggestions = suggestCategories(options.category);
+      const hint =
+        suggestions.length > 0
+          ? ` Did you mean: ${suggestions.join(', ')}?`
+          : ' Use arxiv_list_categories to list valid codes.';
+      throw validationError(`Unknown arXiv category '${options.category}'.${hint}`, {
+        category: options.category,
+        suggestions,
+      });
+    }
+
+    // Wrap the user query in parens so `AND cat:` scopes the category to the
+    // full expression. Without the parens, arXiv's parser binds `AND` tighter
+    // than the implicit conjunction between bare terms — "mixture of experts
+    // AND cat:cs.CL" parses as "mixture ∧ of ∧ (experts AND cat:cs.CL)",
+    // leaking earlier terms across all categories.
+    const searchQuery = options.category ? `(${query}) AND cat:${options.category}` : query;
 
     const url = buildApiUrl(config.apiBaseUrl, {
       search_query: searchQuery,
@@ -165,7 +200,7 @@ export class ArxivService {
       sortOrder: options.sortOrder ?? 'descending',
     });
 
-    return withRetry(async () => {
+    return await withRetry(async () => {
       const xml = await this.fetchApi(url, ctx);
       const feed = this.parseAtomFeed(xml);
       return { total_results: feed.totalResults, start: feed.startIndex, papers: feed.entries };
@@ -216,18 +251,22 @@ export class ArxivService {
       baseDelayMs: 2000,
     });
 
-    // Strip <head> boilerplate so max_characters budget goes toward actual paper content
+    // Strip <head> / site chrome, then strip LaTeXML class/id noise so
+    // max_characters buys real body content, not `ltx_text` wrappers.
     const bodyContent = stripHtmlHead(content);
     const totalCharacters = bodyContent.length;
-    const truncated = maxCharacters != null && totalCharacters > maxCharacters;
+    const cleaned = stripLatexmlNoise(bodyContent);
+    const bodyCharacters = cleaned.length;
+    const truncated = maxCharacters != null && bodyCharacters > maxCharacters;
 
     return {
       paper_id: paper.id,
       title: paper.title,
-      content: truncated ? bodyContent.slice(0, maxCharacters) : bodyContent,
+      content: truncated ? cleaned.slice(0, maxCharacters) : cleaned,
       source,
       truncated,
       total_characters: totalCharacters,
+      body_characters: bodyCharacters,
       pdf_url: paper.pdf_url,
       abstract_url: paper.abstract_url,
     };
