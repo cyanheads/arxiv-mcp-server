@@ -43,7 +43,9 @@ beforeEach(() => {
 describe('arxivSearch', () => {
   it('calls service.search with correct options', async () => {
     mockSearch.mockResolvedValue(MOCK_RESULT);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
     const input = arxivSearch.input.parse({
       query: 'au:bengio AND ti:attention',
       max_results: 5,
@@ -69,7 +71,9 @@ describe('arxivSearch', () => {
 
   it('passes category filter when provided', async () => {
     mockSearch.mockResolvedValue(MOCK_RESULT);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
     const input = arxivSearch.input.parse({ query: 'all:transformer', category: 'cs.CL' });
     await arxivSearch.handler(input, ctx);
 

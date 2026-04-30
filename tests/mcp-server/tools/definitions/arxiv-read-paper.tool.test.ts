@@ -36,7 +36,9 @@ beforeEach(() => {
 describe('arxivReadPaper', () => {
   it('calls service.readContent and returns result', async () => {
     mockReadContent.mockResolvedValue(MOCK_CONTENT);
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: arxivReadPaper.errors! }) as Parameters<
+      typeof arxivReadPaper.handler
+    >[1];
     const input = arxivReadPaper.input.parse({ paper_id: '2401.12345', max_characters: 5000 });
     const result = await arxivReadPaper.handler(input, ctx);
 

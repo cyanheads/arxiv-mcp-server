@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 import { formatPaper, PaperMetadataSchema } from '@/services/arxiv/types.js';
 
@@ -11,6 +12,15 @@ export const arxivSearch = tool('arxiv_search', {
   description:
     'Search arXiv papers by query with category and sort filters. Returns paper metadata including title, authors, abstract, categories, and links.',
   annotations: { readOnlyHint: true },
+
+  errors: [
+    {
+      reason: 'unknown_category',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Provided category code is not part of the arXiv taxonomy.',
+      recovery: 'Call arxiv_list_categories to discover valid category codes and retry.',
+    },
+  ],
 
   input: z.object({
     query: z

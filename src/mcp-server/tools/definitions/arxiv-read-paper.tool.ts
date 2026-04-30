@@ -4,12 +4,29 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
 export const arxivReadPaper = tool('arxiv_read_paper', {
   description:
     'Fetch the full text of an arXiv paper as HTML, with automatic fallback if the primary source is unavailable.',
   annotations: { readOnlyHint: true },
+
+  errors: [
+    {
+      reason: 'no_match',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Paper ID is not present in the arXiv index.',
+      recovery:
+        'Verify the paper ID format (e.g., "2401.12345") and confirm via arxiv_search before retrying.',
+    },
+    {
+      reason: 'html_unavailable',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Paper exists but no HTML rendering is available; only PDF.',
+      recovery: 'Use the pdf_url returned by arxiv_get_metadata to fetch the source PDF directly.',
+    },
+  ],
 
   input: z.object({
     paper_id: z

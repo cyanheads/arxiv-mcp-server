@@ -37,7 +37,9 @@ beforeEach(() => {
 describe('paperResource', () => {
   it('returns paper for valid ID', async () => {
     mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
     const result = await paperResource.handler({ paperId: '2401.12345' }, ctx);
     expect(mockGetPapers).toHaveBeenCalledWith(['2401.12345'], ctx);
     expect(result).toMatchObject({ id: '2401.12345v1', title: 'Test Paper' });
@@ -45,7 +47,9 @@ describe('paperResource', () => {
 
   it('throws when paper not found', async () => {
     mockGetPapers.mockResolvedValue({ papers: [] });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
     await expect(paperResource.handler({ paperId: '9999.99999' }, ctx)).rejects.toThrow(
       /not found/i,
     );

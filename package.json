@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "MCP server for arXiv academic paper search, metadata retrieval, and full-text reading.",
   "mcpName": "io.github.cyanheads/arxiv-mcp-server",
   "type": "module",
@@ -21,8 +21,7 @@
     "changelog:build": "bun scripts/build-changelog.ts",
     "changelog:check": "bun scripts/build-changelog.ts --check",
     "test": "vitest run",
-    "dev:stdio": "MCP_TRANSPORT_TYPE=stdio bun --watch src/index.ts",
-    "dev:http": "MCP_TRANSPORT_TYPE=http bun --watch src/index.ts",
+    "start": "node dist/index.js",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
     "start:http": "MCP_TRANSPORT_TYPE=http node dist/index.js"
   },
@@ -64,7 +63,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.7.5",
+    "@cyanheads/mcp-ts-core": "^0.8.7",
     "fast-xml-parser": "^5.7.2",
     "pino-pretty": "^13.1.3"
   },

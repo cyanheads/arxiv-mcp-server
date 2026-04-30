@@ -37,7 +37,9 @@ beforeEach(() => {
 describe('arxivGetMetadata', () => {
   it('normalizes string input to array', async () => {
     mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
     const input = arxivGetMetadata.input.parse({ paper_ids: '2401.12345' });
     await arxivGetMetadata.handler(input, ctx);
 
@@ -46,7 +48,9 @@ describe('arxivGetMetadata', () => {
 
   it('passes array input directly', async () => {
     mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
     const input = arxivGetMetadata.input.parse({ paper_ids: ['2401.12345', '2401.67890'] });
     await arxivGetMetadata.handler(input, ctx);
 
@@ -55,20 +59,24 @@ describe('arxivGetMetadata', () => {
 
   it('throws when no papers found', async () => {
     mockGetPapers.mockResolvedValue({ papers: [] });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
     const input = arxivGetMetadata.input.parse({ paper_ids: '9999.99999' });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toThrow(/not found|no papers/i);
   });
 
   it('formats papers and not-found list', () => {
-    const result: PaperLookupResult = {
-      papers: [MOCK_PAPER],
-      not_found: ['9999.99999'],
-    };
-    const blocks = arxivGetMetadata.format?.(result) ?? [];
+    const blocks =
+      arxivGetMetadata.format?.({
+        papers: [MOCK_PAPER],
+        totalSucceeded: 1,
+        not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+      }) ?? [];
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('**Test Paper**');
-    expect(text).toContain('Not found: 9999.99999');
+    expect(text).toContain('Found 1 of 2 papers');
+    expect(text).toContain('9999.99999 (not_in_arxiv)');
   });
 });

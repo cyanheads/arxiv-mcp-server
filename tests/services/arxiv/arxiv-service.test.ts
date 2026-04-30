@@ -4,6 +4,7 @@
  * @module services/arxiv/arxiv-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
@@ -130,6 +131,20 @@ describe('ArxivService.search', () => {
     });
   });
 
+  it('sends a descriptive User-Agent identifying this client to arXiv', async () => {
+    // arXiv community convention (cf. arxiv.py): include a UA so operators can
+    // identify and contact maintainers if a client misbehaves.
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('all:test', {}, ctx);
+
+    const init = mockFetch.mock.calls[0]?.[1];
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers['user-agent']).toMatch(/arxiv-mcp-server/);
+    expect(headers['user-agent']).toMatch(/github\.com\/cyanheads\/arxiv-mcp-server/);
+  });
+
   it('builds URL with correct query params', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
@@ -186,23 +201,25 @@ describe('ArxivService.search', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it('retries on rate limit', async () => {
-    mockFetch
-      .mockResolvedValueOnce(
-        new Response('Rate exceeded.', {
-          status: 200,
-          headers: { 'content-type': 'text/plain' },
-        }),
-      )
-      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+  it('fails fast on "Rate exceeded" plain-text response without retrying', async () => {
+    // arXiv returns 200 OK with `Rate exceeded.` body when throttling. Retrying
+    // violates arXiv's 3s crawl etiquette and amplifies the throttle — surface
+    // the rate-limit immediately. See issue #8.
+    mockFetch.mockResolvedValueOnce(
+      new Response('Rate exceeded.', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      }),
+    );
 
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.search('all:test', {}, ctx);
 
-    expect(result.papers).toHaveLength(1);
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-  }, 10_000);
+    await expect(service.search('all:test', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
 
   it('fails fast on 4xx without retrying', async () => {
     // arXiv returns HTTP 400 for bad input (e.g., non-integer max_results) with
@@ -239,23 +256,90 @@ describe('ArxivService.search', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   }, 10_000);
 
-  it('retries on HTTP 429 rate-limit status', async () => {
-    mockFetch
-      .mockResolvedValueOnce(
-        new Response('<feed/>', {
-          status: 429,
-          headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
-        }),
-      )
-      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+  it('fails fast on HTTP 429 and surfaces Retry-After header', async () => {
+    // 429 means arXiv is throttling — retrying makes it worse. Surface the
+    // Retry-After header so clients can honor the cooldown. See issue #8.
+    mockFetch.mockResolvedValueOnce(
+      new Response('<feed/>', {
+        status: 429,
+        headers: {
+          'content-type': 'application/atom+xml; charset=UTF-8',
+          'retry-after': '60',
+        },
+      }),
+    );
 
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.search('all:test', {}, ctx);
 
+    await expect(service.search('all:test', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: { status: 429, retryAfter: '60' },
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors Retry-After at the queue level — subsequent calls wait the cooldown', async () => {
+    // When arXiv signals throttle, the cooldown applies to ALL queued calls,
+    // not just the one that hit the rate-limit. Otherwise N concurrent callers
+    // each hit the same rate-limit window in parallel.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // Call 1: 429 with Retry-After: 2 (seconds)
+      mockFetch.mockResolvedValueOnce(
+        new Response('<feed/>', {
+          status: 429,
+          headers: {
+            'content-type': 'application/atom+xml; charset=UTF-8',
+            'retry-after': '2',
+          },
+        }),
+      );
+      // Call 2: success (should fire only after the 2s cooldown)
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+
+      const service = getArxivService();
+      const p1 = service.search('first', {}, createMockContext());
+      const p2 = service.search('second', {}, createMockContext());
+
+      await expect(p1).rejects.toMatchObject({ code: JsonRpcErrorCode.RateLimited });
+      // After p1 settled, only one fetch has happened.
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      // Advance just shy of the cooldown — second call still waiting.
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      // Advance past the cooldown — second call dispatches and resolves.
+      await vi.advanceTimersByTimeAsync(700);
+      const result = await p2;
+      expect(result.papers).toHaveLength(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips queued requests whose ctx.signal aborted before their turn', async () => {
+    // A cancelled request shouldn't consume a 3s queue slot — drop it at the
+    // queue head so the next live caller dispatches immediately.
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+
+    const liveCtx = createMockContext();
+    const cancelledCtrl = new AbortController();
+    const cancelledCtx = createMockContext({ signal: cancelledCtrl.signal });
+    cancelledCtrl.abort(new Error('user cancelled'));
+
+    const service = getArxivService();
+
+    await expect(service.search('cancelled', {}, cancelledCtx)).rejects.toThrow(/cancelled/);
+    expect(mockFetch).not.toHaveBeenCalled();
+
+    // Live request after the cancelled one still works.
+    const result = await service.search('live', {}, liveCtx);
     expect(result.papers).toHaveLength(1);
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-  }, 10_000);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -271,7 +355,7 @@ describe('ArxivService.getPapers', () => {
 
     expect(result.papers).toHaveLength(1);
     expect(result.papers[0]?.id).toBe('2401.12345v1');
-    expect(result.not_found).toBeUndefined();
+    expect(result.not_found_ids).toBeUndefined();
 
     const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
     expect(url.searchParams.get('id_list')).toBe('2401.12345');
@@ -284,7 +368,7 @@ describe('ArxivService.getPapers', () => {
     const result = await service.getPapers(['2401.12345', '9999.99999'], ctx);
 
     expect(result.papers).toHaveLength(1);
-    expect(result.not_found).toEqual(['9999.99999']);
+    expect(result.not_found_ids).toEqual(['9999.99999']);
   });
 
   it('handles sparse upstream entries without fabricating optional fields', async () => {

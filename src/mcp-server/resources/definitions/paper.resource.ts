@@ -4,7 +4,7 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
 export const paperResource = resource('arxiv://paper/{paperId}', {
@@ -15,12 +15,25 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     paperId: z.string().describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
   }),
 
+  errors: [
+    {
+      reason: 'no_match',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Paper ID is not present in the arXiv index.',
+      recovery:
+        'Verify the paper ID format (e.g., "2401.12345") and confirm the paper exists via arxiv_search.',
+    },
+  ],
+
   async handler(params, ctx) {
     const service = getArxivService();
     const result = await service.getPapers([params.paperId], ctx);
     const [paper] = result.papers;
     if (!paper) {
-      throw notFound(`Paper '${params.paperId}' not found.`, { paperId: params.paperId });
+      throw ctx.fail('no_match', `Paper '${params.paperId}' not found.`, {
+        paperId: params.paperId,
+        ...ctx.recoveryFor('no_match'),
+      });
     }
     return paper;
   },

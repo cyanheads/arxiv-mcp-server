@@ -41,7 +41,8 @@ export interface SearchResult {
 }
 
 export interface PaperLookupResult {
-  not_found?: string[];
+  /** Paper IDs that returned no data from arXiv. Plain strings — the tool layer wraps them in the framework's partialResult shape. */
+  not_found_ids?: string[];
   papers: PaperMetadata[];
 }
 

@@ -4,14 +4,38 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { partialResult, partialResultSchema } from '@cyanheads/mcp-ts-core/utils';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 import { formatPaper, PaperMetadataSchema } from '@/services/arxiv/types.js';
+
+const NotFoundReason = z.enum(['not_in_arxiv']).describe('Why the paper ID could not be returned.');
+
+const OutputSchema = partialResultSchema({
+  succeededKey: 'papers',
+  succeededSchema: PaperMetadataSchema,
+  succeededDescription: 'Papers found. May be fewer than requested if some IDs are invalid.',
+  failedKey: 'not_found',
+  idKey: 'id',
+  idDescription: 'arXiv ID that returned no data.',
+  reason: NotFoundReason,
+  failureDescription: 'A requested ID that arXiv did not return.',
+});
 
 export const arxivGetMetadata = tool('arxiv_get_metadata', {
   description:
     'Get full metadata for one or more arXiv papers by ID. Use when you have known IDs from citations, prior search results, or memory.',
   annotations: { readOnlyHint: true },
+
+  errors: [
+    {
+      reason: 'no_match',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'None of the requested IDs returned data from arXiv.',
+      recovery:
+        'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and confirm the paper exists via arxiv_search.',
+    },
+  ],
 
   input: z.object({
     paper_ids: z
@@ -31,12 +55,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       ),
   }),
 
-  output: z.object({
-    papers: z
-      .array(PaperMetadataSchema)
-      .describe('Papers found. May be fewer than requested if some IDs are invalid.'),
-    not_found: z.array(z.string()).optional().describe('Paper IDs that returned no results.'),
-  }),
+  output: OutputSchema,
 
   async handler(input, ctx) {
     const service = getArxivService();
@@ -44,27 +63,43 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
     const result = await service.getPapers(ids, ctx);
 
     if (result.papers.length === 0) {
-      throw notFound(
-        `No papers found for the given IDs. Verify ID format (e.g., '2401.12345' or '2401.12345v2').`,
-        { ids },
-      );
+      throw ctx.fail('no_match', `No papers found for the given IDs.`, {
+        ids,
+        ...ctx.recoveryFor('no_match'),
+      });
     }
 
     ctx.log.info('Metadata lookup completed', {
       requested: ids.length,
       found: result.papers.length,
     });
-    return result;
+
+    return partialResult({
+      succeededKey: 'papers' as const,
+      succeeded: result.papers,
+      failedKey: 'not_found' as const,
+      failed: (result.not_found_ids ?? []).map((id) => ({
+        id,
+        reason: 'not_in_arxiv' as const,
+      })),
+    });
   },
 
   format: (result) => {
-    const parts: string[] = [];
+    const parts: string[] = [
+      `Found ${result.totalSucceeded} of ${result.totalSucceeded + (result.not_found?.length ?? 0)} papers.`,
+    ];
     if (result.papers.length > 0) {
       parts.push(result.papers.map(formatPaper).join('\n\n---\n\n'));
     }
     if (result.not_found && result.not_found.length > 0) {
-      parts.push(`\nNot found: ${result.not_found.join(', ')}`);
+      const lines = result.not_found.map((entry) =>
+        entry.detail
+          ? `- ${entry.id} (${entry.reason}): ${entry.detail}`
+          : `- ${entry.id} (${entry.reason})`,
+      );
+      parts.push(`\nNot found:\n${lines.join('\n')}`);
     }
-    return [{ type: 'text' as const, text: parts.join('\n') }];
+    return [{ type: 'text' as const, text: parts.join('\n\n') }];
   },
 });
