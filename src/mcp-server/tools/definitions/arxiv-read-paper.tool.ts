@@ -9,7 +9,7 @@ import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
 export const arxivReadPaper = tool('arxiv_read_paper', {
   description:
-    'Fetch the full text of an arXiv paper as HTML, with automatic fallback if the primary source is unavailable.',
+    'Fetch the full text of an arXiv paper as HTML. Tries arxiv.org/html first; falls back to ar5iv.labs.arxiv.org when the native render is unavailable. PDF-only papers (no HTML render on either source) return an html_unavailable error with the pdf_url for direct download. Page through long papers with the start and max_characters parameters.',
   annotations: { readOnlyHint: true },
 
   errors: [
@@ -23,7 +23,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     {
       reason: 'html_unavailable',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Paper exists but no HTML rendering is available; only PDF.',
+      when: 'Paper exists but neither arxiv.org/html nor ar5iv has an HTML rendering; only the PDF is available.',
       recovery: 'Use the pdf_url returned by arxiv_get_metadata to fetch the source PDF directly.',
     },
   ],
@@ -41,21 +41,40 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       .describe(
         'Maximum characters of paper body content to return. Defaults to 100,000. HTML head/boilerplate is stripped before counting. When truncated, a notice and total character count are included.',
       ),
+    start: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Character offset into the cleaned body to begin reading from. Defaults to 0. Use with max_characters to page through long papers — e.g., start=100000 with max_characters=100000 returns chars 100,000–199,999. The total length is reported as body_characters in the response.',
+      ),
   }),
 
   output: z.object({
     paper_id: z.string().describe('arXiv paper ID.'),
     title: z.string().describe('Paper title (from metadata, not parsed from HTML).'),
-    content: z.string().describe('Cleaned paper body HTML, truncated to max_characters.'),
+    content: z
+      .string()
+      .describe(
+        'Cleaned paper body HTML for the requested slice. Empty when start is past body_characters.',
+      ),
     source: z
       .enum(['arxiv_html', 'ar5iv'])
       .describe('Which HTML source the content was fetched from.'),
-    truncated: z.boolean().describe('Whether content was truncated due to max_characters.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when more body content exists past this slice (start + content.length < body_characters).',
+      ),
+    start: z
+      .number()
+      .describe('Character offset of the first character in content within the cleaned body.'),
     total_characters: z.number().describe('Character count of the original unprocessed HTML body.'),
     body_characters: z
       .number()
       .describe(
-        'Character count of the cleaned body HTML — what fits into max_characters. Typically 3-4× smaller than total_characters for math-heavy papers.',
+        'Character count of the full cleaned body HTML. Use with start and max_characters to page. Typically 3-4× smaller than total_characters for math-heavy papers.',
       ),
     pdf_url: z.string().describe('Direct PDF download URL.'),
     abstract_url: z.string().describe('arXiv abstract page URL for attribution.'),
@@ -63,11 +82,16 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
 
   async handler(input, ctx) {
     const service = getArxivService();
-    const result = await service.readContent(input.paper_id, input.max_characters, ctx);
+    const result = await service.readContent(
+      input.paper_id,
+      { maxCharacters: input.max_characters, start: input.start },
+      ctx,
+    );
     ctx.log.info('Paper content fetched', {
       paperId: result.paper_id,
       source: result.source,
       truncated: result.truncated,
+      start: result.start,
       characters: result.total_characters,
     });
     return result;
@@ -82,9 +106,18 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       `Abstract: ${result.abstract_url}`,
       `PDF: ${result.pdf_url}`,
     ];
-    if (result.truncated) {
+    const sliceEnd = result.start + result.content.length;
+    if (result.start >= result.body_characters && result.body_characters > 0) {
       lines.push(
-        `\n[Truncated: showing ${result.content.length.toLocaleString()} of ${result.body_characters.toLocaleString()} body characters]`,
+        `\n[Offset ${result.start.toLocaleString()} is past end of body (${result.body_characters.toLocaleString()} characters). Use start=0 to read from the beginning.]`,
+      );
+    } else if (result.truncated) {
+      lines.push(
+        `\n[Truncated: showing chars ${result.start.toLocaleString()}–${(sliceEnd - 1).toLocaleString()} of ${result.body_characters.toLocaleString()} body characters. Call again with start=${sliceEnd} to continue.]`,
+      );
+    } else if (result.start > 0) {
+      lines.push(
+        `\n[Showing chars ${result.start.toLocaleString()}–${(sliceEnd - 1).toLocaleString()} of ${result.body_characters.toLocaleString()} body characters (final chunk).]`,
       );
     }
     lines.push('', result.content);

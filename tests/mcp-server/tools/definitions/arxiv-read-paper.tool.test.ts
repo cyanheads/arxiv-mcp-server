@@ -20,6 +20,7 @@ const MOCK_CONTENT: PaperContent = {
   content: '<html><body>Full paper content</body></html>',
   source: 'arxiv_html',
   truncated: false,
+  start: 0,
   total_characters: 44,
   body_characters: 44,
   pdf_url: 'https://arxiv.org/pdf/2401.12345v1',
@@ -42,24 +43,94 @@ describe('arxivReadPaper', () => {
     const input = arxivReadPaper.input.parse({ paper_id: '2401.12345', max_characters: 5000 });
     const result = await arxivReadPaper.handler(input, ctx);
 
-    expect(mockReadContent).toHaveBeenCalledWith('2401.12345', 5000, ctx);
+    expect(mockReadContent).toHaveBeenCalledWith(
+      '2401.12345',
+      { maxCharacters: 5000, start: 0 },
+      ctx,
+    );
     expect(result.paper_id).toBe('2401.12345v1');
     expect(result.source).toBe('arxiv_html');
   });
 
-  it('formats with truncation notice when truncated', () => {
+  it('passes start offset through to the service', async () => {
+    mockReadContent.mockResolvedValue({ ...MOCK_CONTENT, start: 100_000 });
+    const ctx = createMockContext({ errors: arxivReadPaper.errors! }) as Parameters<
+      typeof arxivReadPaper.handler
+    >[1];
+    const input = arxivReadPaper.input.parse({
+      paper_id: '2401.12345',
+      max_characters: 100_000,
+      start: 100_000,
+    });
+    await arxivReadPaper.handler(input, ctx);
+
+    expect(mockReadContent).toHaveBeenCalledWith(
+      '2401.12345',
+      { maxCharacters: 100_000, start: 100_000 },
+      ctx,
+    );
+  });
+
+  it('formats with truncation notice including slice range and next-start hint', () => {
     const truncated: PaperContent = {
       ...MOCK_CONTENT,
-      content: '<html>partial',
+      content: 'x'.repeat(20_000),
       truncated: true,
-      total_characters: 150000,
-      body_characters: 50000,
+      start: 0,
+      total_characters: 150_000,
+      body_characters: 50_000,
     };
     const blocks = arxivReadPaper.format?.(truncated) ?? [];
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('# Test Paper');
     expect(text).toContain('[Truncated:');
     expect(text).toContain('50,000 body characters');
+    expect(text).toContain('chars 0–19,999');
+    expect(text).toContain('start=20000');
+  });
+
+  it('formats with mid-paper slice notice when start > 0 and truncated', () => {
+    const slice: PaperContent = {
+      ...MOCK_CONTENT,
+      content: 'y'.repeat(10_000),
+      truncated: true,
+      start: 100_000,
+      body_characters: 250_000,
+    };
+    const blocks = arxivReadPaper.format?.(slice) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('chars 100,000–109,999');
+    expect(text).toContain('start=110000');
+  });
+
+  it('formats final-chunk notice when start > 0 and not truncated', () => {
+    const finalChunk: PaperContent = {
+      ...MOCK_CONTENT,
+      content: 'z'.repeat(50_000),
+      truncated: false,
+      start: 200_000,
+      body_characters: 250_000,
+    };
+    const blocks = arxivReadPaper.format?.(finalChunk) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('final chunk');
+    expect(text).toContain('chars 200,000–249,999');
+    expect(text).not.toContain('Truncated:');
+  });
+
+  it('formats past-end notice when start exceeds body_characters', () => {
+    const pastEnd: PaperContent = {
+      ...MOCK_CONTENT,
+      content: '',
+      truncated: false,
+      start: 999_999,
+      body_characters: 50_000,
+    };
+    const blocks = arxivReadPaper.format?.(pastEnd) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('past end of body');
+    expect(text).toContain('999,999');
+    expect(text).toContain('start=0');
   });
 
   it('surfaces raw HTML and body character counts distinctly in the header', () => {
@@ -74,11 +145,12 @@ describe('arxivReadPaper', () => {
     expect(text).toContain('Body: 40000 chars');
   });
 
-  it('formats without truncation notice when not truncated', () => {
+  it('formats without truncation notice when not truncated and start=0', () => {
     const blocks = arxivReadPaper.format?.(MOCK_CONTENT) ?? [];
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('# Test Paper');
     expect(text).not.toContain('Truncated');
+    expect(text).not.toContain('final chunk');
     expect(text).toContain('<html><body>Full paper content</body></html>');
   });
 

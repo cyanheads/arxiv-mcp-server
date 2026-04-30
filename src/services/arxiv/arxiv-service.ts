@@ -24,6 +24,7 @@ import type {
   PaperContent,
   PaperLookupResult,
   PaperMetadata,
+  ReadContentOptions,
   SearchOptions,
   SearchResult,
 } from './types.js';
@@ -211,15 +212,31 @@ function stripHtmlHead(html: string): string {
 }
 
 /**
+ * Class tokens that mark document structure (sections, headings, bibliography,
+ * abstract, etc.). The `ltx_*` classes generally carry no information a reader
+ * benefits from, but these specific tokens identify section boundaries and are
+ * worth preserving so future tooling (e.g. section-scoped reads) can navigate
+ * the paper without re-fetching from upstream.
+ */
+const LATEXML_STRUCTURAL_CLASS =
+  /\bltx_(?:section|subsection|subsubsection|paragraph|subparagraph|appendix|bibliography|abstract|acknowledgements?|title|part|chapter)\b/;
+
+/**
  * Strip LaTeXML-generated class/id noise and collapse redundant break runs.
  * LaTeXML emits `class="ltx_..."` and generated `id="..."` on nearly every element;
  * neither carries information a reader (human or LLM) benefits from. Stripping
  * them typically shrinks a math-heavy paper's HTML by 3-4x with zero content loss.
+ *
+ * Exception: class attributes containing a structural marker (see
+ * LATEXML_STRUCTURAL_CLASS) are preserved verbatim so section boundaries remain
+ * identifiable for downstream tooling.
  */
 function stripLatexmlNoise(html: string): string {
   return (
     html
-      .replace(/\s+class="ltx_[^"]*"/gi, '')
+      .replace(/\s+class="(ltx_[^"]*)"/gi, (match, value) =>
+        LATEXML_STRUCTURAL_CLASS.test(value) ? match : '',
+      )
       .replace(/\s+id="[^"]*"/gi, '')
       // Collapse runs of 2+ <br> tags (LaTeXML emits these around display math)
       .replace(/(?:<br\s*\/?>\s*){2,}/gi, '<br>\n')
@@ -345,7 +362,7 @@ export class ArxivService {
   /** Fetch paper metadata + full HTML content. Tries native arXiv HTML, falls back to ar5iv. */
   async readContent(
     paperId: string,
-    maxCharacters: number | undefined,
+    options: ReadContentOptions,
     ctx: Context,
   ): Promise<PaperContent> {
     // Metadata fetch has its own retry via getPapers → fetchApi
@@ -375,14 +392,22 @@ export class ArxivService {
     const totalCharacters = bodyContent.length;
     const cleaned = stripLatexmlNoise(bodyContent);
     const bodyCharacters = cleaned.length;
-    const truncated = maxCharacters != null && bodyCharacters > maxCharacters;
+
+    const start = options.start ?? 0;
+    const sliceEnd = options.maxCharacters != null ? start + options.maxCharacters : bodyCharacters;
+    const sliced = cleaned.slice(start, sliceEnd);
+    // `truncated` means "more body content exists past this slice." If start
+    // is past bodyCharacters, sliced is empty and truncated is false — the
+    // caller paged off the end.
+    const truncated = start + sliced.length < bodyCharacters;
 
     return {
       paper_id: paper.id,
       title: paper.title,
-      content: truncated ? cleaned.slice(0, maxCharacters) : cleaned,
+      content: sliced,
       source,
       truncated,
+      start,
       total_characters: totalCharacters,
       body_characters: bodyCharacters,
       pdf_url: paper.pdf_url,

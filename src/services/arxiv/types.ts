@@ -46,6 +46,12 @@ export interface PaperLookupResult {
   papers: PaperMetadata[];
 }
 
+export interface ReadContentOptions {
+  maxCharacters?: number;
+  /** Character offset into the cleaned body to begin the slice. Defaults to 0. */
+  start?: number;
+}
+
 export interface PaperContent {
   abstract_url: string;
   body_characters: number;
@@ -53,6 +59,8 @@ export interface PaperContent {
   paper_id: string;
   pdf_url: string;
   source: 'arxiv_html' | 'ar5iv';
+  /** Character offset of the first character in `content` within the cleaned body. */
+  start: number;
   title: string;
   total_characters: number;
   truncated: boolean;

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.15](changelog/0.1.x/0.1.15.md) — 2026-04-30
+
+arxiv_read_paper adds `start` offset for chunk-by-chunk pagination on long papers; HTML cleaner preserves ltx_section/title structural markers; description clarifies arxiv.org/html → ar5iv fallback (no PDF auto-extract)
+
 ## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-04-30 · ⚠️ Breaking
 
 Bump @cyanheads/mcp-ts-core 0.7.5 → 0.8.7; typed error contracts on every tool/resource; arxiv_get_metadata adopts partialResult; fixes arxiv_search retry-storm on rate-limit (#8) — fail-fast + Retry-After cooldown + User-Agent

@@ -405,7 +405,7 @@ describe('ArxivService.readContent', () => {
 
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.readContent('2401.12345', undefined, ctx);
+    const result = await service.readContent('2401.12345', {}, ctx);
 
     expect(result.paper_id).toBe('2401.12345v1');
     expect(result.title).toBe('Test Paper Title');
@@ -423,11 +423,62 @@ describe('ArxivService.readContent', () => {
 
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.readContent('2401.12345', 10, ctx);
+    const result = await service.readContent('2401.12345', { maxCharacters: 10 }, ctx);
 
     expect(result.truncated).toBe(true);
+    expect(result.start).toBe(0);
     expect(result.content).toBe('x'.repeat(10));
     expect(result.total_characters).toBe(100);
+  });
+
+  it('slices from start offset when paginating', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse('abcdefghij'.repeat(10)));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    // body_characters = 100; ask for chars 30..49
+    const result = await service.readContent('2401.12345', { maxCharacters: 20, start: 30 }, ctx);
+
+    expect(result.start).toBe(30);
+    expect(result.body_characters).toBe(100);
+    expect(result.content).toHaveLength(20);
+    expect(result.content).toBe('abcdefghij'.repeat(10).slice(30, 50));
+    expect(result.truncated).toBe(true);
+  });
+
+  it('returns empty content with truncated=false when start is past body_characters', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse('a'.repeat(50)));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.readContent(
+      '2401.12345',
+      { maxCharacters: 100, start: 9999 },
+      ctx,
+    );
+
+    expect(result.start).toBe(9999);
+    expect(result.content).toBe('');
+    expect(result.truncated).toBe(false);
+    expect(result.body_characters).toBe(50);
+  });
+
+  it('reports truncated=false when the slice ends exactly at body_characters', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse('z'.repeat(100)));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.readContent('2401.12345', { maxCharacters: 50, start: 50 }, ctx);
+
+    expect(result.start).toBe(50);
+    expect(result.content).toHaveLength(50);
+    expect(result.truncated).toBe(false);
   });
 
   it('falls back to ar5iv when arxiv.org returns 404', async () => {
@@ -438,7 +489,7 @@ describe('ArxivService.readContent', () => {
 
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.readContent('2401.12345', undefined, ctx);
+    const result = await service.readContent('2401.12345', {}, ctx);
 
     expect(result.source).toBe('ar5iv');
     expect(result.content).toBe('<html>ar5iv content</html>');
@@ -450,7 +501,7 @@ describe('ArxivService.readContent', () => {
     const ctx = createMockContext();
     const service = getArxivService();
 
-    await expect(service.readContent('9999.99999', undefined, ctx)).rejects.toThrow(/not found/i);
+    await expect(service.readContent('9999.99999', {}, ctx)).rejects.toThrow(/not found/i);
   });
 
   it('throws notFound when no HTML source is available', async () => {
@@ -464,9 +515,7 @@ describe('ArxivService.readContent', () => {
     const ctx = createMockContext();
     const service = getArxivService();
 
-    await expect(service.readContent('2401.12345', undefined, ctx)).rejects.toThrow(
-      /not available/i,
-    );
+    await expect(service.readContent('2401.12345', {}, ctx)).rejects.toThrow(/not available/i);
   });
 
   it('strips LaTeXML class/id noise and reports body_characters distinct from total', async () => {
@@ -479,7 +528,7 @@ describe('ArxivService.readContent', () => {
       .mockResolvedValueOnce(htmlResponse(raw));
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.readContent('2401.12345', undefined, ctx);
+    const result = await service.readContent('2401.12345', {}, ctx);
 
     // Content should no longer contain ltx_* class or id attributes
     expect(result.content).not.toMatch(/class="ltx_/);
@@ -497,6 +546,41 @@ describe('ArxivService.readContent', () => {
     expect(result.body_characters).toBeLessThan(result.total_characters);
   });
 
+  it('preserves structural ltx_* class attributes (section, title, bibliography) while stripping noise', async () => {
+    // Section boundaries must survive cleaning so downstream tooling (or a
+    // future section-scoped read parameter) can identify them. Decorative
+    // classes like ltx_text and ltx_font_bold should still be stripped.
+    const raw = [
+      '<article>',
+      '<section class="ltx_section">',
+      '<h2 class="ltx_title ltx_title_section">1 Introduction</h2>',
+      '<p class="ltx_para"><span class="ltx_text ltx_font_bold">Body</span></p>',
+      '<section class="ltx_subsection"><h3 class="ltx_title ltx_title_subsection">1.1</h3></section>',
+      '<section class="ltx_bibliography"><h2 class="ltx_title">References</h2></section>',
+      '</section>',
+      '</article>',
+    ].join('');
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.readContent('2401.12345', {}, ctx);
+
+    // Structural markers preserved
+    expect(result.content).toContain('class="ltx_section"');
+    expect(result.content).toContain('class="ltx_subsection"');
+    expect(result.content).toContain('class="ltx_bibliography"');
+    expect(result.content).toContain('ltx_title');
+    // Decorative noise stripped
+    expect(result.content).not.toContain('ltx_para');
+    expect(result.content).not.toContain('ltx_text');
+    expect(result.content).not.toContain('ltx_font_bold');
+    // Text content survives
+    expect(result.content).toContain('1 Introduction');
+    expect(result.content).toContain('References');
+  });
+
   it('truncates based on body_characters, not raw total', async () => {
     // Raw HTML with lots of ltx noise that strips down to a small body.
     const raw = `<article>${'<span class="ltx_text" id="x">a</span>'.repeat(20)}</article>`;
@@ -505,7 +589,7 @@ describe('ArxivService.readContent', () => {
       .mockResolvedValueOnce(htmlResponse(raw));
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.readContent('2401.12345', 50, ctx);
+    const result = await service.readContent('2401.12345', { maxCharacters: 50 }, ctx);
 
     expect(result.total_characters).toBe(raw.length);
     // Cleaned content is much smaller than raw; truncation applies to cleaned form
@@ -526,8 +610,6 @@ describe('ArxivService.readContent', () => {
     const ctx = createMockContext();
     const service = getArxivService();
 
-    await expect(service.readContent('2401.12345', undefined, ctx)).rejects.toThrow(
-      /content-type/i,
-    );
+    await expect(service.readContent('2401.12345', {}, ctx)).rejects.toThrow(/content-type/i);
   });
 });

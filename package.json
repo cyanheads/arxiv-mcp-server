@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "MCP server for arXiv academic paper search, metadata retrieval, and full-text reading.",
   "mcpName": "io.github.cyanheads/arxiv-mcp-server",
   "type": "module",
