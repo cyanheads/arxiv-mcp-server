@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-04-30 08:41:21
+Generated on: 2026-05-05 12:43:16
 
 ```text
 arxiv-mcp-server/
@@ -46,6 +46,8 @@ arxiv-mcp-server/
 │   ├── add-tool/
 │   │   └── SKILL.md
 │   ├── api-auth/
+│   │   └── SKILL.md
+│   ├── api-canvas/
 │   │   └── SKILL.md
 │   ├── api-config/
 │   │   └── SKILL.md
@@ -96,7 +98,9 @@ arxiv-mcp-server/
 │   │   └── SKILL.md
 │   ├── security-pass/
 │   │   └── SKILL.md
-│   └── setup/
+│   ├── setup/
+│   │   └── SKILL.md
+│   └── tool-defs-analysis/
 │       └── SKILL.md
 ├── src/
 │   ├── config/

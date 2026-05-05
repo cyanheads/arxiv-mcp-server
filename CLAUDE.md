@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 0.1.15
+**Version:** 0.1.16
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -191,6 +191,8 @@ async handler(input, ctx) {
 }
 ```
 
+**Declare contracts inline on each tool, even when similar across tools.** The contract is part of the tool's documented public surface — reading one tool definition file should give the full picture (input, output, errors, handler, format). Don't extract a shared `errors[]` constant or contract module to deduplicate; per-tool repetition is the intended cost of locality, and dynamic `recovery` hints often need tool-specific context anyway.
+
 **Service-thrown reasons.** Services don't have `ctx.fail`, but they receive `ctx`. Pass `data: { reason, ...ctx.recoveryFor(reason) }` from a factory throw — the auto-classifier preserves `data` so clients see the same `error.data.reason` they'd see from `ctx.fail`.
 
 ```ts
@@ -291,6 +293,7 @@ Available skills:
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
+| `tool-defs-analysis` | Read-only audit of definition language across tools/resources/prompts (10 categories the LLM reads to decide whether and how to call) |
 | `devcheck` | Lint, format, typecheck, audit |
 | `security-pass` | 8-axis pre-release MCP server security audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
@@ -300,6 +303,7 @@ Available skills:
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
 | `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
+| `api-canvas` | DataCanvas (Tier 3, opt-in) — register tabular data, run SQL, export, plus `spillover()` for big result sets |
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, logger, state, progress |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |

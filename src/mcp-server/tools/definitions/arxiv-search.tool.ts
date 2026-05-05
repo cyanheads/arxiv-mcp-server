@@ -20,6 +20,21 @@ export const arxivSearch = tool('arxiv_search', {
       when: 'Provided category code is not part of the arXiv taxonomy.',
       recovery: 'Call arxiv_list_categories to discover valid category codes and retry.',
     },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
+      retryable: true,
+      recovery:
+        'Wait for the cooldown indicated by error.data.retryAfter (seconds) before retrying.',
+    },
+    {
+      reason: 'invalid_request',
+      code: JsonRpcErrorCode.InvalidRequest,
+      when: 'arXiv rejected the request (HTTP 4xx other than 429), typically malformed query syntax.',
+      recovery:
+        'Check query syntax — use field prefixes ti:, au:, abs:, cat: and boolean operators AND, OR, ANDNOT.',
+    },
   ],
 
   input: z.object({

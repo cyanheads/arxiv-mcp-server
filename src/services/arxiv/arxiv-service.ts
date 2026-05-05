@@ -16,7 +16,11 @@ import {
   serviceUnavailable,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  httpErrorFromResponse,
+  type RequestContext,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 import { XMLParser } from 'fast-xml-parser';
 import { getServerConfig } from '@/config/server-config.js';
 import { suggestCategories, VALID_CATEGORY_CODES } from './categories.js';
@@ -118,30 +122,6 @@ function isArxivTransient(err: unknown): boolean {
   }
   // Non-McpError (raw network errors, unexpected throws): treat as transient.
   return true;
-}
-
-/**
- * Extract a `RequestContext`-shaped object from `Context` for `withRetry`'s
- * logging correlation. Direct assignment fails under
- * `exactOptionalPropertyTypes: true` because `Context.auth` is `AuthContext |
- * undefined` (explicit) while `RequestContext.auth?` is just `AuthContext`.
- * The framework docstring confirms passing handler `Context` is safe at
- * runtime; this shim makes it satisfy TypeScript too.
- */
-function ctxAsRequestContext(ctx: Context): {
-  requestId: string;
-  timestamp: string;
-  traceId?: string;
-  spanId?: string;
-  tenantId?: string;
-} {
-  return {
-    requestId: ctx.requestId,
-    timestamp: ctx.timestamp,
-    ...(ctx.traceId !== undefined && { traceId: ctx.traceId }),
-    ...(ctx.spanId !== undefined && { spanId: ctx.spanId }),
-    ...(ctx.tenantId !== undefined && { tenantId: ctx.tenantId }),
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +299,7 @@ export class ArxivService {
       },
       {
         operation: 'arxivSearch',
-        context: ctxAsRequestContext(ctx),
+        context: ctx as unknown as RequestContext,
         signal: ctx.signal,
         isTransient: isArxivTransient,
         maxRetries: 1,
@@ -342,7 +322,7 @@ export class ArxivService {
       },
       {
         operation: 'arxivGetPapers',
-        context: ctxAsRequestContext(ctx),
+        context: ctx as unknown as RequestContext,
         signal: ctx.signal,
         isTransient: isArxivTransient,
         maxRetries: 1,
@@ -379,7 +359,7 @@ export class ArxivService {
     // Same fail-fast-on-rate-limit policy as API calls — see isArxivTransient.
     const { content, source } = await withRetry(() => this.fetchHtml(paper.id, ctx), {
       operation: 'arxivFetchHtml',
-      context: ctxAsRequestContext(ctx),
+      context: ctx as unknown as RequestContext,
       signal: ctx.signal,
       isTransient: isArxivTransient,
       maxRetries: 1,
@@ -446,7 +426,11 @@ export class ArxivService {
       ) {
         if (text.includes('Rate exceeded')) {
           this.applyCooldown(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
-          throw rateLimited('arXiv rate limit exceeded', { url });
+          throw rateLimited('arXiv rate limit exceeded', {
+            url,
+            reason: 'rate_limited',
+            ...ctx.recoveryFor('rate_limited'),
+          });
         }
         // Unexpected content-type indicates upstream behavior change or proxy
         // interference — treat as non-transient so withRetry doesn't waste cycles.
@@ -479,12 +463,16 @@ export class ArxivService {
             status: response.status,
             body: text.slice(0, 500),
             ...(retryAfter !== null && { retryAfter }),
+            reason: 'rate_limited',
+            ...ctx.recoveryFor('rate_limited'),
           });
         }
         throw invalidRequest(`arXiv API returned HTTP ${response.status}`, {
           url,
           status: response.status,
           body: text.slice(0, 500),
+          reason: 'invalid_request',
+          ...ctx.recoveryFor('invalid_request'),
         });
       }
 

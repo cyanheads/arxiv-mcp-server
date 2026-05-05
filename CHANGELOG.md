@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.16](changelog/0.1.x/0.1.16.md) — 2026-05-05
+
+Error-contract conformance pass — every non-baseline throw on every API-using surface now carries a typed contract entry and resolves its recovery hint at runtime. Bumps mcp-ts-core 0.8.7 → 0.8.15.
+
 ## [0.1.15](changelog/0.1.x/0.1.15.md) — 2026-04-30
 
 arxiv_read_paper adds `start` offset for chunk-by-chunk pagination on long papers; HTML cleaner preserves ltx_section/title structural markers; description clarifies arxiv.org/html → ar5iv fallback (no PDF auto-extract)

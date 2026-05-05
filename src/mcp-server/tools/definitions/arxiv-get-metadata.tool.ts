@@ -35,6 +35,20 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       recovery:
         'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and confirm the paper exists via arxiv_search.',
     },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
+      retryable: true,
+      recovery:
+        'Wait for the cooldown indicated by error.data.retryAfter (seconds) before retrying.',
+    },
+    {
+      reason: 'invalid_request',
+      code: JsonRpcErrorCode.InvalidRequest,
+      when: 'arXiv rejected the request (HTTP 4xx other than 429), e.g. malformed ID syntax.',
+      recovery: 'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and retry.',
+    },
   ],
 
   input: z.object({
