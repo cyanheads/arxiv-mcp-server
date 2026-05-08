@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-05-08
+
+Fix retry storm on AbortSignal.timeout — connection-layer arXiv throttle now classified as Timeout (non-retryable) instead of ServiceUnavailable (retryable), cutting caller-visible latency from 60-90s to 15s. Framework refresh 0.8.15 → 0.8.19.
+
 ## [0.1.16](changelog/0.1.x/0.1.16.md) — 2026-05-05
 
 Error-contract conformance pass — every non-baseline throw on every API-using surface now carries a typed contract entry and resolves its recovery hint at runtime. Bumps mcp-ts-core 0.8.7 → 0.8.15.

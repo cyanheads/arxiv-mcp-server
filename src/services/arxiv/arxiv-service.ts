@@ -14,6 +14,7 @@ import {
   rateLimited,
   serializationError,
   serviceUnavailable,
+  timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import {
@@ -106,19 +107,24 @@ function parseRetryAfter(value: string): number | null {
 }
 
 /**
- * Retry predicate for arXiv calls. Excludes `RateLimited` from the framework's
- * default transient set: when arXiv signals rate-limit (HTTP 429 or a 200 OK
- * with `Rate exceeded.` body), retrying violates arXiv's documented 3-second
- * crawl etiquette and amplifies the throttle. Surface the error to the caller
- * immediately and let them honor the `Retry-After` carried on `error.data`.
+ * Retry predicate for arXiv calls. Excludes both `RateLimited` and `Timeout`
+ * from the framework's default transient set:
  *
- * Issue: https://github.com/cyanheads/arxiv-mcp-server/issues/8
+ * - `RateLimited`: surfaced when arXiv signals throttle (HTTP 429 or a 200 OK
+ *   with `Rate exceeded.` body). Retrying violates arXiv's documented 3-second
+ *   crawl etiquette and amplifies the throttle. See issue #8.
+ * - `Timeout`: when arXiv is throttling at the connection layer (instead of
+ *   returning a `Rate exceeded.` body), fetches hang until our 15s timeout
+ *   fires. A retry just spends another 15s waiting for the same throttled
+ *   connection, doubling caller-visible latency and upstream load. Treat
+ *   timeouts the same as explicit rate-limits — surface immediately.
+ *
+ * Only `ServiceUnavailable` (5xx and raw network blips) and unknown non-McpError
+ * throws stay retryable.
  */
 function isArxivTransient(err: unknown): boolean {
   if (err instanceof McpError) {
-    return (
-      err.code === JsonRpcErrorCode.ServiceUnavailable || err.code === JsonRpcErrorCode.Timeout
-    );
+    return err.code === JsonRpcErrorCode.ServiceUnavailable;
   }
   // Non-McpError (raw network errors, unexpected throws): treat as transient.
   return true;
@@ -412,6 +418,16 @@ export class ArxivService {
         });
       } catch (err) {
         if (ctx.signal.aborted) throw err;
+        // AbortSignal.timeout fires with a DOMException named TimeoutError.
+        // Classify as Timeout (non-retryable per isArxivTransient) — a 15s hang
+        // is overwhelmingly throttling at the connection layer, not a blip.
+        if (err instanceof Error && err.name === 'TimeoutError') {
+          throw timeout(
+            `arXiv API timed out after ${config.apiTimeoutMs}ms`,
+            { url, timeoutMs: config.apiTimeoutMs },
+            { cause: err },
+          );
+        }
         throw serviceUnavailable('arXiv API network error', { url }, { cause: err });
       }
 
@@ -546,6 +562,13 @@ export class ArxivService {
         });
       } catch (err) {
         if (ctx.signal.aborted) throw err;
+        if (err instanceof Error && err.name === 'TimeoutError') {
+          throw timeout(
+            `arxiv.org HTML timed out after ${config.contentTimeoutMs}ms`,
+            { paperId, timeoutMs: config.contentTimeoutMs },
+            { cause: err },
+          );
+        }
         throw serviceUnavailable('arxiv.org HTML network error', { paperId }, { cause: err });
       }
       if (response.ok) return { content: await response.text(), source: 'arxiv_html' };
@@ -572,6 +595,13 @@ export class ArxivService {
         });
       } catch (err) {
         if (ctx.signal.aborted) throw err;
+        if (err instanceof Error && err.name === 'TimeoutError') {
+          throw timeout(
+            `ar5iv timed out after ${config.contentTimeoutMs}ms`,
+            { paperId, timeoutMs: config.contentTimeoutMs },
+            { cause: err },
+          );
+        }
         throw serviceUnavailable('ar5iv network error', { paperId }, { cause: err });
       }
       if (response.ok) return { content: await response.text(), source: 'ar5iv' };

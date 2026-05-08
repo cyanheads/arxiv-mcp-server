@@ -256,6 +256,26 @@ describe('ArxivService.search', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   }, 10_000);
 
+  it('fails fast on fetch timeout without retrying', async () => {
+    // AbortSignal.timeout fires when arXiv hangs (typically connection-layer
+    // throttling). The previous classification wrapped this as ServiceUnavailable
+    // and retried, doubling caller-visible latency and upstream load. Surface as
+    // Timeout and let the caller back off. See production logs 2026-05-08
+    // (sessionId fae92e81…, requests with rootCause TimeoutError, durationMs 60-90s).
+    const timeoutErr = Object.assign(new Error('The operation timed out.'), {
+      name: 'TimeoutError',
+    });
+    mockFetch.mockRejectedValueOnce(timeoutErr);
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.search('all:test', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
   it('fails fast on HTTP 429 and surfaces Retry-After header', async () => {
     // 429 means arXiv is throttling — retrying makes it worse. Surface the
     // Retry-After header so clients can honor the cooldown. See issue #8.
