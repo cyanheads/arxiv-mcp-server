@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-05-05 12:43:16
+Generated on: 2026-05-16 17:00:23
 
 ```text
 arxiv-mcp-server/
@@ -62,6 +62,8 @@ arxiv-mcp-server/
 │   │   │   ├── graph.md
 │   │   │   ├── llm.md
 │   │   │   └── speech.md
+│   │   └── SKILL.md
+│   ├── api-telemetry/
 │   │   └── SKILL.md
 │   ├── api-testing/
 │   │   └── SKILL.md

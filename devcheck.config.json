@@ -12,6 +12,6 @@
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": []
+    "allowlist": ["fast-xml-parser"]
   }
 }

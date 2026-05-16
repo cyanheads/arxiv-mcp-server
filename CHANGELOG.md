@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.18](changelog/0.1.x/0.1.18.md) — 2026-05-16
+
+Adopt server-level `instructions` from `@cyanheads/mcp-ts-core` 0.9.x — spec-compliant clients now forward arXiv tool orientation to the model on every `initialize`. Framework refresh 0.8.19 → 0.9.1 (portability lint family, Workers `nodejs_compat` boot fix, SSRF hardening, changelog summary cap 250 → 350 chars).
+
 ## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-05-08
 
 Fix retry storm on AbortSignal.timeout — connection-layer arXiv throttle now classified as Timeout (non-retryable) instead of ServiceUnavailable (retryable), cutting caller-visible latency from 60-90s to 15s. Framework refresh 0.8.15 → 0.8.19.
