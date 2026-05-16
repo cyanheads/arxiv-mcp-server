@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-05-16 17:00:23
+Generated on: 2026-05-16 19:22:39
 
 ```text
 arxiv-mcp-server/
@@ -152,6 +152,7 @@ arxiv-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

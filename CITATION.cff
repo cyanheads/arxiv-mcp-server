@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: arxiv-mcp-server
+abstract: "Model Context Protocol (MCP) server for the arXiv preprint repository, providing paper search with field prefixes and boolean operators, metadata retrieval, full-text HTML reading via arXiv and ar5iv, and category taxonomy browsing."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/arxiv-mcp-server"
+license: Apache-2.0
+keywords:
+  - mcp
+  - model-context-protocol
+  - arxiv
+  - preprints
+  - academic-research
+  - scholarly-search
