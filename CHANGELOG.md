@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.19](changelog/0.1.x/0.1.19.md) — 2026-05-18
+
+Field-test fixes from issues #4 — #10: `arxiv_get_metadata` preserves input order; `arxiv_read_paper` honors version suffix in HTML URLs and collapses MathML to dollar-delimited LaTeX (2-3× shrink); category suggestions rank by edit distance; rate-limit cooldown grows geometrically (5s → 10s → 20s → 30s capped) per consecutive hit.
+
 ## [0.1.18](changelog/0.1.x/0.1.18.md) — 2026-05-16
 
 Adopt server-level `instructions` from `@cyanheads/mcp-ts-core` 0.9.x — spec-compliant clients now forward arXiv tool orientation to the model on every `initialize`. Framework refresh 0.8.19 → 0.9.1 (portability lint family, Workers `nodejs_compat` boot fix, SSRF hardening, changelog summary cap 250 → 350 chars).

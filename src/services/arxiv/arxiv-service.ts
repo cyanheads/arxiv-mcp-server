@@ -208,10 +208,42 @@ const LATEXML_STRUCTURAL_CLASS =
   /\bltx_(?:section|subsection|subsubsection|paragraph|subparagraph|appendix|bibliography|abstract|acknowledgements?|title|part|chapter)\b/;
 
 /**
- * Strip LaTeXML-generated class/id noise and collapse redundant break runs.
- * LaTeXML emits `class="ltx_..."` and generated `id="..."` on nearly every element;
- * neither carries information a reader (human or LLM) benefits from. Stripping
- * them typically shrinks a math-heavy paper's HTML by 3-4x with zero content loss.
+ * Collapse `<math>…</math>` elements to their LaTeX source, preserving the
+ * inline-vs-block distinction. A typical inline `70%` expands to ~250 chars of
+ * presentation MathML; the same content is present in the
+ * `<annotation encoding="application/x-tex">` child as ~4 chars. On math-heavy
+ * papers the MathML markup consumes the majority of the response budget while
+ * carrying no incremental signal for a reader who can parse LaTeX. See issue #4.
+ *
+ * Preference order for the LaTeX source:
+ *   1. `<annotation encoding="application/x-tex">…</annotation>` child
+ *   2. `alttext="…"` attribute on the `<math>` element
+ * If neither is present, the math element is dropped entirely.
+ *
+ * HTML entities (`&lt;`, `&gt;`, `&amp;`) in the LaTeX source are decoded so the
+ * downstream consumer sees the raw TeX literally.
+ */
+function collapseMathML(html: string): string {
+  return html.replace(/<math\b([^>]*)>([\s\S]*?)<\/math>/g, (_, attrs: string, inner: string) => {
+    const block = /\bdisplay=["']block["']/i.test(attrs);
+    const annot = inner.match(
+      /<annotation[^>]*encoding=["']application\/x-tex["'][^>]*>([\s\S]*?)<\/annotation>/,
+    )?.[1];
+    const alt = attrs.match(/\balttext=["']([^"']*)["']/)?.[1];
+    const tex = annot ?? alt;
+    if (!tex) return '';
+    const decoded = tex.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    return block ? `$$${decoded}$$` : `$${decoded}$`;
+  });
+}
+
+/**
+ * Strip LaTeXML-generated class/id noise, collapse MathML to LaTeX, and collapse
+ * redundant break runs. LaTeXML emits `class="ltx_..."` and generated `id="..."`
+ * on nearly every element, and renders inline math as full MathML trees whose
+ * `<annotation encoding="application/x-tex">` child already carries the same
+ * content in a fraction of the bytes. Stripping these typically shrinks a
+ * math-heavy paper's HTML by an order of magnitude with zero content loss.
  *
  * Exception: class attributes containing a structural marker (see
  * LATEXML_STRUCTURAL_CLASS) are preserved verbatim so section boundaries remain
@@ -219,7 +251,7 @@ const LATEXML_STRUCTURAL_CLASS =
  */
 function stripLatexmlNoise(html: string): string {
   return (
-    html
+    collapseMathML(html)
       .replace(/\s+class="(ltx_[^"]*)"/gi, (match, value) =>
         LATEXML_STRUCTURAL_CLASS.test(value) ? match : '',
       )
@@ -251,6 +283,13 @@ export class ArxivService {
    * doesn't trigger N parallel rate-limit failures across the queue.
    */
   private cooldownUntilMs = 0;
+  /**
+   * Count of rate-limit events since the last successful API response. Drives
+   * geometric cooldown growth so a session that keeps tripping the limit backs
+   * off increasingly rather than thrashing at the 5s minimum. Reset to 0 on the
+   * next successful response. See issue #9.
+   */
+  private consecutiveRateLimits = 0;
 
   constructor() {
     this.parser = new XMLParser({
@@ -335,12 +374,19 @@ export class ArxivService {
       },
     );
 
-    // Cross-reference to detect not-found IDs
-    const foundBaseIds = new Set(result.entries.map((p) => stripVersion(p.id)));
-    const notFoundIds = ids.filter((id) => !foundBaseIds.has(stripVersion(id)));
+    // Re-index by input order — arXiv returns entries in its own internal order
+    // (typically submission-date desc), so a caller stitching results back to an
+    // ordered reference list would otherwise silently misalign. See issue #5.
+    // Both input and response sides are normalized via stripVersion since input
+    // may be versioned or not and arXiv always returns versioned IDs.
+    const byBaseId = new Map(result.entries.map((p) => [stripVersion(p.id), p]));
+    const ordered = ids
+      .map((id) => byBaseId.get(stripVersion(id)))
+      .filter((p): p is PaperMetadata => p !== undefined);
+    const notFoundIds = ids.filter((id) => !byBaseId.has(stripVersion(id)));
 
     return {
-      papers: result.entries,
+      papers: ordered,
       ...(notFoundIds.length > 0 ? { not_found_ids: notFoundIds } : {}),
     };
   }
@@ -441,9 +487,13 @@ export class ArxivService {
         !contentType.includes('application/atom+xml')
       ) {
         if (text.includes('Rate exceeded')) {
-          this.applyCooldown(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
-          throw rateLimited('arXiv rate limit exceeded', {
+          const cooldownAppliedMs = this.recordRateLimit();
+          throw rateLimited(this.rateLimitMessage(cooldownAppliedMs), {
             url,
+            status: response.status,
+            body: text.slice(0, 500),
+            cooldownAppliedMs,
+            consecutiveRateLimits: this.consecutiveRateLimits,
             reason: 'rate_limited',
             ...ctx.recoveryFor('rate_limited'),
           });
@@ -473,12 +523,14 @@ export class ArxivService {
         if (response.status === 429) {
           const retryAfter = response.headers.get('retry-after');
           const parsedMs = retryAfter !== null ? parseRetryAfter(retryAfter) : null;
-          this.applyCooldown(parsedMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS);
-          throw rateLimited(`arXiv API returned HTTP 429`, {
+          const cooldownAppliedMs = this.recordRateLimit(parsedMs ?? undefined);
+          throw rateLimited(this.rateLimitMessage(cooldownAppliedMs), {
             url,
             status: response.status,
             body: text.slice(0, 500),
             ...(retryAfter !== null && { retryAfter }),
+            cooldownAppliedMs,
+            consecutiveRateLimits: this.consecutiveRateLimits,
             reason: 'rate_limited',
             ...ctx.recoveryFor('rate_limited'),
           });
@@ -492,8 +544,33 @@ export class ArxivService {
         });
       }
 
+      // Successful response — clear any active backoff so the next rate-limit
+      // event (if it ever recurs) starts from the 5s base again.
+      this.consecutiveRateLimits = 0;
       return text;
     });
+  }
+
+  /**
+   * Record a rate-limit event and compute the cooldown to apply. Grows the
+   * cooldown geometrically with `consecutiveRateLimits` (5s, 10s, 20s, 30s
+   * capped) so a persistently-throttled session backs off increasingly. When
+   * arXiv sent a `Retry-After` header, the larger of (adaptive, header) wins
+   * so we never wait less than upstream asked for.
+   */
+  private recordRateLimit(retryAfterMs?: number): number {
+    this.consecutiveRateLimits += 1;
+    const adaptive = Math.min(
+      DEFAULT_RATE_LIMIT_COOLDOWN_MS * 2 ** (this.consecutiveRateLimits - 1),
+      MAX_COOLDOWN_MS,
+    );
+    const cooldownMs = Math.min(Math.max(adaptive, retryAfterMs ?? 0), MAX_COOLDOWN_MS);
+    this.applyCooldown(cooldownMs);
+    return cooldownMs;
+  }
+
+  private rateLimitMessage(cooldownAppliedMs: number): string {
+    return `arXiv rate limit exceeded — server applied ${cooldownAppliedMs}ms cooldown; consider reducing concurrency before next call`;
   }
 
   /**
@@ -549,14 +626,17 @@ export class ArxivService {
     ctx: Context,
   ): Promise<{ content: string; source: 'arxiv_html' | 'ar5iv' }> {
     const config = getServerConfig();
-    const baseId = stripVersion(paperId);
+    // Pass the paperId through verbatim — both arxiv.org/html and ar5iv honor a
+    // version suffix when present (`/html/2401.12345v1` serves v1; bare ID serves
+    // latest). Stripping unconditionally discarded the caller's intent when they
+    // asked for a specific version. See issue #10.
 
     // Try native arXiv HTML first
     {
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
       let response: Response;
       try {
-        response = await fetch(`https://arxiv.org/html/${baseId}`, {
+        response = await fetch(`https://arxiv.org/html/${paperId}`, {
           signal,
           headers: { 'user-agent': USER_AGENT, accept: 'text/html' },
         });
@@ -588,7 +668,7 @@ export class ArxivService {
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
       let response: Response;
       try {
-        response = await fetch(`https://ar5iv.labs.arxiv.org/html/${baseId}`, {
+        response = await fetch(`https://ar5iv.labs.arxiv.org/html/${paperId}`, {
           signal,
           redirect: 'manual',
           headers: { 'user-agent': USER_AGENT, accept: 'text/html' },
@@ -616,7 +696,7 @@ export class ArxivService {
     }
 
     throw notFound(
-      `HTML content not available for paper '${paperId}'. The PDF is available at https://arxiv.org/pdf/${baseId}`,
+      `HTML content not available for paper '${paperId}'. The PDF is available at https://arxiv.org/pdf/${paperId}`,
       {
         paperId,
         reason: 'html_unavailable',

@@ -53,7 +53,7 @@ export const arxivSearch = tool('arxiv_search', {
       // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — this regex filters them out.
       .regex(/^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$/, 'Query contains control characters.')
       .describe(
-        `Search query. Supports field prefixes: ti: (title), au: (author), abs: (abstract), cat: (category), co: (comment), jr: (journal ref), all: (all fields). Boolean operators: AND, OR, ANDNOT. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
+        `Search query. Field prefixes: ti: (title), au: (author — token-based; quote multi-token names like au:"hinton g" or pair with a topical clause to disambiguate common surnames), abs: (abstract), cat: (category — exact code match, not fuzzy), co: (comment), jr: (journal ref), all: (all fields). Boolean operators: AND, OR, ANDNOT. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
       ),
     category: z
       .string()

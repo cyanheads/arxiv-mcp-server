@@ -229,29 +229,32 @@ export const VALID_CATEGORY_CODES: ReadonlySet<string> = new Set(
 
 /**
  * Suggest up to `limit` valid category codes closest to an invalid input.
- * Prefers codes sharing the archive prefix ("cs.INVALID" → "cs.AI", "cs.CC", ...);
- * falls back to closest match by edit distance when no prefix matches.
+ * Prefers codes sharing the archive prefix, then ranks within that group by
+ * edit distance — `"cs.LB"` returns `"cs.LG"`, `"cs.LO"` ahead of `"cs.AI"`.
+ * Falls back to closest match across the full taxonomy when no prefix matches.
+ * See issue #6.
  */
 export function suggestCategories(code: string, limit = 5): string[] {
   const trimmed = code.trim();
   if (!trimmed) return [];
-  const prefix = trimmed.split('.')[0]?.toLowerCase();
+  const lower = trimmed.toLowerCase();
+  const prefix = lower.split('.')[0];
+
+  const rankByDistance = (pool: readonly ArxivCategory[]): string[] =>
+    pool
+      .map((cat) => ({ code: cat.code, d: editDistance(lower, cat.code.toLowerCase()) }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, limit)
+      .map((x) => x.code);
 
   if (prefix) {
     const prefixed = ARXIV_CATEGORIES.filter(
       (cat) => cat.code.toLowerCase().startsWith(`${prefix}.`) || cat.code.toLowerCase() === prefix,
     );
-    if (prefixed.length > 0) return prefixed.slice(0, limit).map((cat) => cat.code);
+    if (prefixed.length > 0) return rankByDistance(prefixed);
   }
 
-  const lower = trimmed.toLowerCase();
-  return ARXIV_CATEGORIES.map((cat) => ({
-    code: cat.code,
-    d: editDistance(lower, cat.code.toLowerCase()),
-  }))
-    .sort((a, b) => a.d - b.d)
-    .slice(0, limit)
-    .map((x) => x.code);
+  return rankByDistance(ARXIV_CATEGORIES);
 }
 
 /** Iterative Levenshtein distance — O(m*n) time, O(min(m,n)) space. */

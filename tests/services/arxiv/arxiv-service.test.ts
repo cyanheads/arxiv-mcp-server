@@ -302,20 +302,22 @@ describe('ArxivService.search', () => {
   it('honors Retry-After at the queue level — subsequent calls wait the cooldown', async () => {
     // When arXiv signals throttle, the cooldown applies to ALL queued calls,
     // not just the one that hit the rate-limit. Otherwise N concurrent callers
-    // each hit the same rate-limit window in parallel.
+    // each hit the same rate-limit window in parallel. Retry-After larger than
+    // the adaptive base (5s) wins; smaller values are floored by the adaptive
+    // formula. See issues #8, #9.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      // Call 1: 429 with Retry-After: 2 (seconds)
+      // Call 1: 429 with Retry-After: 8 (seconds) — larger than adaptive 5s base
       mockFetch.mockResolvedValueOnce(
         new Response('<feed/>', {
           status: 429,
           headers: {
             'content-type': 'application/atom+xml; charset=UTF-8',
-            'retry-after': '2',
+            'retry-after': '8',
           },
         }),
       );
-      // Call 2: success (should fire only after the 2s cooldown)
+      // Call 2: success (should fire only after the 8s cooldown)
       mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
 
       const service = getArxivService();
@@ -327,7 +329,7 @@ describe('ArxivService.search', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
 
       // Advance just shy of the cooldown — second call still waiting.
-      await vi.advanceTimersByTimeAsync(1500);
+      await vi.advanceTimersByTimeAsync(7500);
       expect(mockFetch).toHaveBeenCalledTimes(1);
 
       // Advance past the cooldown — second call dispatches and resolves.
@@ -338,6 +340,160 @@ describe('ArxivService.search', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('grows cooldown geometrically on consecutive rate-limit hits (issue #9)', async () => {
+    // First hit: 5s, second: 10s, third: 20s, fourth: 30s (capped). The error
+    // data surfaces cooldownAppliedMs and consecutiveRateLimits so callers can
+    // self-throttle.
+    const rateLimited200 = (): Response =>
+      new Response('Rate exceeded.', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      });
+    mockFetch
+      .mockResolvedValueOnce(rateLimited200())
+      .mockResolvedValueOnce(rateLimited200())
+      .mockResolvedValueOnce(rateLimited200())
+      .mockResolvedValueOnce(rateLimited200());
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const service = getArxivService();
+      const expected = [
+        { cooldownAppliedMs: 5_000, consecutiveRateLimits: 1, advance: 5_100 },
+        { cooldownAppliedMs: 10_000, consecutiveRateLimits: 2, advance: 10_100 },
+        { cooldownAppliedMs: 20_000, consecutiveRateLimits: 3, advance: 20_100 },
+        { cooldownAppliedMs: 30_000, consecutiveRateLimits: 4, advance: 0 },
+      ];
+      for (const { cooldownAppliedMs, consecutiveRateLimits, advance } of expected) {
+        const p = service.search('t', {}, createMockContext());
+        await expect(p).rejects.toMatchObject({
+          code: JsonRpcErrorCode.RateLimited,
+          data: { cooldownAppliedMs, consecutiveRateLimits },
+        });
+        if (advance > 0) await vi.advanceTimersByTimeAsync(advance);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resets consecutive rate-limit counter on successful response (issue #9)', async () => {
+    // Two rate-limit hits grow the cooldown, then a success resets the counter
+    // so the next rate-limit goes back to the 5s base.
+    const rateLimited200 = (): Response =>
+      new Response('Rate exceeded.', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      });
+    mockFetch
+      .mockResolvedValueOnce(rateLimited200()) // 5s
+      .mockResolvedValueOnce(rateLimited200()) // 10s
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE)) // success → reset
+      .mockResolvedValueOnce(rateLimited200()); // 5s again (not 20s)
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const service = getArxivService();
+
+      const p1 = service.search('t', {}, createMockContext());
+      await expect(p1).rejects.toMatchObject({
+        data: { cooldownAppliedMs: 5_000, consecutiveRateLimits: 1 },
+      });
+      await vi.advanceTimersByTimeAsync(5_100);
+
+      const p2 = service.search('t', {}, createMockContext());
+      await expect(p2).rejects.toMatchObject({
+        data: { cooldownAppliedMs: 10_000, consecutiveRateLimits: 2 },
+      });
+      await vi.advanceTimersByTimeAsync(10_100);
+
+      // Success — counter resets
+      await service.search('t', {}, createMockContext());
+
+      // Next rate-limit starts fresh at the 5s base
+      const p4 = service.search('t', {}, createMockContext());
+      await expect(p4).rejects.toMatchObject({
+        data: { cooldownAppliedMs: 5_000, consecutiveRateLimits: 1 },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('200 "Rate exceeded" and 429 rate-limit paths emit symmetric error data (issue #9)', async () => {
+    // Both paths must carry the same diagnostic fields so callers can branch on
+    // a single shape. Pre-fix, the 200 path emitted only {url}. The recovery
+    // hint is added at the tool/resource layer (via ctx.recoveryFor), not in
+    // the service, so this check covers service-level parity only.
+    const expectedKeys = new Set([
+      'url',
+      'status',
+      'body',
+      'cooldownAppliedMs',
+      'consecutiveRateLimits',
+      'reason',
+    ]);
+
+    // 200 + Rate exceeded
+    mockFetch.mockResolvedValueOnce(
+      new Response('Rate exceeded.', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      }),
+    );
+    let service = getArxivService();
+    let err: unknown;
+    try {
+      await service.search('t', {}, createMockContext());
+    } catch (e) {
+      err = e;
+    }
+    const data200 = (err as { data: Record<string, unknown> }).data;
+    for (const key of expectedKeys) {
+      expect(data200, `200 path missing ${key}`).toHaveProperty(key);
+    }
+    expect(data200.status).toBe(200);
+
+    // Reset service so the counter starts fresh
+    initArxivService();
+    service = getArxivService();
+
+    // 429
+    mockFetch.mockResolvedValueOnce(
+      new Response('Rate exceeded', {
+        status: 429,
+        headers: {
+          'content-type': 'application/atom+xml; charset=UTF-8',
+          'retry-after': '4',
+        },
+      }),
+    );
+    try {
+      await service.search('t', {}, createMockContext());
+    } catch (e) {
+      err = e;
+    }
+    const data429 = (err as { data: Record<string, unknown> }).data;
+    for (const key of expectedKeys) {
+      expect(data429, `429 path missing ${key}`).toHaveProperty(key);
+    }
+    expect(data429.status).toBe(429);
+    expect(data429.retryAfter).toBe('4');
+  });
+
+  it('rate-limit message names the applied cooldown in ms (issue #9)', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response('Rate exceeded.', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      }),
+    );
+    const service = getArxivService();
+    await expect(service.search('t', {}, createMockContext())).rejects.toThrow(
+      /arXiv rate limit exceeded — server applied 5000ms cooldown/,
+    );
   });
 
   it('skips queued requests whose ctx.signal aborted before their turn', async () => {
@@ -389,6 +545,77 @@ describe('ArxivService.getPapers', () => {
 
     expect(result.papers).toHaveLength(1);
     expect(result.not_found_ids).toEqual(['9999.99999']);
+  });
+
+  it('preserves input order regardless of arXiv response order (issue #5)', async () => {
+    // arXiv returns entries in submission-date desc, not the order we asked
+    // for. The service must re-index by input so callers can stitch metadata
+    // back to an ordered reference list.
+    const ATOM_REORDERED = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>3</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00003v1</id>
+    <title>C</title><summary>c</summary>
+    <author><name>X</name></author>
+    <published>2024-03-01T00:00:00Z</published><updated>2024-03-01T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00001v1</id>
+    <title>A</title><summary>a</summary>
+    <author><name>X</name></author>
+    <published>2024-01-01T00:00:00Z</published><updated>2024-01-01T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00002v1</id>
+    <title>B</title><summary>b</summary>
+    <author><name>X</name></author>
+    <published>2024-02-01T00:00:00Z</published><updated>2024-02-01T00:00:00Z</updated>
+  </entry>
+</feed>`;
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_REORDERED));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.getPapers(['2401.00001', '2401.00002', '2401.00003'], ctx);
+
+    expect(result.papers.map((p) => p.id)).toEqual([
+      '2401.00001v1',
+      '2401.00002v1',
+      '2401.00003v1',
+    ]);
+  });
+
+  it('preserves input order across mixed versioned and unversioned IDs (issue #5)', async () => {
+    // Input may carry version suffixes inconsistently; the reorder must compare
+    // by base id so a versioned input lines up with arXiv's versioned response.
+    const ATOM_MIXED = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>2</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00002v3</id>
+    <title>B</title><summary>b</summary>
+    <author><name>X</name></author>
+    <published>2024-02-01T00:00:00Z</published><updated>2024-02-01T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00001v1</id>
+    <title>A</title><summary>a</summary>
+    <author><name>X</name></author>
+    <published>2024-01-01T00:00:00Z</published><updated>2024-01-01T00:00:00Z</updated>
+  </entry>
+</feed>`;
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_MIXED));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.getPapers(['2401.00001v1', '2401.00002'], ctx);
+
+    expect(result.papers.map((p) => p.id)).toEqual(['2401.00001v1', '2401.00002v3']);
   });
 
   it('handles sparse upstream entries without fabricating optional fields', async () => {
@@ -516,6 +743,97 @@ describe('ArxivService.readContent', () => {
     expect(mockFetch).toHaveBeenCalledTimes(3);
   });
 
+  it('forwards the versioned paper ID to arxiv.org HTML fetch (issue #10)', async () => {
+    // Versioned input must reach the HTML host with the version intact —
+    // arxiv.org/html honors a version suffix, so stripping it silently served
+    // the latest version instead of the requested one.
+    const ATOM_V1 = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.12345v1</id>
+    <title>V1 Title</title><summary>v1 abstract</summary>
+    <author><name>X</name></author>
+    <published>2024-01-22T00:00:00Z</published><updated>2024-01-22T00:00:00Z</updated>
+  </entry>
+</feed>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_V1))
+      .mockResolvedValueOnce(htmlResponse('<html>v1 body</html>'));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.readContent('2401.12345v1', {}, ctx);
+
+    // Second fetch (HTML) URL must include the version
+    const htmlUrl = String(mockFetch.mock.calls[1]?.[0]);
+    expect(htmlUrl).toBe('https://arxiv.org/html/2401.12345v1');
+  });
+
+  it('forwards the versioned ID through to the ar5iv fallback (issue #10)', async () => {
+    // When arxiv.org/html returns 404 for a versioned paper, the ar5iv fallback
+    // must also receive the version — not the stripped form.
+    const ATOM_V1 = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.12345v2</id>
+    <title>V2</title><summary>v2</summary>
+    <author><name>X</name></author>
+    <published>2024-02-01T00:00:00Z</published><updated>2024-02-01T00:00:00Z</updated>
+  </entry>
+</feed>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_V1))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(htmlResponse('<html>v2 from ar5iv</html>'));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.readContent('2401.12345v2', {}, ctx);
+
+    expect(String(mockFetch.mock.calls[1]?.[0])).toBe('https://arxiv.org/html/2401.12345v2');
+    expect(String(mockFetch.mock.calls[2]?.[0])).toBe(
+      'https://ar5iv.labs.arxiv.org/html/2401.12345v2',
+    );
+  });
+
+  it('points the PDF fallback hint at the same version that was requested (issue #10)', async () => {
+    // When HTML is genuinely unavailable, the error message points the caller
+    // at the PDF — and that hint must match the version they asked for, not the
+    // stripped form.
+    const ATOM_V1 = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.12345v1</id>
+    <title>V1</title><summary>v1</summary>
+    <author><name>X</name></author>
+    <published>2024-01-22T00:00:00Z</published><updated>2024-01-22T00:00:00Z</updated>
+  </entry>
+</feed>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_V1))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.readContent('2401.12345v1', {}, ctx)).rejects.toThrow(
+      /https:\/\/arxiv\.org\/pdf\/2401\.12345v1/,
+    );
+  });
+
   it('throws notFound when paper does not exist', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
@@ -536,6 +854,109 @@ describe('ArxivService.readContent', () => {
     const service = getArxivService();
 
     await expect(service.readContent('2401.12345', {}, ctx)).rejects.toThrow(/not available/i);
+  });
+
+  it('collapses inline MathML to TeX annotation, reclaiming character budget (issue #4)', async () => {
+    // arXiv renders inline `70%` as ~250 chars of presentation MathML. The same
+    // content is present in the <annotation encoding="application/x-tex"> child
+    // as 4 chars. Collapsing typically shrinks math-heavy papers by an order of
+    // magnitude with zero content loss.
+    const mathTag =
+      '<math alttext="70\\%" display="inline">' +
+      '<semantics><mrow><mn>70</mn><mo>%</mo></mrow>' +
+      '<annotation encoding="application/x-tex">70\\%</annotation>' +
+      '</semantics></math>';
+    const raw = `<article><p>Fracture point at ${mathTag} utilization.</p></article>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.readContent('2401.12345', {}, ctx);
+
+    expect(result.content).not.toContain('<math');
+    expect(result.content).not.toContain('annotation');
+    expect(result.content).not.toContain('semantics');
+    expect(result.content).toContain('$70\\%$');
+    expect(result.content).toContain('Fracture point at');
+    expect(result.content).toContain('utilization');
+  });
+
+  it('marks display-block MathML with $$…$$ and inline with $…$ (issue #4)', async () => {
+    // Block-level math (display="block") wraps in $$…$$; inline math wraps in
+    // single $. The distinction is preserved so downstream consumers can render
+    // each appropriately.
+    const blockMath =
+      '<math display="block"><semantics><mrow><mi>E</mi><mo>=</mo><mi>m</mi><msup><mi>c</mi><mn>2</mn></msup></mrow>' +
+      '<annotation encoding="application/x-tex">E=mc^2</annotation>' +
+      '</semantics></math>';
+    const inlineMath =
+      '<math display="inline"><semantics><mi>x</mi>' +
+      '<annotation encoding="application/x-tex">x</annotation>' +
+      '</semantics></math>';
+    const raw = `<article><p>${blockMath} and inline ${inlineMath}.</p></article>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+    expect(result.content).toContain('$$E=mc^2$$');
+    expect(result.content).toContain('$x$');
+  });
+
+  it('falls back to alttext when no annotation child is present (issue #4)', async () => {
+    // Some arXiv pages render MathML without an x-tex annotation child but
+    // still carry the LaTeX source in the alttext attribute. Drop math
+    // elements that have neither.
+    const withAlt = '<math alttext="\\alpha" display="inline"><mi>α</mi></math>';
+    const noSource = '<math display="inline"><mi>β</mi></math>';
+    const raw = `<article><p>${withAlt} vs ${noSource}.</p></article>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+    expect(result.content).toContain('$\\alpha$');
+    // The annotation-less element is dropped entirely
+    expect(result.content).not.toContain('β');
+    expect(result.content).not.toContain('<math');
+  });
+
+  it('decodes HTML entities in the LaTeX source (issue #4)', async () => {
+    // The <annotation> child may carry HTML-encoded characters (&lt;, &gt;,
+    // &amp;) from the upstream LaTeXML transform. Decode them so downstream
+    // consumers see literal TeX, not HTML-escaped TeX.
+    const mathTag =
+      '<math display="inline"><semantics><mi>a</mi>' +
+      '<annotation encoding="application/x-tex">a &lt; b &amp;&amp; c &gt; d</annotation>' +
+      '</semantics></math>';
+    const raw = `<article><p>${mathTag}</p></article>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+    expect(result.content).toContain('$a < b && c > d$');
+  });
+
+  it('shrinks math-heavy bodies by an order of magnitude (issue #4)', async () => {
+    // Regression check on the practical benefit: a page where MathML dominates
+    // the byte budget should compress dramatically after collapse, leaving
+    // proportionally more characters for prose.
+    const mathExpr =
+      '<math alttext="x" display="inline">' +
+      '<semantics><mrow><mi>x</mi></mrow>' +
+      '<annotation encoding="application/x-tex">x</annotation>' +
+      '</semantics></math>';
+    // 200 inline math expressions, each ~250 chars raw → ~3 chars collapsed.
+    const raw = `<article><p>${mathExpr.repeat(200)}</p></article>`;
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(raw));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+    // Body should shrink at least 5x — in practice closer to 30x.
+    expect(result.body_characters).toBeLessThan(result.total_characters / 5);
   });
 
   it('strips LaTeXML class/id noise and reports body_characters distinct from total', async () => {

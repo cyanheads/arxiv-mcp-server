@@ -8,7 +8,7 @@
 
 [![npm](https://img.shields.io/npm/v/@cyanheads/arxiv-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/arxiv-mcp-server)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/arxiv-mcp-server)
-[![Version](https://img.shields.io/badge/Version-0.1.18-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
+[![Version](https://img.shields.io/badge/Version-0.1.19-blue.svg?style=flat-square)](./CHANGELOG.md) [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-259?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
 
@@ -60,7 +60,7 @@ Fetch full metadata for one or more papers by known arXiv ID.
 Read the full HTML content of an arXiv paper.
 
 - Tries native arXiv HTML first, falls back to ar5iv for broader coverage
-- Strips HTML head/boilerplate before truncation so the character budget targets paper content
+- Strips HTML head/boilerplate and collapses MathML to dollar-delimited LaTeX (`$…$` inline, `$$…$$` block) so the character budget targets paper content
 - `max_characters` defaults to 100,000; raw HTML can be 500KB-3MB+ for math-heavy papers
 - Returns raw HTML — no parsing or extraction; the LLM interprets content directly
 

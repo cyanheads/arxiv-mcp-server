@@ -68,6 +68,25 @@ describe('suggestCategories', () => {
     }
   });
 
+  it('ranks prefix-matched suggestions by edit distance (issue #6)', () => {
+    // cs.LB is a likely typo of cs.LG; previous behavior returned the first 5
+    // cs.* codes alphabetically (cs.AI, cs.AR, cs.CC, ...) regardless of how
+    // close they were. Edit-distance ranking surfaces cs.LG and cs.LO ahead of
+    // alphabetically-earlier codes.
+    const suggestions = suggestCategories('cs.LB', 5);
+    expect(suggestions).toContain('cs.LG');
+    expect(suggestions).toContain('cs.LO');
+    expect(suggestions.indexOf('cs.LG')).toBeLessThan(suggestions.indexOf('cs.AI'));
+  });
+
+  it('ranks the longer typo cs.SAA closer to cs.SE / cs.SI / cs.SD than to cs.AI (issue #6)', () => {
+    // Even when no cs.* code is a distance-1 match, the prefix branch should
+    // still rank by similarity rather than declaration order.
+    const suggestions = suggestCategories('cs.SAA', 5);
+    // All cs.S* codes are closer to cs.SAA than cs.AI.
+    expect(suggestions.indexOf('cs.AI')).toBeGreaterThan(suggestions.indexOf('cs.SE'));
+  });
+
   it('falls back to edit-distance ranking when the prefix is unknown', () => {
     const suggestions = suggestCategories('foo.BAR');
     expect(suggestions.length).toBeGreaterThan(0);
