@@ -72,6 +72,15 @@ RUN if [ "$OTEL_ENABLED" = "true" ]; then \
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
 
+# Copy the mirror lifecycle scripts. `bun run mirror:init` / `mirror:refresh` /
+# `mirror:verify` invoke these directly (Bun runs `.ts` natively) — they must
+# exist inside the container or the operator can't cold-init the mirror.
+COPY --from=build /usr/src/app/scripts/arxiv-mirror-init.ts \
+                  /usr/src/app/scripts/arxiv-mirror-refresh.ts \
+                  /usr/src/app/scripts/arxiv-mirror-verify.ts \
+                  /usr/src/app/scripts/_mirror-context.ts \
+                  ./scripts/
+
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
 

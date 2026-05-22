@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "MCP server for arXiv academic paper search, metadata retrieval, and full-text reading.",
   "mcpName": "io.github.cyanheads/arxiv-mcp-server",
   "type": "module",
@@ -9,7 +9,18 @@
   "bin": {
     "arxiv-mcp-server": "dist/index.js"
   },
-  "files": ["dist/", "README.md", "LICENSE", "CLAUDE.md", "Dockerfile", "server.json"],
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "CLAUDE.md",
+    "Dockerfile",
+    "server.json",
+    "scripts/arxiv-mirror-init.ts",
+    "scripts/arxiv-mirror-refresh.ts",
+    "scripts/arxiv-mirror-verify.ts",
+    "scripts/_mirror-context.ts"
+  ],
   "scripts": {
     "build": "bun scripts/build.ts",
     "rebuild": "bun scripts/clean.ts && bun scripts/build.ts",

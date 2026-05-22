@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.2](changelog/1.2.x/1.2.2.md) — 2026-05-21
+
+Ship the `mirror:*` scripts in the published artifacts. v1.2.0 added `scripts/arxiv-mirror-{init,refresh,verify}.ts` but omitted them from the Docker production stage and the npm `files` array — `bun run mirror:init` failed with `Module not found` inside the container and in npm-installed copies. Runtime code unchanged; packaging only.
+
 ## [1.2.1](changelog/1.2.x/1.2.1.md) — 2026-05-21
 
 Dockerfile build stage adds `--ignore-scripts` to `bun install` so `better-sqlite3`'s `node-gyp` native build doesn't fail in the `oven/bun:1.3` base image (no `python3`/`make`/`g++`). Runtime is Bun-only and uses `bun:sqlite`, so the compiled binary is never loaded — skipping it is strictly an improvement. No source changes.
