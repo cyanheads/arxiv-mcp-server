@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.3](changelog/1.2.x/1.2.3.md) — 2026-05-21
+
+Dockerfile production stage writes a minimal `tsconfig.json` mapping `@/*` → `./dist/*` so Bun resolves the path alias the mirror scripts import through. v1.2.2 shipped the scripts but Bun couldn't resolve `@/config/server-config.js`. Final piece for an end-to-end deployable mirror.
+
 ## [1.2.2](changelog/1.2.x/1.2.2.md) — 2026-05-21
 
 Ship the `mirror:*` scripts in the published artifacts. v1.2.0 added `scripts/arxiv-mirror-{init,refresh,verify}.ts` but omitted them from the Docker production stage and the npm `files` array — `bun run mirror:init` failed with `Module not found` inside the container and in npm-installed copies. Runtime code unchanged; packaging only.

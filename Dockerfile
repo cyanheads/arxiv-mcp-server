@@ -81,6 +81,12 @@ COPY --from=build /usr/src/app/scripts/arxiv-mirror-init.ts \
                   /usr/src/app/scripts/_mirror-context.ts \
                   ./scripts/
 
+# Emit a minimal `tsconfig.json` so Bun can resolve the `@/...` path alias the
+# mirror scripts import through. Source `tsconfig.json` maps `@/*` to `./src/*`,
+# but production only carries `./dist/*` — without this file, `bun run mirror:init`
+# fails with `Cannot find module '@/config/server-config.js'`.
+RUN echo '{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./dist/*"]}}}' > tsconfig.json
+
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
 
