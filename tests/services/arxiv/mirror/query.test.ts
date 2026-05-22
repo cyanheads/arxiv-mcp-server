@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tests for the arXiv → FTS5 query translator including
  * field prefixes, boolean operators, phrase quoting, category-hierarchy
- * expansion via the bundled taxonomy, and parenthesis-boundary adjacency
- * (issue #13) verified against a real in-memory FTS5 index.
+ * expansion via the bundled taxonomy, parenthesis-boundary adjacency
+ * (issue #13), and `cat:` extraction cleanup inside parens (issue #14),
+ * all verified against a real in-memory FTS5 index.
  * @module services/arxiv/mirror/query.test
  */
 
@@ -149,6 +150,141 @@ describe('translateQuery — parenthesis-boundary adjacency (issue #13)', () => 
   });
 });
 
+describe('translateQuery — cat: extraction cleanup (issue #14)', () => {
+  // -------------------------------------------------------------------------
+  // The six failing shapes from the issue's table.
+  // -------------------------------------------------------------------------
+
+  it('drops dangling OR when cat: opens a parenthesized group', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG OR term)');
+    expect(matchExpr).toBe('("term")');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('drops dangling OR when cat: closes a parenthesized group', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(term OR cat:cs.LG)');
+    expect(matchExpr).toBe('("term")');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('drops dangling AND when cat: opens a parenthesized group', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG AND term)');
+    expect(matchExpr).toBe('("term")');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('collapses an empty group to no matchExpr when cat: was the sole operand', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG)');
+    expect(matchExpr).toBeUndefined();
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('collapses to no matchExpr when every operand in a group is cat:', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG OR cat:cs.AI)');
+    expect(matchExpr).toBeUndefined();
+    expect(categoryFilters.sort()).toEqual(['cs.AI', 'cs.LG']);
+  });
+
+  it('reduces (cat OR cat OR term) to just the surviving term', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG OR cat:cs.AI OR term)');
+    expect(matchExpr).toBe('("term")');
+    expect(categoryFilters.sort()).toEqual(['cs.AI', 'cs.LG']);
+  });
+
+  // -------------------------------------------------------------------------
+  // Broader cleanup scenarios — cleanup must handle every operator/paren
+  // boundary, not just the shapes in the issue table.
+  // -------------------------------------------------------------------------
+
+  it('joins surviving operands when cat: sits between two terms at top level', () => {
+    expect(translateQuery('a AND cat:cs.LG AND b').matchExpr).toBe('"a" AND "b"');
+  });
+
+  it('drops a leading operator when cat: was the first token at top level', () => {
+    const { matchExpr, categoryFilters } = translateQuery('cat:cs.LG AND a');
+    expect(matchExpr).toBe('"a"');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('drops a trailing operator when cat: was the last token at top level', () => {
+    const { matchExpr, categoryFilters } = translateQuery('a AND cat:cs.LG');
+    expect(matchExpr).toBe('"a"');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('removes an emptied group from the middle of a larger expression', () => {
+    expect(translateQuery('term AND (cat:cs.LG)').matchExpr).toBe('"term"');
+    expect(translateQuery('(cat:cs.LG) AND term').matchExpr).toBe('"term"');
+  });
+
+  it('handles nested groups where the inner group empties out', () => {
+    expect(translateQuery('(a AND (cat:cs.LG))').matchExpr).toBe('("a")');
+  });
+
+  it('collapses double-operator artifacts when cat: bridged the operators', () => {
+    // `a AND cat:cs.LG OR b` → after strip: `"a" AND OR "b"`; first op wins.
+    expect(translateQuery('a AND cat:cs.LG OR b').matchExpr).toBe('"a" AND "b"');
+  });
+
+  it('preserves explicit grouping when the group still has surviving operands', () => {
+    expect(translateQuery('(a OR cat:cs.LG OR b)').matchExpr).toBe('("a" OR "b")');
+  });
+
+  it('preserves categoryFilters even when matchExpr collapses to undefined', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG AND cat:cs.AI)');
+    expect(matchExpr).toBeUndefined();
+    expect(categoryFilters.sort()).toEqual(['cs.AI', 'cs.LG']);
+  });
+
+  it('expands group-level cat: inside parens (cs → every cs.* code)', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(term OR cat:cs)');
+    expect(matchExpr).toBe('("term")');
+    expect(categoryFilters.length).toBeGreaterThan(10);
+    expect(categoryFilters.every((c) => c.startsWith('cs.'))).toBe(true);
+  });
+
+  it('does not regress non-cat parenthesized queries', () => {
+    expect(translateQuery('(a OR b)').matchExpr).toBe('("a" OR "b")');
+    expect(translateQuery('(a AND b) OR c').matchExpr).toBe('("a" AND "b") OR "c"');
+  });
+
+  it('does not insert AND across a cleanup-emptied paren boundary', () => {
+    // After cleanup the trailing `()` is gone — issue #13's adjacency
+    // pass must not re-inject an AND between `"term"` and nothing.
+    expect(translateQuery('term AND (cat:cs.LG)').matchExpr).toBe('"term"');
+  });
+
+  it('handles cat: adjacent to an all: expansion inside parens', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(all:dark OR cat:cs.LG)');
+    expect(matchExpr).toBe('((title:"dark" OR authors:"dark" OR abstract:"dark"))');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('handles cat: as the sole operand alongside an all: expansion', () => {
+    const { matchExpr, categoryFilters } = translateQuery('all:dark AND cat:cs.LG');
+    expect(matchExpr).toBe('(title:"dark" OR authors:"dark" OR abstract:"dark")');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('handles cat: with a phrase operand inside parens', () => {
+    const { matchExpr, categoryFilters } = translateQuery('(cat:cs.LG OR "deep learning")');
+    expect(matchExpr).toBe('("deep learning")');
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('handles a single cat: at top level with no other tokens', () => {
+    const { matchExpr, categoryFilters } = translateQuery('cat:cs.LG');
+    expect(matchExpr).toBeUndefined();
+    expect(categoryFilters).toEqual(['cs.LG']);
+  });
+
+  it('handles multiple consecutive cat: at top level with no other tokens', () => {
+    const { matchExpr, categoryFilters } = translateQuery('cat:cs.LG OR cat:cs.AI OR cat:cs.CL');
+    expect(matchExpr).toBeUndefined();
+    expect(categoryFilters.sort()).toEqual(['cs.AI', 'cs.CL', 'cs.LG']);
+  });
+});
+
 describe('translateQuery → FTS5 parser parity (issue #13)', () => {
   let dir: string;
   let store: MirrorStore;
@@ -193,6 +329,29 @@ describe('translateQuery → FTS5 parser parity (issue #13)', () => {
     'ti:foo bar',
     // cat: extraction leaves an FTS expression behind:
     'attention AND cat:cs.LG',
+    // All failing shapes from issue #14 — cat: extraction inside parens.
+    '(cat:cs.LG OR term)',
+    '(term OR cat:cs.LG)',
+    '(cat:cs.LG AND term)',
+    '(cat:cs.LG)',
+    '(cat:cs.LG OR cat:cs.AI)',
+    '(cat:cs.LG OR cat:cs.AI OR term)',
+    // Broader #14 cleanup combinations beyond the issue's table.
+    'cat:cs.LG AND a',
+    'a AND cat:cs.LG',
+    'cat:cs.LG',
+    'cat:cs.LG OR cat:cs.AI OR cat:cs.CL',
+    'a AND cat:cs.LG AND b',
+    'a AND cat:cs.LG OR b',
+    'term AND (cat:cs.LG)',
+    '(cat:cs.LG) AND term',
+    '(a AND (cat:cs.LG))',
+    '(a OR cat:cs.LG OR b)',
+    '(cat:cs.LG AND cat:cs.AI)',
+    '(term OR cat:cs)',
+    '(all:dark OR cat:cs.LG)',
+    'all:dark AND cat:cs.LG',
+    '(cat:cs.LG OR "deep learning")',
   ];
 
   it.each(cases)('emitted FTS5 expression parses for %s', (q) => {

@@ -343,5 +343,67 @@ describe('ArxivService — mirror integration', () => {
         spy.mockRestore();
       }
     });
+
+    // -----------------------------------------------------------------------
+    // Issue #14 — cat: extraction inside parens. Previously emitted FTS5
+    // expressions with dangling operators or empty groups; after the
+    // translator cleanup pass these resolve cleanly via the mirror.
+    // -----------------------------------------------------------------------
+
+    it.each([
+      // All six failing shapes from the issue's table.
+      '(cat:cs.LG OR attention)',
+      '(attention OR cat:cs.LG)',
+      '(cat:cs.LG AND attention)',
+      '(cat:cs.LG)',
+      '(cat:cs.LG OR cat:cs.AI)',
+      '(cat:cs.LG OR cat:cs.AI OR attention)',
+      // Broader cleanup combinations.
+      'cat:cs.LG AND attention',
+      'attention AND cat:cs.LG',
+      'attention AND (cat:cs.LG)',
+      '(cat:cs.LG) AND attention',
+      '(attention AND (cat:cs.LG))',
+      '(attention OR cat:cs.LG OR background)',
+      'attention AND cat:cs.LG OR background',
+      '(all:attention OR cat:cs.LG)',
+    ])('resolves cat:-cleanup query %s without surfacing an FTS5 error', async (q) => {
+      const ctx = createMockContext();
+      await expect(service.search(q, { maxResults: 5 }, ctx)).resolves.toMatchObject({
+        total_results: expect.any(Number),
+        papers: expect.any(Array),
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('applies the extracted category filter even when the group emptied out', async () => {
+      // `(cat:cs.LG)` strips to no matchExpr — the mirror search runs as a
+      // pure category filter and returns the cs.LG paper only.
+      const ctx = createMockContext();
+      const result = await service.search('(cat:cs.LG)', { maxResults: 10 }, ctx);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers).toHaveLength(1);
+      expect(result.papers[0]?.id).toBe('2401.10001v1');
+    });
+
+    it('applies multiple extracted categories from inside a group', async () => {
+      const ctx = createMockContext();
+      const result = await service.search(
+        '(cat:cs.LG OR cat:astro-ph.CO)',
+        { maxResults: 10 },
+        ctx,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers).toHaveLength(2);
+      expect(result.papers.map((p) => p.id).sort()).toEqual(['2401.10001v1', '2401.10002v3']);
+    });
+
+    it('combines surviving FTS term with extracted category filter', async () => {
+      const ctx = createMockContext();
+      const result = await service.search('(cat:cs.LG OR attention)', { maxResults: 10 }, ctx);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers).toHaveLength(1);
+      expect(result.papers[0]?.id).toBe('2401.10001v1');
+    });
   });
 });

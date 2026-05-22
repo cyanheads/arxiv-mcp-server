@@ -163,19 +163,12 @@ export function translateQuery(query: string): TranslatedQuery {
     const t = tokens[i];
     if (!t) continue;
 
-    // Strip `cat:` operands into the category filter set. Any boolean operator
-    // bridging two `cat:` tokens is dropped along with the operands.
+    // Strip `cat:` operands into the category filter set. The operators they
+    // leave behind (and any groups they empty out) are reconciled by
+    // `cleanupDanglingOps` after the main pass — local cleanup here is wrong
+    // whenever the next token is `)` or another operator, so don't try.
     if (t.kind === 'field' && t.field === 'cat') {
       for (const c of expandCategory(t.value)) categoryFilters.add(c);
-      // Consume an adjacent dangling boolean operator if it sandwiches another
-      // `cat:` operand or sits at the boundary of the FTS expression.
-      const prev = ftsParts[ftsParts.length - 1];
-      const next = tokens[i + 1];
-      const dropPrev =
-        prev === 'AND' || prev === 'OR' || prev === 'NOT'
-          ? next === undefined || (next.kind === 'field' && next.field === 'cat')
-          : false;
-      if (dropPrev) ftsParts.pop();
       continue;
     }
 
@@ -211,11 +204,8 @@ export function translateQuery(query: string): TranslatedQuery {
     }
   }
 
-  // Trim leading/trailing dangling operators that surfaced after `cat:` removal.
-  while (ftsParts.length > 0 && isBoolOp(ftsParts[0])) ftsParts.shift();
-  while (ftsParts.length > 0 && isBoolOp(ftsParts[ftsParts.length - 1])) ftsParts.pop();
-
-  const matchExpr = ftsParts.length > 0 ? collapseSpaces(joinFtsParts(ftsParts)) : undefined;
+  const cleaned = cleanupDanglingOps(ftsParts);
+  const matchExpr = cleaned.length > 0 ? collapseSpaces(joinFtsParts(cleaned)) : undefined;
 
   return {
     ...(matchExpr !== undefined && { matchExpr }),
@@ -225,6 +215,48 @@ export function translateQuery(query: string): TranslatedQuery {
 
 function isBoolOp(s: string | undefined): boolean {
   return s === 'AND' || s === 'OR' || s === 'NOT';
+}
+
+/**
+ * Reconcile `ftsParts` after `cat:` extraction. Runs to a fixed point:
+ * collapses empty `( )` groups, then drops any boolean operator whose
+ * neighbors no longer form a valid binary expression — adjacent to `(`,
+ * `)`, an array endpoint, or another operator (in which case the earlier
+ * operator wins). One pass can expose another (an empty group collapse
+ * leaves operators newly adjacent); iterating until stable handles every
+ * combination without per-shape special cases.
+ */
+function cleanupDanglingOps(parts: readonly string[]): string[] {
+  let working: readonly string[] = parts;
+  for (;;) {
+    const next: string[] = [];
+    let i = 0;
+    while (i < working.length) {
+      const cur = working[i] ?? '';
+      if (cur === '(' && working[i + 1] === ')') {
+        i += 2;
+        continue;
+      }
+      if (isBoolOp(cur)) {
+        const prev = next[next.length - 1];
+        const after = working[i + 1];
+        if (
+          prev === undefined ||
+          prev === '(' ||
+          isBoolOp(prev) ||
+          after === undefined ||
+          after === ')'
+        ) {
+          i++;
+          continue;
+        }
+      }
+      next.push(cur);
+      i++;
+    }
+    if (next.length === working.length) return next;
+    working = next;
+  }
 }
 
 /**

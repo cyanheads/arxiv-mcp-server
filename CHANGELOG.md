@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.5](changelog/1.2.x/1.2.5.md) — 2026-05-22
+
+Mirror translator's `cat:` extraction no longer leaves dangling boolean operators or empty `( )` groups inside parens ([#14](https://github.com/cyanheads/arxiv-mcp-server/issues/14)). New `cleanupDanglingOps` post-pass collapses empty groups and drops orphaned operators to a fixed point, covering all six failing shapes from the issue.
+
 ## [1.2.4](changelog/1.2.x/1.2.4.md) — 2026-05-22
 
 Mirror query translator inserts explicit `AND` at every parenthesis boundary so `all:` expansions and user-typed groups stop emitting FTS5-invalid expressions. Defense-in-depth catch in `ArxivService.searchMirror` rethrows any leaked `fts5:` SQLiteError as `validationError` with the original query and recovery hint.
