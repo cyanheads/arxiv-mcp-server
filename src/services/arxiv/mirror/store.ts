@@ -250,7 +250,11 @@ export class MirrorStore {
 
   /**
    * Execute an FTS5 + filter search. The translator (`query.ts`) is responsible
-   * for producing a safe `matchExpr` from user input. `categoryFilters` are
+   * for producing a `matchExpr` that parses against FTS5 for every input the
+   * arXiv-syntax lexer accepts — specifically, it inserts explicit `AND` at any
+   * boundary where implicit conjunction would cross a parenthesized form
+   * (see issue #13). Callers still wrap this in a SQLite-error catch for
+   * defense in depth — see `ArxivService.searchMirror`. `categoryFilters` are
    * expanded category codes (group/archive expansion handled upstream); each
    * matches against `primary_category` or any token in `categories`.
    */

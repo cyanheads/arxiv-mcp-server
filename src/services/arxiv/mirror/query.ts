@@ -215,7 +215,7 @@ export function translateQuery(query: string): TranslatedQuery {
   while (ftsParts.length > 0 && isBoolOp(ftsParts[0])) ftsParts.shift();
   while (ftsParts.length > 0 && isBoolOp(ftsParts[ftsParts.length - 1])) ftsParts.pop();
 
-  const matchExpr = ftsParts.length > 0 ? collapseSpaces(ftsParts.join(' ')) : undefined;
+  const matchExpr = ftsParts.length > 0 ? collapseSpaces(joinFtsParts(ftsParts)) : undefined;
 
   return {
     ...(matchExpr !== undefined && { matchExpr }),
@@ -225,6 +225,31 @@ export function translateQuery(query: string): TranslatedQuery {
 
 function isBoolOp(s: string | undefined): boolean {
   return s === 'AND' || s === 'OR' || s === 'NOT';
+}
+
+/**
+ * Join `ftsParts` with a space, inserting an explicit `AND` at every
+ * adjacency that would otherwise force FTS5 to apply implicit conjunction
+ * across a parenthesized boundary. FTS5 only honors implicit-AND between
+ * bare phrases — once either side carries parens (a `(` / `)` literal token
+ * from user grouping, or a single-string `all:` expansion of the form
+ * `(col:val OR …)`), an explicit operator is required.
+ */
+function joinFtsParts(parts: readonly string[]): string {
+  const out: string[] = [];
+  for (const cur of parts) {
+    const prev = out[out.length - 1];
+    if (prev !== undefined && needsExplicitAnd(prev, cur)) out.push('AND');
+    out.push(cur);
+  }
+  return out.join(' ');
+}
+
+function needsExplicitAnd(prev: string, next: string): boolean {
+  if (isBoolOp(prev) || isBoolOp(next)) return false;
+  // `(` opens a group; `)` closes one — neither boundary needs a sibling AND.
+  if (prev === '(' || next === ')') return false;
+  return prev.endsWith(')') || next.startsWith('(');
 }
 
 function collapseSpaces(s: string): string {

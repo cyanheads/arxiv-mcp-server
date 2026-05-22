@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.4](changelog/1.2.x/1.2.4.md) — 2026-05-22
+
+Mirror query translator inserts explicit `AND` at every parenthesis boundary so `all:` expansions and user-typed groups stop emitting FTS5-invalid expressions. Defense-in-depth catch in `ArxivService.searchMirror` rethrows any leaked `fts5:` SQLiteError as `validationError` with the original query and recovery hint.
+
 ## [1.2.3](changelog/1.2.x/1.2.3.md) — 2026-05-21
 
 Dockerfile production stage writes a minimal `tsconfig.json` mapping `@/*` → `./dist/*` so Bun resolves the path alias the mirror scripts import through. v1.2.2 shipped the scripts but Bun couldn't resolve `@/config/server-config.js`. Final piece for an end-to-end deployable mirror.

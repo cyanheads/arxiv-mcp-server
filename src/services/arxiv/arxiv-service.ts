@@ -461,14 +461,35 @@ export class ArxivService {
     const ftsSortBy: 'relevance' | 'published' | 'updated' =
       sortBy === 'submitted' ? 'published' : sortBy === 'updated' ? 'updated' : 'relevance';
 
-    const { papers, total } = store.search({
-      ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
-      categoryFilters: [...categoryFilters],
-      limit,
-      offset,
-      sortBy: ftsSortBy,
-      sortOrder: options.sortOrder ?? 'descending',
-    });
+    let papers: PaperRow[];
+    let total: number;
+    try {
+      ({ papers, total } = store.search({
+        ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
+        categoryFilters: [...categoryFilters],
+        limit,
+        offset,
+        sortBy: ftsSortBy,
+        sortOrder: options.sortOrder ?? 'descending',
+      }));
+    } catch (err) {
+      // Defense in depth: the translator should produce parseable FTS5 for every
+      // input the lexer accepts, but a regression there would surface here as a
+      // raw `SQLiteError: fts5: …`. Convert to validationError so callers get
+      // an actionable hint instead of a SQLite engine string. See issue #13.
+      if (err instanceof Error && /^fts5:/.test(err.message)) {
+        throw validationError(
+          `Mirror search could not parse the translated FTS5 expression: ${err.message}`,
+          {
+            query,
+            matchExpr: translated.matchExpr,
+            reason: 'unsupported_query_syntax',
+            ...ctx.recoveryFor('unsupported_query_syntax'),
+          },
+        );
+      }
+      throw err;
+    }
     ctx.log.info('Mirror search', {
       query,
       total,

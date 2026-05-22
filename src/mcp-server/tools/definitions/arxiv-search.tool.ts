@@ -35,6 +35,13 @@ export const arxivSearch = tool('arxiv_search', {
       recovery:
         'Check query syntax — use field prefixes ti:, au:, abs:, cat: and boolean operators AND, OR, ANDNOT.',
     },
+    {
+      reason: 'unsupported_query_syntax',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Query translates to a mirror FTS5 expression the search engine cannot parse, typically two operands juxtaposed across a parenthesized group without an explicit operator.',
+      recovery:
+        'Add an explicit AND or OR between adjacent terms and parenthesized groups, then retry.',
+    },
   ],
 
   input: z.object({
