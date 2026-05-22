@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.0](changelog/1.2.x/1.2.0.md) — 2026-05-21
+
+Optional OAI-PMH metadata mirror for `arxiv_search` and `arxiv_get_metadata` — local SQLite + FTS5 eliminates per-IP rate-limit exposure. Opt-in via `ARXIV_MIRROR_ENABLED=true` and `bun run mirror:init` (~4.4h cold harvest). Falls back to the live API on incomplete harvest or lookup miss; `arxiv_read_paper` still uses the live API.
+
 ## [0.1.19](changelog/0.1.x/0.1.19.md) — 2026-05-18
 
 Field-test fixes from issues #4 — #10: `arxiv_get_metadata` preserves input order; `arxiv_read_paper` honors version suffix in HTML URLs and collapses MathML to dollar-delimited LaTeX (2-3× shrink); category suggestions rank by edit distance; rate-limit cooldown grows geometrically (5s → 10s → 20s → 30s capped) per consecutive hit.

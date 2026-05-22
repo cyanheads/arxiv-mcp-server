@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-05-16 19:22:39
+Generated on: 2026-05-22 01:19:56
 
 ```text
 arxiv-mcp-server/
@@ -15,13 +15,19 @@ arxiv-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 1.2.x/
 │   └── template.md
 ├── claude-plans/
+├── data/
 ├── dev-logs/
 ├── docs/
 │   ├── arxiv-mcp-server-research.md
 │   └── design.md
 ├── scripts/
+│   ├── _mirror-context.ts
+│   ├── arxiv-mirror-init.ts
+│   ├── arxiv-mirror-refresh.ts
+│   ├── arxiv-mirror-verify.ts
 │   ├── build-changelog.ts
 │   ├── build.ts
 │   ├── check-docs-sync.ts
@@ -124,6 +130,15 @@ arxiv-mcp-server/
 │   │           └── index.ts
 │   ├── services/
 │   │   └── arxiv/
+│   │       ├── mirror/
+│   │       │   ├── harvester.ts
+│   │       │   ├── index.ts
+│   │       │   ├── query.ts
+│   │       │   ├── runner.ts
+│   │       │   ├── schema.sql
+│   │       │   ├── schema.ts
+│   │       │   ├── store.ts
+│   │       │   └── types.ts
 │   │       ├── arxiv-service.ts
 │   │       ├── categories.ts
 │   │       └── types.ts
@@ -142,6 +157,12 @@ arxiv-mcp-server/
 │   │           └── arxiv-search.tool.test.ts
 │   └── services/
 │       └── arxiv/
+│           ├── mirror/
+│           │   ├── harvester.test.ts
+│           │   ├── parity.test.ts
+│           │   ├── query.test.ts
+│           │   └── store.test.ts
+│           ├── arxiv-service-mirror.test.ts
 │           ├── arxiv-service.test.ts
 │           ├── categories.test.ts
 │           └── types.test.ts
