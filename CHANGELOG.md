@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.1](changelog/1.2.x/1.2.1.md) — 2026-05-21
+
+Dockerfile build stage adds `--ignore-scripts` to `bun install` so `better-sqlite3`'s `node-gyp` native build doesn't fail in the `oven/bun:1.3` base image (no `python3`/`make`/`g++`). Runtime is Bun-only and uses `bun:sqlite`, so the compiled binary is never loaded — skipping it is strictly an improvement. No source changes.
+
 ## [1.2.0](changelog/1.2.x/1.2.0.md) — 2026-05-21
 
 Optional OAI-PMH metadata mirror for `arxiv_search` and `arxiv_get_metadata` — local SQLite + FTS5 eliminates per-IP rate-limit exposure. Opt-in via `ARXIV_MIRROR_ENABLED=true` and `bun run mirror:init` (~4.4h cold harvest). Falls back to the live API on incomplete harvest or lookup miss; `arxiv_read_paper` still uses the live API.

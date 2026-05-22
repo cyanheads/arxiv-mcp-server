@@ -11,8 +11,11 @@ WORKDIR /usr/src/app
 # Copy dependency manifests for optimized layer caching
 COPY package.json bun.lock ./
 
-# Install all dependencies (including dev dependencies for building)
-RUN bun install --frozen-lockfile
+# Install all dependencies (including dev dependencies for building).
+# `--ignore-scripts` skips native install scripts (e.g. better-sqlite3's node-gyp
+# build) — the Bun base image has no C++ toolchain, and the runtime image is
+# Bun-only, which uses `bun:sqlite` rather than `better-sqlite3` at runtime.
+RUN bun install --frozen-lockfile --ignore-scripts
 
 # Copy the rest of the source code
 COPY . .
