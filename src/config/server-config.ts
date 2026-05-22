@@ -11,6 +11,15 @@ const ServerConfigSchema = z.object({
   requestDelayMs: z.coerce.number().default(3000),
   contentTimeoutMs: z.coerce.number().default(30000),
   apiTimeoutMs: z.coerce.number().default(15000),
+
+  // OAI-PMH mirror (issue #12). All optional; mirror is disabled by default.
+  mirrorEnabled: z.coerce.boolean().default(false),
+  mirrorPath: z.string().default('./data/arxiv-mirror.db'),
+  mirrorRefreshCron: z.string().optional(),
+  mirrorFallbackLive: z.coerce.boolean().default(true),
+  mirrorRecentDaysLive: z.coerce.number().min(0).default(2),
+  mirrorOaiBaseUrl: z.string().default('https://oaipmh.arxiv.org/oai'),
+  mirrorOaiRequestDelayMs: z.coerce.number().min(0).default(3000),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -24,6 +33,18 @@ export function getServerConfig(): ServerConfig {
     requestDelayMs: 'ARXIV_REQUEST_DELAY_MS',
     contentTimeoutMs: 'ARXIV_CONTENT_TIMEOUT_MS',
     apiTimeoutMs: 'ARXIV_API_TIMEOUT_MS',
+    mirrorEnabled: 'ARXIV_MIRROR_ENABLED',
+    mirrorPath: 'ARXIV_MIRROR_PATH',
+    mirrorRefreshCron: 'ARXIV_MIRROR_REFRESH_CRON',
+    mirrorFallbackLive: 'ARXIV_MIRROR_FALLBACK_LIVE',
+    mirrorRecentDaysLive: 'ARXIV_MIRROR_RECENT_DAYS_LIVE',
+    mirrorOaiBaseUrl: 'ARXIV_MIRROR_OAI_BASE_URL',
+    mirrorOaiRequestDelayMs: 'ARXIV_MIRROR_OAI_REQUEST_DELAY_MS',
   });
   return _config;
+}
+
+/** Reset the cached config — test-only. */
+export function resetServerConfig(): void {
+  _config = undefined;
 }

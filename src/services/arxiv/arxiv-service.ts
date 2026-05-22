@@ -25,6 +25,14 @@ import {
 import { XMLParser } from 'fast-xml-parser';
 import { getServerConfig } from '@/config/server-config.js';
 import { suggestCategories, VALID_CATEGORY_CODES } from './categories.js';
+import {
+  expandCategory,
+  getStore,
+  type MirrorStore,
+  openStore,
+  type PaperRow,
+  translateQuery,
+} from './mirror/index.js';
 import type {
   PaperContent,
   PaperLookupResult,
@@ -269,6 +277,76 @@ function extractPaperId(idUrl: string): string {
   return idUrl.replace(/^https?:\/\/arxiv\.org\/abs\//, '');
 }
 
+/**
+ * Convert a mirror `PaperRow` to the canonical `PaperMetadata` shape. The
+ * mirror stores the latest version only — the returned `id` reflects that.
+ * Authors are best-effort split on commas; arXivRaw stores authors as a free
+ * text block, so split fidelity varies by submission style.
+ */
+function rowToMetadata(row: PaperRow): PaperMetadata {
+  const versionedId = row.version ? `${row.id}v${row.version}` : row.id;
+  const authors = row.authors
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const categories = row.categories.split(/\s+/).filter(Boolean);
+  return {
+    id: versionedId,
+    title: row.title,
+    authors,
+    abstract: row.abstract,
+    primary_category: row.primary_category,
+    categories,
+    published: row.published,
+    updated: row.updated,
+    ...(row.comment && { comment: row.comment }),
+    ...(row.journal_ref && { journal_ref: row.journal_ref }),
+    ...(row.doi && { doi: row.doi }),
+    pdf_url: `https://arxiv.org/pdf/${versionedId}`,
+    abstract_url: `https://arxiv.org/abs/${row.id}`,
+  };
+}
+
+/**
+ * Open the mirror store lazily and verify completion. Returns the store when
+ * the mirror is enabled and the cold harvest is complete; otherwise returns
+ * undefined so the caller falls through to the live API.
+ *
+ * Failures opening the SQLite file (e.g. corrupt, permissions) are caught and
+ * surfaced as `undefined` — the caller transparently falls back to live. The
+ * upstream operator sees the failure via the next `mirror:verify` run.
+ */
+async function tryReadyMirror(
+  ctx: Context,
+): Promise<{ store: MirrorStore; status: 'complete' } | undefined> {
+  const config = getServerConfig();
+  if (!config.mirrorEnabled) return;
+  try {
+    const store = getStore() ?? (await openStore(config.mirrorPath));
+    const state = store.readHarvestState();
+    if (state.status !== 'complete') {
+      ctx.log.debug('Mirror not ready; using live API', { status: state.status });
+      return;
+    }
+    return { store, status: 'complete' };
+  } catch (err) {
+    ctx.log.warning('Mirror open failed; using live API', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+}
+
+/**
+ * Detect queries that should bypass the mirror to cover the nightly-update
+ * gap — sort-by-submitted-descending with recent-window > 0.
+ */
+function shouldBypassForRecency(options: SearchOptions, recentDaysLive: number): boolean {
+  if (recentDaysLive <= 0) return false;
+  if (options.sortBy !== 'submitted') return false;
+  return (options.sortOrder ?? 'descending') === 'descending';
+}
+
 // ---------------------------------------------------------------------------
 // ArxivService
 // ---------------------------------------------------------------------------
@@ -321,6 +399,15 @@ export class ArxivService {
       });
     }
 
+    // Mirror path: enabled, harvest complete, and the query isn't sort-by-recent
+    // (which needs the up-to-the-minute live API to cover the nightly gap).
+    if (!shouldBypassForRecency(options, config.mirrorRecentDaysLive)) {
+      const ready = await tryReadyMirror(ctx);
+      if (ready) {
+        return this.searchMirror(ready.store, query, options, ctx);
+      }
+    }
+
     // Wrap the user query in parens so `AND cat:` scopes the category to the
     // full expression. Without the parens, arXiv's parser binds `AND` tighter
     // than the implicit conjunction between bare terms — "mixture of experts
@@ -352,8 +439,88 @@ export class ArxivService {
     );
   }
 
+  /**
+   * Search the local OAI-PMH mirror via FTS5. Translates the arXiv query
+   * syntax, applies category-hierarchy expansion, and merges any tool-level
+   * `options.category` into the structured filter set.
+   */
+  private searchMirror(
+    store: MirrorStore,
+    query: string,
+    options: SearchOptions,
+    ctx: Context,
+  ): SearchResult {
+    const translated = translateQuery(query);
+    const categoryFilters = new Set(translated.categoryFilters);
+    if (options.category) {
+      for (const c of expandCategory(options.category)) categoryFilters.add(c);
+    }
+    const limit = options.maxResults ?? 10;
+    const offset = options.start ?? 0;
+    const sortBy = options.sortBy ?? 'relevance';
+    const ftsSortBy: 'relevance' | 'published' | 'updated' =
+      sortBy === 'submitted' ? 'published' : sortBy === 'updated' ? 'updated' : 'relevance';
+
+    const { papers, total } = store.search({
+      ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
+      categoryFilters: [...categoryFilters],
+      limit,
+      offset,
+      sortBy: ftsSortBy,
+      sortOrder: options.sortOrder ?? 'descending',
+    });
+    ctx.log.info('Mirror search', {
+      query,
+      total,
+      returned: papers.length,
+      matchExpr: translated.matchExpr,
+      categoryFilters: [...categoryFilters],
+    });
+    return {
+      total_results: total,
+      start: offset,
+      papers: papers.map(rowToMetadata),
+    };
+  }
+
   /** Get full metadata for one or more papers by arXiv ID. */
   async getPapers(ids: string[], ctx: Context): Promise<PaperLookupResult> {
+    const ready = await tryReadyMirror(ctx);
+    if (!ready) return this.fetchLivePapers(ids, ctx);
+
+    const config = getServerConfig();
+    const baseIds = ids.map(stripVersion);
+    const rows = ready.store.getPapersByIds(baseIds);
+    const byBaseId = new Map(rows.map((r) => [r.id, r]));
+
+    // Slots align with input order; mirror hits fill in here, gaps may be
+    // patched from the live API below.
+    const slots: (PaperMetadata | null)[] = baseIds.map((b) => {
+      const row = byBaseId.get(b);
+      return row ? rowToMetadata(row) : null;
+    });
+
+    const missingIndices = slots.flatMap((p, i) => (p === null ? [i] : []));
+    if (missingIndices.length > 0 && config.mirrorFallbackLive) {
+      const missing = missingIndices.map((i) => ids[i] ?? '');
+      ctx.log.info('Mirror miss; falling back to live', { missing });
+      const live = await this.fetchLivePapers(missing, ctx);
+      const liveByBaseId = new Map(live.papers.map((p) => [stripVersion(p.id), p]));
+      for (const i of missingIndices) {
+        slots[i] = liveByBaseId.get(baseIds[i] ?? '') ?? null;
+      }
+    }
+
+    const papers = slots.filter((p): p is PaperMetadata => p !== null);
+    const notFoundIds = ids.filter((_, i) => slots[i] === null);
+    return {
+      papers,
+      ...(notFoundIds.length > 0 ? { not_found_ids: notFoundIds } : {}),
+    };
+  }
+
+  /** Live-API path for `getPapers`. Extracted so the mirror fallback can reuse it. */
+  private async fetchLivePapers(ids: string[], ctx: Context): Promise<PaperLookupResult> {
     const config = getServerConfig();
     const url = buildApiUrl(config.apiBaseUrl, {
       id_list: ids.join(','),
@@ -397,8 +564,10 @@ export class ArxivService {
     options: ReadContentOptions,
     ctx: Context,
   ): Promise<PaperContent> {
-    // Metadata fetch has its own retry via getPapers → fetchApi
-    const lookup = await this.getPapers([paperId], ctx);
+    // Metadata fetch always uses the live API — the mirror only knows the
+    // latest version, but `readContent` honors the caller's version suffix
+    // (issue #10), so we go straight to arXiv for canonical per-version data.
+    const lookup = await this.fetchLivePapers([paperId], ctx);
     const [paper] = lookup.papers;
     if (!paper) {
       throw notFound(

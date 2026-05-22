@@ -7,11 +7,12 @@
       "tsc-alias",
       "@cyanheads/mcp-ts-core",
       "depcheck",
-      "tsx"
+      "tsx",
+      "bun:sqlite"
     ],
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": ["fast-xml-parser"]
+    "allowlist": ["fast-xml-parser", "@types/node", "vitest"]
   }
 }
