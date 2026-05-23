@@ -1,0 +1,26 @@
+{
+  "manifest_version": "0.3",
+  "name": "arxiv-mcp-server",
+  "version": "1.2.6",
+  "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
+  "author": { "name": "cyanheads" },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "MCP_AUTH_MODE": "none",
+        "NODE_ENV": "production"
+      }
+    }
+  },
+  "compatibility": {
+    "runtimes": { "node": ">=24.0.0" }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "user_config": {}
+}

@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/arxiv-mcp-server",
-  "description": "Search arXiv, fetch paper metadata, and read full-text content. STDIO & Streamable HTTP.",
+  "description": "Search arXiv, fetch paper metadata, and read full-text content.",
   "repository": {
     "url": "https://github.com/cyanheads/arxiv-mcp-server",
     "source": "github"
   },
-  "version": "1.2.5",
+  "version": "1.2.6",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/arxiv-mcp-server",
       "runtimeHint": "bun",
-      "version": "1.2.5",
+      "version": "1.2.6",
       "packageArguments": [
         {
           "type": "positional",
@@ -76,7 +76,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/arxiv-mcp-server",
       "runtimeHint": "bun",
-      "version": "1.2.5",
+      "version": "1.2.6",
       "packageArguments": [
         {
           "type": "positional",

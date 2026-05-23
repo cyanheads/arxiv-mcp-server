@@ -9,9 +9,11 @@ import {
   invalidRequest,
   JsonRpcErrorCode,
   McpError,
+  notFound,
   serializationError,
   serviceUnavailable,
   timeout as timeoutError,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import {
   httpErrorFromResponse,
@@ -310,15 +312,15 @@ export function pickLatestDatestamp(page: {
 
 function oaiProtocolError(code: string, message: string): McpError {
   if (code === 'badResumptionToken') {
-    return new McpError(JsonRpcErrorCode.ValidationError, `OAI badResumptionToken: ${message}`, {
+    return validationError(`OAI badResumptionToken: ${message}`, {
       code,
       reason: 'token_expired',
     });
   }
   if (code === 'noRecordsMatch') {
-    return new McpError(JsonRpcErrorCode.NotFound, `OAI noRecordsMatch: ${message}`, { code });
+    return notFound(`OAI noRecordsMatch: ${message}`, { code });
   }
-  return new McpError(JsonRpcErrorCode.ValidationError, `OAI ${code}: ${message}`, { code });
+  return validationError(`OAI ${code}: ${message}`, { code });
 }
 
 /**

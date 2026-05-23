@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.6](changelog/1.2.x/1.2.6.md) — 2026-05-23
+
+mcp-ts-core ^0.9.1 → ^0.9.6. Error factories in harvester (McpError → validationError/notFound). manifest.json and .mcpbignore scaffolded for MCPB bundle support. Skills synced. fast-xml-parser unpinned.
+
 ## [1.2.5](changelog/1.2.x/1.2.5.md) — 2026-05-22
 
 Mirror translator's `cat:` extraction no longer leaves dangling boolean operators or empty `( )` groups inside parens ([#14](https://github.com/cyanheads/arxiv-mcp-server/issues/14)). New `cleanupDanglingOps` post-pass collapses empty groups and drops orphaned operators to a fixed point, covering all six failing shapes from the issue.

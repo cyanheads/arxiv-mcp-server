@@ -13,6 +13,6 @@
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": ["fast-xml-parser", "@types/node", "vitest"]
+    "allowlist": ["@types/node", "vitest"]
   }
 }
