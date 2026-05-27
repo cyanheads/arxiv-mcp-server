@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
   "mcpName": "io.github.cyanheads/arxiv-mcp-server",
   "type": "module",

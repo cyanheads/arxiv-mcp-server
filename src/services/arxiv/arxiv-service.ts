@@ -401,7 +401,8 @@ export class ArxivService {
 
     // Mirror path: enabled, harvest complete, and the query isn't sort-by-recent
     // (which needs the up-to-the-minute live API to cover the nightly gap).
-    if (!shouldBypassForRecency(options, config.mirrorRecentDaysLive)) {
+    const bypassForRecency = shouldBypassForRecency(options, config.mirrorRecentDaysLive);
+    if (!bypassForRecency) {
       const ready = await tryReadyMirror(ctx);
       if (ready) {
         return this.searchMirror(ready.store, query, options, ctx);
@@ -423,20 +424,30 @@ export class ArxivService {
       sortOrder: options.sortOrder ?? 'descending',
     });
 
-    return await withRetry(
-      async () => {
-        const xml = await this.fetchApi(url, ctx);
-        const feed = this.parseAtomFeed(xml);
-        return { total_results: feed.totalResults, start: feed.startIndex, papers: feed.entries };
-      },
-      {
-        operation: 'arxivSearch',
-        context: ctx as unknown as RequestContext,
-        signal: ctx.signal,
-        isTransient: isArxivTransient,
-        maxRetries: 1,
-      },
-    );
+    try {
+      return await withRetry(
+        async () => {
+          const xml = await this.fetchApi(url, ctx);
+          const feed = this.parseAtomFeed(xml);
+          return { total_results: feed.totalResults, start: feed.startIndex, papers: feed.entries };
+        },
+        {
+          operation: 'arxivSearch',
+          context: ctx as unknown as RequestContext,
+          signal: ctx.signal,
+          isTransient: isArxivTransient,
+          maxRetries: 1,
+        },
+      );
+    } catch (err) {
+      if (!bypassForRecency) throw err;
+      const ready = await tryReadyMirror(ctx);
+      if (!ready) throw err;
+      ctx.log.warning('Live API failed on recency bypass; falling back to mirror', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return this.searchMirror(ready.store, query, options, ctx);
+    }
   }
 
   /**
@@ -585,11 +596,23 @@ export class ArxivService {
     options: ReadContentOptions,
     ctx: Context,
   ): Promise<PaperContent> {
-    // Metadata fetch always uses the live API — the mirror only knows the
-    // latest version, but `readContent` honors the caller's version suffix
-    // (issue #10), so we go straight to arXiv for canonical per-version data.
-    const lookup = await this.fetchLivePapers([paperId], ctx);
-    const [paper] = lookup.papers;
+    // Metadata: prefer live API for per-version fidelity (the mirror only
+    // stores the latest version). Fall back to mirror on transient failure —
+    // latest-version metadata is better than an error.
+    let paper: PaperMetadata | undefined;
+    try {
+      const lookup = await this.fetchLivePapers([paperId], ctx);
+      paper = lookup.papers[0];
+    } catch (err) {
+      const ready = await tryReadyMirror(ctx);
+      if (!ready) throw err;
+      ctx.log.warning('Live API failed for readContent metadata; falling back to mirror', {
+        paperId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      const rows = ready.store.getPapersByIds([stripVersion(paperId)]);
+      paper = rows[0] ? rowToMetadata(rows[0]) : undefined;
+    }
     if (!paper) {
       throw notFound(
         `Paper '${paperId}' not found. Verify the ID format (e.g., '2401.12345' or '2401.12345v2').`,

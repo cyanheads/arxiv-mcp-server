@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.7](changelog/1.2.x/1.2.7.md) — 2026-05-26
+
+Mirror fallback when live API fails: search recency bypass and readContent metadata paths now recover gracefully instead of surfacing upstream errors.
+
 ## [1.2.6](changelog/1.2.x/1.2.6.md) — 2026-05-23
 
 mcp-ts-core ^0.9.1 → ^0.9.6. Error factories in harvester (McpError → validationError/notFound). manifest.json and .mcpbignore scaffolded for MCPB bundle support. Skills synced. fast-xml-parser unpinned.
