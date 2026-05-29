@@ -1,0 +1,25 @@
+{
+  "name": "@cyanheads/arxiv-mcp-server",
+  "version": "1.2.8",
+  "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/arxiv-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/arxiv-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "arxiv", "academic-papers", "research", "typescript"],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "@cyanheads/arxiv-mcp-server",
+    "shortDescription": "Search arXiv, fetch paper metadata, and read full-text content via MCP.",
+    "longDescription": "MCP server for accessing the arXiv academic paper corpus. Supports full-text search, paper metadata retrieval by ID, HTML content reading, and category taxonomy listing. Deployable as stdio or streamable HTTP.",
+    "developerName": "cyanheads",
+    "category": "research",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/arxiv-mcp-server",
+    "defaultPrompt": []
+  }
+}

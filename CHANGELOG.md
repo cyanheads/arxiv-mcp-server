@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.8](changelog/1.2.x/1.2.8.md) — 2026-05-28
+
+mcp-ts-core ^0.9.6 → ^0.9.13: 413 body cap, HTTP session-init gate, quieter client-error logging, GET /mcp keywords
+
 ## [1.2.7](changelog/1.2.x/1.2.7.md) — 2026-05-26
 
 Mirror fallback when live API fails: search recency bypass and readContent metadata paths now recover gracefully instead of surfacing upstream errors.
