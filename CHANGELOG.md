@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.9](changelog/1.2.x/1.2.9.md) — 2026-05-29
+
+mirror schema v2: ISO 8601 date normalization for chronological sort (#18), index-backed category filter via junction table (#19)
+
 ## [1.2.8](changelog/1.2.x/1.2.8.md) — 2026-05-28
 
 mcp-ts-core ^0.9.6 → ^0.9.13: 413 body cap, HTTP session-init gate, quieter client-error logging, GET /mcp keywords

@@ -143,8 +143,9 @@ describe('rawToRow', () => {
         ],
       }),
     );
-    expect(row.published).toBe('2024-01-22T00:00:00Z');
-    expect(row.updated).toBe('2024-04-10T00:00:00Z');
+    // normalizeDateToIso always uses toISOString() which includes milliseconds.
+    expect(row.published).toBe('2024-01-22T00:00:00.000Z');
+    expect(row.updated).toBe('2024-04-10T00:00:00.000Z');
     expect(row.version).toBe('3');
   });
 

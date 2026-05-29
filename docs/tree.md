@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-05-29 04:48:39
+Generated on: 2026-05-29 07:07:08
 
 ```text
 arxiv-mcp-server/
@@ -168,6 +168,7 @@ arxiv-mcp-server/
 │       └── arxiv/
 │           ├── mirror/
 │           │   ├── harvester.test.ts
+│           │   ├── migration.test.ts
 │           │   ├── parity.test.ts
 │           │   ├── query.test.ts
 │           │   └── store.test.ts

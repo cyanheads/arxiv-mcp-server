@@ -12,6 +12,7 @@ export { readHarvestStatus, runHarvest } from './runner.js';
 export {
   getStore,
   MirrorStore,
+  normalizeDateToIso,
   openStore,
   rawToRow,
   resetStore,

@@ -1,4 +1,4 @@
--- arxiv-mcp-server OAI-PMH mirror schema (issue #12)
+-- arxiv-mcp-server OAI-PMH mirror schema v2 (issues #18 + #19)
 -- Created by SqliteAdapter.migrate(); kept under source control for review.
 
 PRAGMA journal_mode = WAL;
@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 -- ---------------------------------------------------------------------------
 -- papers — one row per arXiv paper (latest version's metadata).
+-- v2: published/updated/latest_version stored as ISO 8601 (issue #18).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS papers (
   id TEXT PRIMARY KEY NOT NULL,                  -- bare arXiv id, e.g. "2401.12345"
@@ -65,6 +66,26 @@ CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
   INSERT INTO papers_fts(rowid, title, authors, abstract)
   VALUES (new.rowid, new.title, new.authors, new.abstract);
 END;
+
+-- ---------------------------------------------------------------------------
+-- paper_categories — junction table for index-backed category filtering
+-- (issue #19). One row per (paper, category) pair; a paper with categories
+-- "cs.LG cs.AI stat.ML" yields three rows. The paper's ISO `updated` is
+-- denormalized in so a category browse can page in date order off the index.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS paper_categories (
+  category TEXT NOT NULL,
+  paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+  updated TEXT NOT NULL,                          -- ISO 8601, mirrors papers.updated
+  PRIMARY KEY (category, paper_id)
+);
+
+-- Composite (category, updated): the leading column drives COUNT(*) and the
+-- IN(...) membership lookups; the trailing column lets a single-category
+-- browse page in updated order straight off the index -- no sort, no papers
+-- scan, fast for common and rare categories alike (issue #19).
+CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx
+  ON paper_categories(category, updated);
 
 -- ---------------------------------------------------------------------------
 -- harvest_state — single-row table tracking init/refresh progress.
