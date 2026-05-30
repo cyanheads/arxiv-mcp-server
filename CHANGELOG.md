@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.10](changelog/1.2.x/1.2.10.md) — 2026-05-30
+
+arxiv_search and arxiv_list_categories surface query echoes, true result totals, and empty-result guidance in a typed enrichment block
+
 ## [1.2.9](changelog/1.2.x/1.2.9.md) — 2026-05-29
 
 mirror schema v2: ISO 8601 date normalization for chronological sort (#18), index-backed category filter via junction table (#19)
