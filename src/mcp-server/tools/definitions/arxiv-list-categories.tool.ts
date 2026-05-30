@@ -32,10 +32,23 @@ export const arxivListCategories = tool('arxiv_list_categories', {
     categories: z.array(CategorySchema).describe('arXiv categories matching the filter.'),
   }),
 
-  handler(input) {
+  enrichment: {
+    totalCount: z.number().describe('Total number of categories returned.'),
+    notice: z.string().optional().describe('Guidance when the group filter returns no categories.'),
+  },
+
+  handler(input, ctx) {
     const categories = input.group
       ? ARXIV_CATEGORIES.filter((c) => c.group === input.group)
       : [...ARXIV_CATEGORIES];
+
+    ctx.enrich.total(categories.length);
+    if (categories.length === 0 && input.group) {
+      ctx.enrich.notice(
+        `No categories found for group "${input.group}". Call arxiv_list_categories without a group filter to see all valid group values.`,
+      );
+    }
+
     return { categories };
   },
 

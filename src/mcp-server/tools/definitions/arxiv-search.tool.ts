@@ -102,12 +102,30 @@ export const arxivSearch = tool('arxiv_search', {
   }),
 
   output: z.object({
-    total_results: z
-      .number()
-      .describe('Total matching papers (may exceed returned count due to pagination).'),
-    start: z.number().describe('Pagination offset of this result set.'),
     papers: z.array(PaperMetadataSchema).describe('Matching papers with full metadata.'),
   }),
+
+  // Result-set context the agent reasons with — the effective query, total match count,
+  // pagination offset, and recovery guidance for empty or overshot pages. Populated via
+  // ctx.enrich() so it reaches structuredContent and content[] alike; kept out of the
+  // domain return.
+  enrichment: {
+    effectiveQuery: z.string().describe('The query as sent to arXiv after input normalization.'),
+    totalFound: z.number().describe('Total matching papers reported by arXiv (before pagination).'),
+    pageStart: z.number().describe('Pagination offset of this result page.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance when results are empty or paging overshot. Absent on successful pages.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    effectiveQuery: { label: 'Query' },
+    totalFound: { label: 'Total Found' },
+    pageStart: { label: 'Page Start' },
+  },
 
   async handler(input, ctx) {
     const service = getArxivService();
@@ -127,31 +145,35 @@ export const arxivSearch = tool('arxiv_search', {
       total: result.total_results,
       returned: result.papers.length,
     });
-    return result;
+
+    ctx.enrich({
+      effectiveQuery: input.query,
+      totalFound: result.total_results,
+      pageStart: result.start,
+    });
+
+    // Empty-result and pagination-overshoot notices surface as enrichment, not throws.
+    if (result.papers.length === 0) {
+      if (result.total_results > 0 && result.start >= result.total_results) {
+        const lastValidStart = Math.max(0, result.total_results - 1);
+        ctx.enrich.notice(
+          `Offset ${result.start} exceeds total results (${result.total_results}). Last valid page starts at ${lastValidStart}.`,
+        );
+      } else {
+        ctx.enrich.notice(
+          'No papers found. Try broader search terms, remove field prefixes (ti:, au:), or check category codes with arxiv_list_categories.',
+        );
+      }
+    }
+
+    return { papers: result.papers };
   },
 
   format: (result) => {
     if (result.papers.length === 0) {
-      // Paging past the end of a valid result set — distinguish from no matches.
-      if (result.total_results > 0 && result.start >= result.total_results) {
-        const lastValidStart = Math.max(0, result.total_results - 1);
-        return [
-          {
-            type: 'text' as const,
-            text: `Offset ${result.start} exceeds total results (${result.total_results}). Last valid page starts at ${lastValidStart}.`,
-          },
-        ];
-      }
-      return [
-        {
-          type: 'text' as const,
-          text: 'No papers found. Try broader search terms, remove field prefixes (ti:, au:), or check category codes with arxiv_list_categories.',
-        },
-      ];
+      return [{ type: 'text' as const, text: '' }];
     }
-    const range = `${result.start + 1}-${result.start + result.papers.length}`;
-    const header = `Found ${result.total_results} papers (offset ${result.start}, showing ${range}):\n\n`;
     const papers = result.papers.map(formatPaper).join('\n\n---\n\n');
-    return [{ type: 'text' as const, text: header + papers }];
+    return [{ type: 'text' as const, text: papers }];
   },
 });

@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/arxiv-search.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
 import type { PaperMetadata, SearchResult } from '@/services/arxiv/types.js';
@@ -65,8 +65,22 @@ describe('arxivSearch', () => {
       }),
       ctx,
     );
-    expect(result.total_results).toBe(42);
     expect(result.papers).toHaveLength(1);
+  });
+
+  it('populates enrichment with query, total, and page start', async () => {
+    mockSearch.mockResolvedValue(MOCK_RESULT);
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
+    const input = arxivSearch.input.parse({ query: 'au:bengio AND ti:attention', start: 5 });
+    await arxivSearch.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.effectiveQuery).toBe('au:bengio AND ti:attention');
+    expect(enrichment.totalFound).toBe(42);
+    expect(enrichment.pageStart).toBe(0); // service echoes back start from result
+    expect(enrichment.notice).toBeUndefined();
   });
 
   it('passes category filter when provided', async () => {
@@ -92,29 +106,44 @@ describe('arxivSearch', () => {
     expect(input.start).toBe(0);
   });
 
-  it('formats papers with header and range', () => {
-    const result: SearchResult = { total_results: 42, start: 0, papers: [MOCK_PAPER] };
+  it('sets empty-result notice in enrichment when no papers match', async () => {
+    mockSearch.mockResolvedValue({ total_results: 0, start: 0, papers: [] });
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
+    const input = arxivSearch.input.parse({ query: 'xyzzy_nonexistent_term' });
+    const result = await arxivSearch.handler(input, ctx);
+
+    expect(result.papers).toHaveLength(0);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalFound).toBe(0);
+    expect(enrichment.notice).toContain('No papers found');
+  });
+
+  it('sets pagination-overshoot notice in enrichment', async () => {
+    mockSearch.mockResolvedValue({ total_results: 27, start: 100, papers: [] });
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
+    const input = arxivSearch.input.parse({ query: 'neural networks', start: 100 });
+    const result = await arxivSearch.handler(input, ctx);
+
+    expect(result.papers).toHaveLength(0);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toContain('Offset 100 exceeds total results (27)');
+    expect(enrichment.notice).toContain('Last valid page starts at 26');
+  });
+
+  it('formats papers', () => {
+    const result = { papers: [MOCK_PAPER] };
     const blocks = arxivSearch.format?.(result) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('Found 42 papers');
-    expect(text).toContain('offset 0');
-    expect(text).toContain('showing 1-1');
     expect(text).toContain('**Attention Is All You Need**');
   });
 
-  it('formats empty results', () => {
-    const blocks = arxivSearch.format?.({ total_results: 0, start: 0, papers: [] }) ?? [];
+  it('formats empty results as empty string (notice is in enrichment)', () => {
+    const blocks = arxivSearch.format?.({ papers: [] }) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toBe(
-      'No papers found. Try broader search terms, remove field prefixes (ti:, au:), or check category codes with arxiv_list_categories.',
-    );
-  });
-
-  it('distinguishes pagination overflow from genuine no-results', () => {
-    // start past the last result of a non-empty set — user paged past the end.
-    const blocks = arxivSearch.format?.({ total_results: 27, start: 100, papers: [] }) ?? [];
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('Offset 100 exceeds total results (27)');
-    expect(text).toContain('Last valid page starts at 26');
+    expect(text).toBe('');
   });
 });

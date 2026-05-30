@@ -3,7 +3,7 @@
  * @module mcp-server/tools/definitions/arxiv-list-categories.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import { arxivListCategories } from '@/mcp-server/tools/definitions/arxiv-list-categories.tool.js';
 
@@ -24,6 +24,24 @@ describe('arxivListCategories', () => {
     const result = await arxivListCategories.handler(input, ctx);
     expect(result.categories).toHaveLength(3);
     expect(result.categories.every((c) => c.group === 'econ')).toBe(true);
+  });
+
+  it('populates totalCount enrichment', async () => {
+    const ctx = createMockContext();
+    const input = arxivListCategories.input.parse({ group: 'econ' });
+    const result = await arxivListCategories.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(result.categories.length);
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('populates totalCount enrichment for all groups', async () => {
+    const ctx = createMockContext();
+    const input = arxivListCategories.input.parse({});
+    const result = await arxivListCategories.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(result.categories.length);
+    expect(enrichment.totalCount).toBeGreaterThan(100);
   });
 
   it('formats output with group headers and a single-group operational header', async () => {
