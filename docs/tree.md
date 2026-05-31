@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-05-29 07:07:08
+Generated on: 2026-05-31 04:33:02
 
 ```text
 arxiv-mcp-server/
@@ -92,8 +92,6 @@ arxiv-mcp-server/
 │   │   └── SKILL.md
 │   ├── design-mcp-server/
 │   │   └── SKILL.md
-│   ├── devcheck/
-│   │   └── SKILL.md
 │   ├── field-test/
 │   │   └── SKILL.md
 │   ├── git-wrapup/
@@ -157,13 +155,16 @@ arxiv-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   │       ├── categories.resource.test.ts
+│   │   │       ├── paper.resource.extra.test.ts
 │   │   │       └── paper.resource.test.ts
 │   │   └── tools/
 │   │       └── definitions/
 │   │           ├── arxiv-get-metadata.tool.test.ts
 │   │           ├── arxiv-list-categories.tool.test.ts
 │   │           ├── arxiv-read-paper.tool.test.ts
-│   │           └── arxiv-search.tool.test.ts
+│   │           ├── arxiv-search.tool.test.ts
+│   │           ├── input-validation.test.ts
+│   │           └── security.test.ts
 │   └── services/
 │       └── arxiv/
 │           ├── mirror/
@@ -172,14 +173,17 @@ arxiv-mcp-server/
 │           │   ├── parity.test.ts
 │           │   ├── query.test.ts
 │           │   └── store.test.ts
+│           ├── arxiv-service-errors.test.ts
 │           ├── arxiv-service-mirror.test.ts
 │           ├── arxiv-service.test.ts
 │           ├── categories.test.ts
+│           ├── types-extra.test.ts
 │           └── types.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
 ├── .mcpbignore
+├── AGENTS.md
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml

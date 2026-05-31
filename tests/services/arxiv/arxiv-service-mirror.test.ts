@@ -406,4 +406,77 @@ describe('ArxivService — mirror integration', () => {
       expect(result.papers[0]?.id).toBe('2401.10001v1');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Refresh-window readiness (#21) — an incremental or failed refresh on top of
+  // a complete mirror must keep serving the existing dataset, not drop to the
+  // throttled live API. Readiness keys off the durable completed_at marker,
+  // which survives the in_progress/error status writes the runner makes.
+  // -------------------------------------------------------------------------
+
+  describe('refresh-window readiness (#21)', () => {
+    /** Flip harvest_state to a non-complete status; completed_at must survive. */
+    async function setRefreshStatus(state: {
+      status: 'in_progress' | 'error';
+      error_message?: string;
+    }): Promise<void> {
+      const s = await MirrorStore.open(configOverrides.mirrorPath);
+      s.writeHarvestState({
+        status: state.status,
+        started_at: '2024-02-22T00:00:00Z',
+        last_datestamp: '2024-02-21',
+        ...(state.error_message ? { error_message: state.error_message } : {}),
+      });
+      // The seed wrote completed_at on a `complete` state; it must persist.
+      expect(s.readHarvestState().completed_at).toBe('2024-02-21T01:00:00Z');
+      s.close();
+    }
+
+    it.each([
+      { status: 'in_progress' as const },
+      { status: 'error' as const, error_message: 'OAI ListRecords HTTP 503' },
+    ])('keeps serving search from the mirror during a $status refresh', async (state) => {
+      await setRefreshStatus(state);
+      const ctx = createMockContext();
+      const result = await service.search('ti:transformers', { maxResults: 10 }, ctx);
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.total_results).toBe(1);
+      expect(result.papers[0]?.id).toBe('2401.10001v1');
+    });
+
+    it('keeps serving getPapers from the mirror during an in-progress refresh', async () => {
+      await setRefreshStatus({ status: 'in_progress' });
+      const ctx = createMockContext();
+      const result = await service.getPapers(['2401.10001', '2401.10002'], ctx);
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers.map((p) => p.id)).toEqual(['2401.10001v1', '2401.10002v3']);
+    });
+
+    it('still routes to live during a never-completed cold init', async () => {
+      // A cold init in flight has status=in_progress but has NEVER completed, so
+      // completed_at is null. The partial dataset must not be served as ready —
+      // search routes to the live API until the first harvest completes.
+      resetStore();
+      const coldDir = await mkdtemp(join(tmpdir(), 'arxiv-svc-cold-test-'));
+      configOverrides.mirrorPath = join(coldDir, 'mirror.db');
+      const cold = await MirrorStore.open(configOverrides.mirrorPath);
+      cold.applyBatch([mkRecord({ paper_id: '2401.10001', title: 'Partial Cold Harvest' })], []);
+      cold.writeHarvestState({ status: 'in_progress', started_at: '2024-02-22T00:00:00Z' });
+      expect(cold.readHarvestState().completed_at).toBeUndefined();
+      cold.close();
+      resetStore();
+
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_LIVE_PAPER));
+      const ctx = createMockContext();
+      const result = await service.search('ti:transformers', { maxResults: 10 }, ctx);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(result.papers[0]?.id).toBe('2402.99999v1');
+
+      resetStore();
+      await rm(coldDir, { recursive: true, force: true });
+    });
+  });
 });

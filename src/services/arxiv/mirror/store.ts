@@ -163,12 +163,22 @@ export class MirrorStore {
     };
   }
 
+  /**
+   * Persist harvest state. `completed_at` and `total_records` are durable
+   * "last successful harvest" markers — preserved via COALESCE when a write
+   * omits them, so an in-progress or failed refresh on top of a complete mirror
+   * keeps the completion marker that readiness keys off. Only the success path
+   * supplies (and thus advances) them. Every other column is current-harvest
+   * progress, overwritten on each write. See issue #21.
+   */
   writeHarvestState(state: HarvestState): void {
     this.db
       .prepare(
         `UPDATE harvest_state
-         SET status = ?, last_datestamp = ?, resumption_token = ?,
-             started_at = ?, completed_at = ?, total_records = ?, error_message = ?
+         SET status = ?, last_datestamp = ?, resumption_token = ?, started_at = ?,
+             completed_at = COALESCE(?, completed_at),
+             total_records = COALESCE(?, total_records),
+             error_message = ?
          WHERE id = 1`,
       )
       .run(

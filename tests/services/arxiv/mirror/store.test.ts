@@ -125,6 +125,65 @@ describe('MirrorStore', () => {
     expect(state.resumption_token).toBe('tok');
   });
 
+  it('preserves the completion marker across an in-progress refresh write (#21)', () => {
+    // A completed cold harvest sets the durable markers.
+    store.writeHarvestState({
+      status: 'complete',
+      started_at: '2024-02-21T00:00:00Z',
+      completed_at: '2024-02-21T01:00:00Z',
+      last_datestamp: '2024-02-20',
+      total_records: 3_000_000,
+    });
+    // A subsequent refresh flips status to in_progress and omits the markers —
+    // they must survive so readiness (which keys off completed_at) holds and the
+    // mirror keeps serving the existing dataset throughout the refresh.
+    store.writeHarvestState({
+      status: 'in_progress',
+      started_at: '2024-02-22T00:00:00Z',
+      last_datestamp: '2024-02-21',
+      resumption_token: 'tok',
+    });
+    const state = store.readHarvestState();
+    expect(state.status).toBe('in_progress');
+    expect(state.completed_at).toBe('2024-02-21T01:00:00Z');
+    expect(state.total_records).toBe(3_000_000);
+    expect(state.last_datestamp).toBe('2024-02-21');
+  });
+
+  it('preserves the completion marker across a failed refresh write (#21)', () => {
+    store.writeHarvestState({
+      status: 'complete',
+      completed_at: '2024-02-21T01:00:00Z',
+      total_records: 3_000_000,
+    });
+    store.writeHarvestState({
+      status: 'error',
+      started_at: '2024-02-22T00:00:00Z',
+      error_message: 'OAI ListRecords HTTP 503',
+    });
+    const state = store.readHarvestState();
+    expect(state.status).toBe('error');
+    expect(state.error_message).toBe('OAI ListRecords HTTP 503');
+    expect(state.completed_at).toBe('2024-02-21T01:00:00Z');
+    expect(state.total_records).toBe(3_000_000);
+  });
+
+  it('advances the completion marker when a later harvest completes (#21)', () => {
+    store.writeHarvestState({
+      status: 'complete',
+      completed_at: '2024-02-21T01:00:00Z',
+      total_records: 3_000_000,
+    });
+    store.writeHarvestState({
+      status: 'complete',
+      completed_at: '2024-02-22T01:00:00Z',
+      total_records: 3_000_100,
+    });
+    const state = store.readHarvestState();
+    expect(state.completed_at).toBe('2024-02-22T01:00:00Z');
+    expect(state.total_records).toBe(3_000_100);
+  });
+
   it('passes PRAGMA integrity checks on a freshly migrated database', () => {
     const result = store.integrityCheck();
     expect(result.ok).toBe(true);

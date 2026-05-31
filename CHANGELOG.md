@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.11](changelog/1.2.x/1.2.11.md) — 2026-05-31
+
+Incremental and failed mirror refreshes no longer drop arxiv_search to the rate-limited live API
+
 ## [1.2.10](changelog/1.2.x/1.2.10.md) — 2026-05-30
 
 arxiv_search and arxiv_list_categories surface query echoes, true result totals, and empty-result guidance in a typed enrichment block

@@ -308,27 +308,34 @@ function rowToMetadata(row: PaperRow): PaperMetadata {
 }
 
 /**
- * Open the mirror store lazily and verify completion. Returns the store when
- * the mirror is enabled and the cold harvest is complete; otherwise returns
- * undefined so the caller falls through to the live API.
+ * Open the mirror store lazily and verify it has usable data. Returns the store
+ * when the mirror is enabled and a full harvest has ever completed; otherwise
+ * returns undefined so the caller falls through to the live API.
+ *
+ * Readiness keys off the durable `completed_at` marker, NOT the live `status`.
+ * The mirror's tables stay transactionally queryable during an incremental
+ * refresh, so an in-progress (or failed) refresh on top of a complete mirror
+ * keeps serving the existing dataset instead of dropping every query to the
+ * throttled live API. Only a never-completed cold init reports not-ready. See
+ * issue #21.
  *
  * Failures opening the SQLite file (e.g. corrupt, permissions) are caught and
  * surfaced as `undefined` — the caller transparently falls back to live. The
  * upstream operator sees the failure via the next `mirror:verify` run.
  */
-async function tryReadyMirror(
-  ctx: Context,
-): Promise<{ store: MirrorStore; status: 'complete' } | undefined> {
+async function tryReadyMirror(ctx: Context): Promise<{ store: MirrorStore } | undefined> {
   const config = getServerConfig();
   if (!config.mirrorEnabled) return;
   try {
     const store = getStore() ?? (await openStore(config.mirrorPath));
     const state = store.readHarvestState();
-    if (state.status !== 'complete') {
-      ctx.log.debug('Mirror not ready; using live API', { status: state.status });
+    if (state.completed_at == null) {
+      ctx.log.debug('Mirror not ready (no completed harvest yet); using live API', {
+        status: state.status,
+      });
       return;
     }
-    return { store, status: 'complete' };
+    return { store };
   } catch (err) {
     ctx.log.warning('Mirror open failed; using live API', {
       error: err instanceof Error ? err.message : String(err),

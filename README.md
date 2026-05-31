@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-1.2.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/arxiv-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/arxiv-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/arxiv-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
+[![Version](https://img.shields.io/badge/Version-1.2.11-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/arxiv-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/arxiv-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/arxiv-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/)
 
 </div>
 
@@ -223,7 +223,7 @@ bun run mirror:refresh   # wire to cron / systemd timer / launchd, OR
 bun run mirror:verify    # PRAGMA integrity_check + quick_check
 ```
 
-**Behavior notes.** Ranking divergence: FTS5 BM25 differs from arXiv's internal ranking, so `sortBy=relevance` against the mirror returns a different top-K than the live API. Queries sorted by `submitted` descending within `ARXIV_MIRROR_RECENT_DAYS_LIVE` days route to the live API to cover the nightly-update gap. The mirror stores the latest version only; per-version reads continue to use the live API. See [#12](https://github.com/cyanheads/arxiv-mcp-server/issues/12) for the full design.
+**Behavior notes.** Ranking divergence: FTS5 BM25 differs from arXiv's internal ranking, so `sortBy=relevance` against the mirror returns a different top-K than the live API. Queries sorted by `submitted` descending within `ARXIV_MIRROR_RECENT_DAYS_LIVE` days route to the live API to cover the nightly-update gap. Refresh resilience: after the initial cold harvest completes, an in-progress or failed daily refresh keeps serving the existing dataset from the mirror — `arxiv_search` and `arxiv_get_metadata` don't drop to the live API during the refresh window ([#21](https://github.com/cyanheads/arxiv-mcp-server/issues/21)). The mirror stores the latest version only; per-version reads continue to use the live API. See [#12](https://github.com/cyanheads/arxiv-mcp-server/issues/12) for the full design.
 
 ### Docker
 
