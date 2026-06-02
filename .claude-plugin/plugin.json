@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "1.2.12",
+  "version": "1.2.13",
   "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads"
@@ -11,7 +11,7 @@
   "mcpServers": {
     "@cyanheads/arxiv-mcp-server": {
       "command": "npx",
-      "args": ["-y", "@cyanheads/arxiv-mcp-server", "run", "start:stdio"],
+      "args": ["-y", "@cyanheads/arxiv-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio"
       }

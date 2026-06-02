@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.13](changelog/1.2.x/1.2.13.md) — 2026-06-02
+
+Adopt @cyanheads/mcp-ts-core 0.9.21: per-request log context fix, secret redaction in fetchWithTimeout, withRetry fail-fast on non-retryable errors
+
 ## [1.2.12](changelog/1.2.x/1.2.12.md) — 2026-06-01
 
 Scheduled mirror refresh runs in a child process — harvest SQLite writes no longer block the request event loop
