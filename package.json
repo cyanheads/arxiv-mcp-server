@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/arxiv-mcp-server",
-  "version": "1.2.12",
+  "version": "1.2.13",
   "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
   "mcpName": "io.github.cyanheads/arxiv-mcp-server",
   "type": "module",
@@ -39,6 +39,7 @@
     "changelog:check": "bun scripts/build-changelog.ts --check",
     "bundle": "bun run build && bunx -y @anthropic-ai/mcpb pack . dist/arxiv-mcp-server.mcpb",
     "test": "vitest run",
+    "release:github": "bun scripts/release-github.ts",
     "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "start": "node dist/index.js",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
@@ -88,7 +89,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.9.16",
+    "@cyanheads/mcp-ts-core": "^0.9.21",
     "better-sqlite3": "^12.10.0",
     "fast-xml-parser": "^5.8.0",
     "node-cron": "^4.2.1",
@@ -106,6 +107,6 @@
     "ignore": "^7.0.5",
     "tsc-alias": "^1.8.17",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.8"
   }
 }
