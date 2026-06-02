@@ -20,6 +20,10 @@ const ServerConfigSchema = z.object({
   mirrorRecentDaysLive: z.coerce.number().min(0).default(2),
   mirrorOaiBaseUrl: z.string().default('https://oaipmh.arxiv.org/oai'),
   mirrorOaiRequestDelayMs: z.coerce.number().min(0).default(3000),
+  // Wall-clock budget for one in-process refresh subprocess before it is
+  // aborted (ms). Default 2h: a nightly delta is small, but arXiv's OAI-PMH
+  // endpoint can be slow per page, so the cap is generous. See issue #22.
+  mirrorRefreshTimeoutMs: z.coerce.number().min(0).default(7_200_000),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -40,6 +44,7 @@ export function getServerConfig(): ServerConfig {
     mirrorRecentDaysLive: 'ARXIV_MIRROR_RECENT_DAYS_LIVE',
     mirrorOaiBaseUrl: 'ARXIV_MIRROR_OAI_BASE_URL',
     mirrorOaiRequestDelayMs: 'ARXIV_MIRROR_OAI_REQUEST_DELAY_MS',
+    mirrorRefreshTimeoutMs: 'ARXIV_MIRROR_REFRESH_TIMEOUT_MS',
   });
   return _config;
 }

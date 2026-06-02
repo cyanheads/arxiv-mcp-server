@@ -13,6 +13,6 @@
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": ["@types/node", "vitest"]
+    "allowlist": ["@cyanheads/mcp-ts-core", "@types/node", "vitest"]
   }
 }

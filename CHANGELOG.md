@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.12](changelog/1.2.x/1.2.12.md) — 2026-06-01
+
+Scheduled mirror refresh runs in a child process — harvest SQLite writes no longer block the request event loop
+
 ## [1.2.11](changelog/1.2.x/1.2.11.md) — 2026-05-31
 
 Incremental and failed mirror refreshes no longer drop arxiv_search to the rate-limited live API

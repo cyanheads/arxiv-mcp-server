@@ -10,7 +10,7 @@ import { getServerConfig } from '@/config/server-config.js';
 import { allResourceDefinitions } from '@/mcp-server/resources/definitions/index.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { initArxivService } from '@/services/arxiv/arxiv-service.js';
-import { runHarvest } from '@/services/arxiv/mirror/index.js';
+import { runRefreshSubprocess } from '@/services/arxiv/mirror/index.js';
 
 await createApp({
   tools: allToolDefinitions,
@@ -47,17 +47,13 @@ await createApp({
             error: (m: string, meta?: object) =>
               core.logger.error(m, { ...jobCtx, ...(meta ?? {}) }),
           };
-          try {
-            const result = await runHarvest(
-              { log: mirrorLog, signal: AbortSignal.timeout(60 * 60_000) },
-              { mode: 'refresh' },
-            );
-            mirrorLog.info('Mirror refresh complete', result);
-          } catch (err) {
-            mirrorLog.error('Mirror refresh failed', {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
+          // Run the harvest in a child process so its synchronous SQLite writes
+          // never block the request event loop — the server keeps serving
+          // arxiv_search / arxiv_get_metadata throughout. See issue #22.
+          await runRefreshSubprocess({
+            timeoutMs: serverConfig.mirrorRefreshTimeoutMs,
+            log: mirrorLog,
+          });
         },
         'Incremental OAI-PMH harvest into the arxiv-mirror SQLite store.',
       );
