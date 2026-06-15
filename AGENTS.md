@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 1.2.13
+**Version:** 1.2.14
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -335,7 +335,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run lint:mcp` | Validate MCP tool/resource definitions |
 | `bun run lint:packaging` | Validate env var alignment between `manifest.json` and `server.json` |
 | `bun run list-skills` | Print skill index from project `skills/` |
-| `bun run bundle` | Build and pack as `.mcpb` for one-click Claude Desktop install |
+| `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 | `bun run test` | Run tests (vitest) |
 | `bun run start:stdio` | Production mode (stdio) — run after `bun run rebuild` |
 | `bun run start:http` | Production mode (HTTP) — run after `bun run rebuild` |
@@ -365,7 +365,7 @@ Remind the user to run publish commands after completing a release flow.
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. MCPB is stdio-only — the HTTP deployment is unaffected.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips dependency-shipped agent docs (`node_modules/**` `skills/`, `.claude/`, `.agents/`, `SKILL.md`) that root-anchored `.mcpbignore` patterns cannot reach. MCPB is stdio-only — the HTTP deployment is unaffected.
 
 **Adding an env var requires both files:** `server.json` (`environmentVariables[]`) and `manifest.json` (`mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match.
 
