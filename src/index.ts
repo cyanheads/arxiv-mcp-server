@@ -13,6 +13,8 @@ import { initArxivService } from '@/services/arxiv/arxiv-service.js';
 import { runRefreshSubprocess } from '@/services/arxiv/mirror/index.js';
 
 await createApp({
+  name: 'arxiv-mcp-server',
+  title: 'arxiv-mcp-server',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: [],

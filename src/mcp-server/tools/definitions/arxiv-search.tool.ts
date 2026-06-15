@@ -113,6 +113,14 @@ export const arxivSearch = tool('arxiv_search', {
     effectiveQuery: z.string().describe('The query as sent to arXiv after input normalization.'),
     totalFound: z.number().describe('Total matching papers reported by arXiv (before pagination).'),
     pageStart: z.number().describe('Pagination offset of this result page.'),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when more matching papers exist beyond this page (totalFound > start + shown).',
+      ),
+    shown: z.number().optional().describe('Papers returned on this page.'),
+    cap: z.number().optional().describe('The max_results limit applied to this page.'),
     notice: z
       .string()
       .optional()
@@ -151,6 +159,15 @@ export const arxivSearch = tool('arxiv_search', {
       totalFound: result.total_results,
       pageStart: result.start,
     });
+
+    // Disclose when this page was capped — more matches exist past start + shown.
+    if (result.papers.length > 0 && result.total_results > result.start + result.papers.length) {
+      ctx.enrich.truncated({
+        shown: result.papers.length,
+        cap: input.max_results,
+        guidance: `${result.total_results} total matches. Page further with start=${result.start + result.papers.length}, or refine the query.`,
+      });
+    }
 
     // Empty-result and pagination-overshoot notices surface as enrichment, not throws.
     if (result.papers.length === 0) {

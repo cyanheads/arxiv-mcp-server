@@ -13,10 +13,10 @@ const ServerConfigSchema = z.object({
   apiTimeoutMs: z.coerce.number().default(15000),
 
   // OAI-PMH mirror (issue #12). All optional; mirror is disabled by default.
-  mirrorEnabled: z.coerce.boolean().default(false),
+  mirrorEnabled: z.stringbool().default(false),
   mirrorPath: z.string().default('./data/arxiv-mirror.db'),
   mirrorRefreshCron: z.string().optional(),
-  mirrorFallbackLive: z.coerce.boolean().default(true),
+  mirrorFallbackLive: z.stringbool().default(true),
   mirrorRecentDaysLive: z.coerce.number().min(0).default(2),
   mirrorOaiBaseUrl: z.string().default('https://oaipmh.arxiv.org/oai'),
   mirrorOaiRequestDelayMs: z.coerce.number().min(0).default(3000),

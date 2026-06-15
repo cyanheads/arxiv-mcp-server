@@ -80,6 +80,33 @@ describe('arxivSearch', () => {
     expect(enrichment.effectiveQuery).toBe('au:bengio AND ti:attention');
     expect(enrichment.totalFound).toBe(42);
     expect(enrichment.pageStart).toBe(0); // service echoes back start from result
+  });
+
+  it('discloses truncation when matches exceed the returned page', async () => {
+    mockSearch.mockResolvedValue(MOCK_RESULT); // 42 total, 1 returned at start 0
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
+    const input = arxivSearch.input.parse({ query: 'all:transformer', max_results: 10 });
+    await arxivSearch.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.shown).toBe(1);
+    expect(enrichment.cap).toBe(10);
+    expect(enrichment.notice).toContain('42 total matches');
+  });
+
+  it('omits truncation disclosure when the page holds all matches', async () => {
+    mockSearch.mockResolvedValue({ total_results: 1, start: 0, papers: [MOCK_PAPER] });
+    const ctx = createMockContext({ errors: arxivSearch.errors! }) as Parameters<
+      typeof arxivSearch.handler
+    >[1];
+    const input = arxivSearch.input.parse({ query: 'all:transformer' });
+    await arxivSearch.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBeUndefined();
     expect(enrichment.notice).toBeUndefined();
   });
 
