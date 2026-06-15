@@ -15,7 +15,7 @@
   "interface": {
     "displayName": "arxiv-mcp-server",
     "shortDescription": "Search arXiv, fetch paper metadata, and read full-text content via MCP.",
-    "longDescription": "MCP server for accessing the arXiv academic paper corpus. Supports full-text search, paper metadata retrieval by ID, HTML content reading, and category taxonomy listing. Deployable as stdio or streamable HTTP.",
+    "longDescription": "Search the arXiv academic paper corpus. Supports full-text search, paper metadata retrieval by ID, HTML content reading, and category taxonomy listing. Deployable as stdio or streamable HTTP.",
     "developerName": "cyanheads",
     "category": "research",
     "capabilities": ["Read"],
