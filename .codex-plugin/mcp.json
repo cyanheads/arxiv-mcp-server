@@ -1,5 +1,5 @@
 {
-  "@cyanheads/arxiv-mcp-server": {
+  "arxiv-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/arxiv-mcp-server"],
     "env": {
