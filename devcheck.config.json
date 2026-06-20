@@ -14,5 +14,8 @@
   },
   "outdated": {
     "allowlist": ["@cyanheads/mcp-ts-core", "@types/node", "vitest"]
+  },
+  "packaging": {
+    "pluginManifests": true
   }
 }
