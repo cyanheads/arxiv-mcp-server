@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.15](changelog/1.2.x/1.2.15.md) — 2026-06-20
+
+Adopt @cyanheads/mcp-ts-core 0.10.7–0.10.9: devcheck fresh-scaffold guards, dependency-specifier guard, plugin-manifest packaging checks, ctx.content collector, DuckDB SQL-gate fixes; skill + script re-sync
+
 ## [1.2.14](changelog/1.2.x/1.2.14.md) — 2026-06-15
 
 Adopt @cyanheads/mcp-ts-core 0.10.6: server identity name/title, arxiv_search truncation disclosure, env booleans via z.stringbool(), MCPB bundle cleaner

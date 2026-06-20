@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-06-15 20:31:45
+Generated on: 2026-06-20 10:34:23
 
 ```text
 arxiv-mcp-server/
@@ -36,6 +36,7 @@ arxiv-mcp-server/
 │   ├── arxiv-mirror-verify.ts
 │   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
