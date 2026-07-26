@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 10:34:23
+Generated on: 2026-07-26 22:53:30
 
 ```text
 arxiv-mcp-server/
@@ -12,10 +12,12 @@ arxiv-mcp-server/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -176,14 +178,15 @@ arxiv-mcp-server/
 │   │   │       ├── categories.resource.test.ts
 │   │   │       ├── paper.resource.extra.test.ts
 │   │   │       └── paper.resource.test.ts
-│   │   └── tools/
-│   │       └── definitions/
-│   │           ├── arxiv-get-metadata.tool.test.ts
-│   │           ├── arxiv-list-categories.tool.test.ts
-│   │           ├── arxiv-read-paper.tool.test.ts
-│   │           ├── arxiv-search.tool.test.ts
-│   │           ├── input-validation.test.ts
-│   │           └── security.test.ts
+│   │   ├── tools/
+│   │   │   └── definitions/
+│   │   │       ├── arxiv-get-metadata.tool.test.ts
+│   │   │       ├── arxiv-list-categories.tool.test.ts
+│   │   │       ├── arxiv-read-paper.tool.test.ts
+│   │   │       ├── arxiv-search.tool.test.ts
+│   │   │       ├── input-validation.test.ts
+│   │   │       └── security.test.ts
+│   │   └── id-input-boundary.test.ts
 │   └── services/
 │       └── arxiv/
 │           ├── mirror/
@@ -201,6 +204,7 @@ arxiv-mcp-server/
 │           └── types.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md

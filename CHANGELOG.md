@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.2.16](changelog/1.2.x/1.2.16.md) — 2026-07-26
+
+Fix silent version substitution in metadata batch lookup, mirror fallback, and whitespace-only ID validation (#25, #26, #28, #33); adopt mcp-ts-core 0.11.0
+
 ## [1.2.15](changelog/1.2.x/1.2.15.md) — 2026-06-20
 
 Adopt @cyanheads/mcp-ts-core 0.10.7–0.10.9: devcheck fresh-scaffold guards, dependency-specifier guard, plugin-manifest packaging checks, ctx.content collector, DuckDB SQL-gate fixes; skill + script re-sync

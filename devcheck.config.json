@@ -8,7 +8,8 @@
       "@cyanheads/mcp-ts-core",
       "depcheck",
       "tsx",
-      "bun:sqlite"
+      "bun:sqlite",
+      "@socketsecurity/bun-security-scanner"
     ],
     "ignorePatterns": []
   },
