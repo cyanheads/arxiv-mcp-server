@@ -27,6 +27,14 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       recovery: 'Use the pdf_url returned by arxiv_get_metadata to fetch the source PDF directly.',
     },
     {
+      reason: 'version_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'A version-pinned paper_id was requested, arXiv is unreachable, and the local mirror holds only a different version — per-version reads require the live API.',
+      retryable: true,
+      recovery:
+        'Retry once arXiv is reachable, or request the version reported in error.data.mirrorVersion.',
+    },
+    {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
@@ -45,6 +53,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
   input: z.object({
     paper_id: z
       .string()
+      .trim()
       .min(1, 'Paper ID cannot be empty. Provide an arXiv ID (e.g., "2401.12345").')
       .describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
     max_characters: z

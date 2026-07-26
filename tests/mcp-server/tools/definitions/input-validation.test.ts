@@ -111,8 +111,27 @@ describe('arxivGetMetadata input validation', () => {
     expect(() => arxivGetMetadata.input.parse({ paper_ids: '' })).toThrow(/cannot be empty/i);
   });
 
+  it('rejects whitespace-only paper_id (trimmed to empty)', () => {
+    expect(() => arxivGetMetadata.input.parse({ paper_ids: '   ' })).toThrow(/cannot be empty/i);
+  });
+
   it('rejects array with empty string element', () => {
     expect(() => arxivGetMetadata.input.parse({ paper_ids: [''] })).toThrow();
+  });
+
+  it('rejects array with whitespace-only element (trimmed to empty)', () => {
+    expect(() => arxivGetMetadata.input.parse({ paper_ids: ['2401.12345', ' \t '] })).toThrow(
+      /cannot be empty/i,
+    );
+  });
+
+  it('trims surrounding whitespace off accepted IDs', () => {
+    expect(arxivGetMetadata.input.parse({ paper_ids: '  2401.12345  ' }).paper_ids).toBe(
+      '2401.12345',
+    );
+    expect(arxivGetMetadata.input.parse({ paper_ids: [' 2401.12345 '] }).paper_ids).toEqual([
+      '2401.12345',
+    ]);
   });
 
   it('rejects empty array', () => {
@@ -151,6 +170,14 @@ describe('arxivGetMetadata input validation', () => {
 describe('arxivReadPaper input validation', () => {
   it('rejects empty paper_id', () => {
     expect(() => arxivReadPaper.input.parse({ paper_id: '' })).toThrow(/cannot be empty/i);
+  });
+
+  it('rejects whitespace-only paper_id (trimmed to empty)', () => {
+    expect(() => arxivReadPaper.input.parse({ paper_id: '   ' })).toThrow(/cannot be empty/i);
+  });
+
+  it('trims surrounding whitespace off an accepted paper_id', () => {
+    expect(arxivReadPaper.input.parse({ paper_id: '  2401.12345  ' }).paper_id).toBe('2401.12345');
   });
 
   it('rejects missing paper_id', () => {

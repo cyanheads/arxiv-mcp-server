@@ -618,6 +618,52 @@ describe('ArxivService.getPapers', () => {
     expect(result.papers.map((p) => p.id)).toEqual(['2401.00001v1', '2401.00002v3']);
   });
 
+  it('keeps two explicit versions of one paper in distinct slots (issue #28)', async () => {
+    // arXiv honors a `vN` suffix in id_list and returns one entry per requested
+    // version, newest first. Matching on base ID alone collapses both slots onto
+    // whichever entry landed last in the index.
+    const ATOM_TWO_VERSIONS = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>2</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/1706.03762v7</id>
+    <title>Attention Is All You Need</title><summary>v7</summary>
+    <author><name>Vaswani</name></author>
+    <published>2017-06-12T00:00:00Z</published><updated>2023-08-02T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/1706.03762v1</id>
+    <title>Attention Is All You Need</title><summary>v1</summary>
+    <author><name>Vaswani</name></author>
+    <published>2017-06-12T00:00:00Z</published><updated>2017-06-12T00:00:00Z</updated>
+  </entry>
+</feed>`;
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_TWO_VERSIONS));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.getPapers(['1706.03762v1', '1706.03762v7'], ctx);
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('id_list')).toBe('1706.03762v1,1706.03762v7');
+    expect(result.papers.map((p) => p.id)).toEqual(['1706.03762v1', '1706.03762v7']);
+    expect(result.papers.map((p) => p.abstract)).toEqual(['v1', 'v7']);
+    expect(result.not_found_ids).toBeUndefined();
+  });
+
+  it('reports an explicitly requested version arXiv did not return as not found (issue #25)', async () => {
+    // ATOM_SINGLE carries 2401.12345v1 only — a v2 request must not resolve to it.
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.getPapers(['2401.12345v2'], ctx);
+
+    expect(result.papers).toHaveLength(0);
+    expect(result.not_found_ids).toEqual(['2401.12345v2']);
+  });
+
   it('handles sparse upstream entries without fabricating optional fields', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SPARSE));
     const ctx = createMockContext();

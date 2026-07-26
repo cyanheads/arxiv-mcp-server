@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
 import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
 import { ArxivService } from '@/services/arxiv/arxiv-service.js';
 import { MirrorStore, resetStore } from '@/services/arxiv/mirror/store.js';
@@ -81,6 +82,54 @@ const ATOM_LIVE_PAPER = `<?xml version="1.0" encoding="UTF-8"?>
     <category term="cs.AI" />
     <published>2024-02-15T00:00:00Z</published>
     <updated>2024-02-15T00:00:00Z</updated>
+  </entry>
+</feed>`;
+
+/** Live response for a version the mirror does not hold (it stores v1 only). */
+const ATOM_LIVE_V9 = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.10001v9</id>
+    <title>Mirror Paper One on Transformers</title>
+    <summary>Revision nine, live only.</summary>
+    <author><name>Alice Smith</name></author>
+    <category term="cs.LG" />
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-06-01T00:00:00Z</updated>
+  </entry>
+</feed>`;
+
+/**
+ * Two explicit versions of one paper in a single response. arXiv returns newest
+ * first, which is what made the base-ID map collapse both onto the older entry.
+ */
+const ATOM_LIVE_TWO_VERSIONS = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>2</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.10001v3</id>
+    <title>Revision Three</title>
+    <summary>Third revision.</summary>
+    <author><name>Alice Smith</name></author>
+    <category term="cs.LG" />
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-04-01T00:00:00Z</updated>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.10001v2</id>
+    <title>Revision Two</title>
+    <summary>Second revision.</summary>
+    <author><name>Alice Smith</name></author>
+    <category term="cs.LG" />
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-03-01T00:00:00Z</updated>
   </entry>
 </feed>`;
 
@@ -167,13 +216,59 @@ describe('ArxivService — mirror integration', () => {
       expect(result.papers.map((p) => p.id)).toEqual(['2401.10002v3', '2401.10001v1']);
     });
 
-    it('strips versioned input before mirror lookup and returns the stored version', async () => {
+    it('serves an explicit version from the mirror when the stored version matches (#25)', async () => {
+      const ctx = createMockContext();
+      const result = await service.getPapers(['2401.10001v1', '2401.10002v3'], ctx);
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers.map((p) => p.id)).toEqual(['2401.10001v1', '2401.10002v3']);
+      expect(result.not_found_ids).toBeUndefined();
+    });
+
+    it('routes an explicit version the mirror does not hold to the live API (#25)', async () => {
+      // The mirror stores the latest version only (v1 here), so a v9 request is
+      // a miss — never a silent substitution of the stored version.
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_LIVE_V9));
       const ctx = createMockContext();
       const result = await service.getPapers(['2401.10001v9'], ctx);
 
-      // Mirror only knows the latest version; input version is stripped before lookup.
-      expect(result.papers).toHaveLength(1);
-      expect(result.papers[0]?.id).toBe('2401.10001v1');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+      expect(url.searchParams.get('id_list')).toBe('2401.10001v9');
+      expect(result.papers.map((p) => p.id)).toEqual(['2401.10001v9']);
+    });
+
+    it('reports an explicit version the mirror does not hold as not found when fallback is disabled (#25)', async () => {
+      configOverrides.mirrorFallbackLive = false;
+      const ctx = createMockContext();
+      const result = await service.getPapers(['2401.10001v9'], ctx);
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers).toHaveLength(0);
+      expect(result.not_found_ids).toEqual(['2401.10001v9']);
+    });
+
+    it('keeps two mirror-missing versions of one paper distinct through the live merge (#25 × #28)', async () => {
+      // Compound case: an unversioned slot resolves from the mirror while two
+      // differently-versioned slots for the same base ID both miss and share a
+      // single live fallback call. The merge must key on the full versioned ID
+      // or both live slots collapse onto one version.
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_LIVE_TWO_VERSIONS));
+      const ctx = createMockContext();
+      const result = await service.getPapers(['2401.10001', '2401.10001v2', '2401.10001v3'], ctx);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+      // Only the two misses go upstream — the unversioned slot came from the mirror.
+      expect(url.searchParams.get('id_list')).toBe('2401.10001v2,2401.10001v3');
+
+      expect(result.papers.map((p) => p.id)).toEqual([
+        '2401.10001v1',
+        '2401.10001v2',
+        '2401.10001v3',
+      ]);
+      expect(result.papers[0]?.title).toBe('Mirror Paper One on Transformers');
+      expect(result.not_found_ids).toBeUndefined();
     });
 
     it('falls back to live API for misses when mirrorFallbackLive=true', async () => {
@@ -226,6 +321,84 @@ describe('ArxivService — mirror integration', () => {
 
       expect(mockFetch).toHaveBeenCalledTimes(1);
       expect(result.papers[0]?.id).toBe('2402.99999v1');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // readContent — mirror fallback when the live metadata lookup fails (#33)
+  // -------------------------------------------------------------------------
+
+  describe('readContent — live failure, mirror fallback (#33)', () => {
+    /**
+     * Rate-limit every API call (arXiv's most common failure, and non-retryable
+     * here per #8) while serving HTML for any version. If a version-pinned read
+     * ever resolves to the mirror's stored version, the HTML fetch below
+     * succeeds and the call returns a different revision's body.
+     */
+    function mockLiveDownButHtmlUp(): void {
+      mockFetch.mockImplementation((url: string) => {
+        if (url.includes('export.arxiv.org')) {
+          return Promise.resolve(
+            new Response('Rate exceeded.', {
+              status: 200,
+              headers: { 'content-type': 'text/plain' },
+            }),
+          );
+        }
+        return Promise.resolve(
+          new Response('<html><head></head><body><article>Body text.</article></body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+          }),
+        );
+      });
+    }
+
+    const htmlCalls = (): string[] =>
+      mockFetch.mock.calls.map((c) => String(c[0])).filter((u) => !u.includes('export.arxiv.org'));
+
+    it('fails rather than substituting the stored version for a version-pinned read', async () => {
+      // The mirror holds 2401.10002 at v3; the caller pinned v1.
+      mockLiveDownButHtmlUp();
+      const ctx = createMockContext({ errors: arxivReadPaper.errors! });
+
+      await expect(service.readContent('2401.10002v1', {}, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'version_unavailable', paperId: '2401.10002v1', mirrorVersion: '3' },
+      });
+
+      // No HTML fetched for the substituted version — or for any version.
+      expect(htmlCalls()).toEqual([]);
+    });
+
+    it('serves a version-pinned read from the mirror when the stored version matches', async () => {
+      mockLiveDownButHtmlUp();
+      const ctx = createMockContext({ errors: arxivReadPaper.errors! });
+      const result = await service.readContent('2401.10002v3', {}, ctx);
+
+      expect(result.paper_id).toBe('2401.10002v3');
+      expect(htmlCalls()).toEqual(['https://arxiv.org/html/2401.10002v3']);
+    });
+
+    it('keeps degrading an unversioned read to the latest stored version', async () => {
+      mockLiveDownButHtmlUp();
+      const ctx = createMockContext({ errors: arxivReadPaper.errors! });
+      const result = await service.readContent('2401.10002', {}, ctx);
+
+      expect(result.paper_id).toBe('2401.10002v3');
+      expect(result.title).toBe('Mirror Paper Two on Astrophysics');
+      expect(result.source).toBe('arxiv_html');
+      expect(htmlCalls()).toEqual(['https://arxiv.org/html/2401.10002v3']);
+    });
+
+    it('reports a paper the mirror does not hold at all as not found', async () => {
+      mockLiveDownButHtmlUp();
+      const ctx = createMockContext({ errors: arxivReadPaper.errors! });
+
+      await expect(service.readContent('9999.99999v1', {}, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'no_match' },
+      });
     });
   });
 

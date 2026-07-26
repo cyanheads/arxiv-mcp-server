@@ -15,7 +15,7 @@
 
 | URI Template | Description | Delegates To |
 |:-------------|:------------|:-------------|
-| `arxiv://paper/{paperId}` | Paper metadata by arXiv ID. Returns `PaperMetadataSchema` as JSON text. | `ArxivService.getPapers([paperId])` |
+| `arxiv://paper/{paperId}` | Paper metadata by arXiv ID. The segment is percent-decoded before lookup, so a legacy ID travels as `hep-th%2F9901001`; an ID that decodes to blank is rejected without an arXiv request. Returns `PaperMetadataSchema` as JSON text. | `ArxivService.getPapers([paperId])` |
 | `arxiv://categories` | Full arXiv category taxonomy. Returns grouped category list as JSON text. | Static taxonomy constant |
 
 ### Prompts
@@ -331,7 +331,7 @@ class ArxivService {
 
 | Concern | Decision |
 |:--------|:---------|
-| Batch fetching | `getPapers()` sends all IDs in a single `id_list=` request. Cross-references response entries against requested IDs to detect not-found. |
+| Batch fetching | `getPapers()` sends all IDs in a single `id_list=` request. Cross-references response entries against requested IDs to detect not-found, matching on the full versioned ID when the request pins a version so two versions of one paper stay in their own slots. |
 | Field selection | N/A — arXiv API returns fixed Atom entries, no field selection parameter. |
 | Pagination | `search()` uses `start` + `max_results` params. Single request per tool call (no internal pagination). |
 
@@ -405,7 +405,7 @@ This is a data-access server. The value is in search, metadata retrieval, and co
 - **Raw HTML responses are large.** Since we return unprocessed HTML, responses can be 500KB-3MB+ for math-heavy papers. The `max_characters` parameter is the only size control. LLMs handle HTML well, but callers should set reasonable limits for their context budget.
 - **No PDF text extraction.** The server does not parse PDFs. When HTML is unavailable, it returns the PDF URL and lets the consumer handle it. PDF extraction is complex, error-prone, and better handled by specialized tools.
 - **Rate limits are server-wide.** The 3-second delay is per arXiv API request across all concurrent tool calls, not per-agent. Under high concurrency, agents queue behind each other. This matches arXiv's policy but limits throughput. HTML fetches hit separate hosts (arxiv.org/html, ar5iv) and are not queued.
-- **Paper ID normalization.** The arXiv API always returns IDs with a version suffix (e.g., `2401.12345v1`). Inputs accept both `2401.12345` and `2401.12345v2`. The service normalizes input by stripping the version suffix for API queries and preserves the versioned ID from the response. Returned `id` fields always include the version.
+- **Paper ID normalization.** The arXiv API always returns IDs with a version suffix (e.g., `2401.12345v1`). Inputs accept both `2401.12345` and `2401.12345v2` and are passed through to arXiv verbatim — `id_list` and the HTML endpoints both honor a version suffix. An ID that pins a version resolves only to that version: it never falls back to another version, and the mirror (which stores the latest version only) is a miss for it. An unversioned ID resolves to the latest version. Returned `id` fields always include the version.
 - **Atom XML quirks.** The arXiv API returns HTTP 200 for all cases — empty results, not-found IDs, and rate limiting all return 200 with varying response bodies. Rate limiting returns plain text "Rate exceeded." (content-type `text/plain`, not XML) — must check content-type before parsing. Additional quirks: `<id>` uses `http://` while `<link>` uses `https://`; `<summary>` has leading/trailing whitespace; version suffix (`v1`, `v7`) is always present in `<id>` and must be stripped for base paper ID; `<arxiv:primary_category>` lacks the `scheme` attribute that `<category>` has.
 - **No real-time results.** arXiv updates daily. Search results reflect yesterday's index, not papers submitted today.
 

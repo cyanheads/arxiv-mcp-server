@@ -45,6 +45,51 @@ describe('paperResource', () => {
     expect(result).toMatchObject({ id: '2401.12345v1', title: 'Test Paper' });
   });
 
+  it('rejects an empty or whitespace-only paperId before the handler runs', () => {
+    expect(() => paperResource.params!.parse({ paperId: '' })).toThrow(/cannot be empty/i);
+    expect(() => paperResource.params!.parse({ paperId: '   ' })).toThrow(/cannot be empty/i);
+    expect(mockGetPapers).not.toHaveBeenCalled();
+  });
+
+  it('trims surrounding whitespace off an accepted paperId', () => {
+    expect(paperResource.params!.parse({ paperId: '  2401.12345  ' }).paperId).toBe('2401.12345');
+  });
+
+  it('rejects a percent-encoded blank paperId without an arXiv lookup', async () => {
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    // URI-template matching hands the handler raw segment text, so `%20%20%20`
+    // arrives as nine ordinary characters and clears the schema's blank check.
+    await expect(paperResource.handler({ paperId: '%20%20%20' }, ctx)).rejects.toMatchObject({
+      data: { reason: 'empty_id' },
+    });
+    expect(mockGetPapers).not.toHaveBeenCalled();
+  });
+
+  it('decodes a percent-encoded legacy paperId before lookup', async () => {
+    mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await paperResource.handler({ paperId: 'hep-th%2F9901001' }, ctx);
+    expect(mockGetPapers).toHaveBeenCalledWith(['hep-th/9901001'], ctx);
+  });
+
+  it('passes a malformed escape through rather than throwing a URIError', async () => {
+    mockGetPapers.mockResolvedValue({ papers: [] });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await expect(paperResource.handler({ paperId: '%zz' }, ctx)).rejects.toMatchObject({
+      data: { reason: 'no_match' },
+    });
+    expect(mockGetPapers).toHaveBeenCalledWith(['%zz'], ctx);
+  });
+
   it('throws when paper not found', async () => {
     mockGetPapers.mockResolvedValue({ papers: [] });
     const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<

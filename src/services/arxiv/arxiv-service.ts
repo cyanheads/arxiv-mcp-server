@@ -273,6 +273,46 @@ function stripVersion(id: string): string {
   return id.replace(/v\d+$/, '');
 }
 
+/**
+ * Version an arXiv ID pins explicitly, or `undefined` when it is unversioned.
+ * `2401.12345` → undefined, `2401.12345v7` → 7.
+ */
+function parseVersion(id: string): number | undefined {
+  const match = /v(\d+)$/.exec(id);
+  return match ? Number(match[1]) : undefined;
+}
+
+/**
+ * Match each requested arXiv ID to a candidate record, slot-aligned with `ids`
+ * (`undefined` where nothing satisfies the request).
+ *
+ * An ID that pins a version resolves only to the candidate carrying that exact
+ * version, so two versions of one paper in the same batch stay distinct
+ * (issue #28) and a stored row holding a different version reads as a miss
+ * rather than a silent substitution (issue #25). An unversioned ID resolves to
+ * the highest-versioned candidate sharing its base ID — arXiv's latest-version
+ * semantics, and the only version the mirror stores.
+ */
+function resolveRequestedIds<T>(
+  ids: readonly string[],
+  candidates: readonly T[],
+  idOf: (candidate: T) => string,
+): (T | undefined)[] {
+  const byVersionedId = new Map<string, T>();
+  const latestByBaseId = new Map<string, { candidate: T; version: number }>();
+  for (const candidate of candidates) {
+    const id = idOf(candidate);
+    byVersionedId.set(id, candidate);
+    const base = stripVersion(id);
+    const version = parseVersion(id) ?? 0;
+    const latest = latestByBaseId.get(base);
+    if (!latest || version >= latest.version) latestByBaseId.set(base, { candidate, version });
+  }
+  return ids.map((id) =>
+    parseVersion(id) === undefined ? latestByBaseId.get(id)?.candidate : byVersionedId.get(id),
+  );
+}
+
 function extractPaperId(idUrl: string): string {
   return idUrl.replace(/^https?:\/\/arxiv\.org\/abs\//, '');
 }
@@ -528,30 +568,26 @@ export class ArxivService {
     if (!ready) return this.fetchLivePapers(ids, ctx);
 
     const config = getServerConfig();
-    const baseIds = ids.map(stripVersion);
-    const rows = ready.store.getPapersByIds(baseIds);
-    const byBaseId = new Map(rows.map((r) => [r.id, r]));
+    // The mirror is keyed by base ID and stores the latest version only, so the
+    // lookup is by base ID but the match is version-aware: a row satisfies a
+    // slot only when it carries the version that slot asked for. An explicit
+    // older version is a miss, patched from the live API below. See issue #25.
+    const rows = ready.store.getPapersByIds(ids.map(stripVersion));
+    const slots = resolveRequestedIds(ids, rows.map(rowToMetadata), (p) => p.id);
 
-    // Slots align with input order; mirror hits fill in here, gaps may be
-    // patched from the live API below.
-    const slots: (PaperMetadata | null)[] = baseIds.map((b) => {
-      const row = byBaseId.get(b);
-      return row ? rowToMetadata(row) : null;
-    });
-
-    const missingIndices = slots.flatMap((p, i) => (p === null ? [i] : []));
+    const missingIndices = slots.flatMap((p, i) => (p === undefined ? [i] : []));
     if (missingIndices.length > 0 && config.mirrorFallbackLive) {
       const missing = missingIndices.map((i) => ids[i] ?? '');
       ctx.log.info('Mirror miss; falling back to live', { missing });
       const live = await this.fetchLivePapers(missing, ctx);
-      const liveByBaseId = new Map(live.papers.map((p) => [stripVersion(p.id), p]));
-      for (const i of missingIndices) {
-        slots[i] = liveByBaseId.get(baseIds[i] ?? '') ?? null;
+      const resolved = resolveRequestedIds(missing, live.papers, (p) => p.id);
+      for (const [k, slotIndex] of missingIndices.entries()) {
+        slots[slotIndex] = resolved[k];
       }
     }
 
-    const papers = slots.filter((p): p is PaperMetadata => p !== null);
-    const notFoundIds = ids.filter((_, i) => slots[i] === null);
+    const papers = slots.filter((p): p is PaperMetadata => p !== undefined);
+    const notFoundIds = ids.filter((_, i) => slots[i] === undefined);
     return {
       papers,
       ...(notFoundIds.length > 0 ? { not_found_ids: notFoundIds } : {}),
@@ -583,13 +619,12 @@ export class ArxivService {
     // Re-index by input order — arXiv returns entries in its own internal order
     // (typically submission-date desc), so a caller stitching results back to an
     // ordered reference list would otherwise silently misalign. See issue #5.
-    // Both input and response sides are normalized via stripVersion since input
-    // may be versioned or not and arXiv always returns versioned IDs.
-    const byBaseId = new Map(result.entries.map((p) => [stripVersion(p.id), p]));
-    const ordered = ids
-      .map((id) => byBaseId.get(stripVersion(id)))
-      .filter((p): p is PaperMetadata => p !== undefined);
-    const notFoundIds = ids.filter((id) => !byBaseId.has(stripVersion(id)));
+    // The match is version-aware: arXiv honors a `vN` suffix in `id_list` and
+    // returns one entry per requested version, so a batch asking for two
+    // versions of one paper must keep them in their own slots. See issue #28.
+    const resolved = resolveRequestedIds(ids, result.entries, (p) => p.id);
+    const ordered = resolved.filter((p): p is PaperMetadata => p !== undefined);
+    const notFoundIds = ids.filter((_, i) => resolved[i] === undefined);
 
     return {
       papers: ordered,
@@ -618,7 +653,25 @@ export class ArxivService {
         error: err instanceof Error ? err.message : String(err),
       });
       const rows = ready.store.getPapersByIds([stripVersion(paperId)]);
-      paper = rows[0] ? rowToMetadata(rows[0]) : undefined;
+      const [stored] = rows;
+      const [match] = resolveRequestedIds([paperId], rows.map(rowToMetadata), (p) => p.id);
+      // A version-pinned read must not degrade to whichever version the mirror
+      // happens to hold — the substituted ID would flow into the HTML fetch
+      // below and return a different revision's body. Unversioned reads keep
+      // degrading to the latest stored version. See issue #33.
+      if (!match && stored) {
+        throw serviceUnavailable(
+          `arXiv is unavailable and version ${parseVersion(paperId)} of '${stored.id}' cannot be served locally — the mirror holds version ${stored.version} only.`,
+          {
+            paperId,
+            mirrorVersion: stored.version,
+            reason: 'version_unavailable',
+            ...ctx.recoveryFor('version_unavailable'),
+          },
+          { cause: err },
+        );
+      }
+      paper = match;
     }
     if (!paper) {
       throw notFound(

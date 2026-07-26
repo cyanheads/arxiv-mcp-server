@@ -56,10 +56,16 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       .union([
         z
           .string()
+          .trim()
           .min(1, 'Paper ID cannot be empty. Provide an arXiv ID (e.g., "2401.12345").')
           .describe('Single arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
         z
-          .array(z.string().min(1))
+          .array(
+            z
+              .string()
+              .trim()
+              .min(1, 'Paper ID cannot be empty. Provide an arXiv ID (e.g., "2401.12345").'),
+          )
           .min(1)
           .max(10)
           .describe('Array of up to 10 arXiv paper IDs for batch lookup.'),
