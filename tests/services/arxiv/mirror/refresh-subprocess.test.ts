@@ -86,7 +86,7 @@ describe('runRefreshSubprocess', () => {
     expect(log.error).not.toHaveBeenCalled();
   });
 
-  it('logs an error and still resolves on a non-zero exit', async () => {
+  it('rejects on a non-zero exit so the scheduler records the tick as failed (#31)', async () => {
     const child = makeFakeChild();
     spawnMock.mockReturnValue(child as unknown as ChildProcess);
     const log = makeLog();
@@ -94,11 +94,56 @@ describe('runRefreshSubprocess', () => {
     const done = runRefreshSubprocess({ timeoutMs: 1000, log });
     child.exitCode = 1;
     child.emit('exit', 1, null);
-    await expect(done).resolves.toBeUndefined();
+    await expect(done).rejects.toThrow(/exited with code 1/);
     expect(log.error).toHaveBeenCalledWith(
       'Mirror refresh subprocess exited non-zero',
       expect.objectContaining({ code: 1 }),
     );
+  });
+
+  it('rejects when the child fails to spawn (#31)', async () => {
+    spawnMock.mockImplementation(() => {
+      throw new Error('EACCES');
+    });
+    const log = makeLog();
+
+    await expect(runRefreshSubprocess({ timeoutMs: 1000, log })).rejects.toThrow(/failed to spawn/);
+    expect(log.error).toHaveBeenCalledWith(
+      'Mirror refresh subprocess failed to spawn',
+      expect.objectContaining({ error: 'EACCES' }),
+    );
+  });
+
+  it('rejects when the child emits an error event (#31)', async () => {
+    const child = makeFakeChild();
+    spawnMock.mockReturnValue(child as unknown as ChildProcess);
+    const log = makeLog();
+
+    const done = runRefreshSubprocess({ timeoutMs: 1000, log });
+    child.emit('error', new Error('spawn ENOENT'));
+    await expect(done).rejects.toThrow(/spawn ENOENT/);
+    expect(log.error).toHaveBeenCalledWith('Mirror refresh subprocess error', {
+      error: 'spawn ENOENT',
+    });
+  });
+
+  it('releases the concurrency guard after a failed run (#31)', async () => {
+    // The rejection must not strand `activeChild`, or every later tick is
+    // skipped as "already running".
+    const first = makeFakeChild();
+    spawnMock.mockReturnValue(first as unknown as ChildProcess);
+    const log = makeLog();
+
+    const failed = runRefreshSubprocess({ timeoutMs: 1000, log });
+    first.emit('exit', 1, null);
+    await expect(failed).rejects.toThrow();
+
+    const second = makeFakeChild();
+    spawnMock.mockReturnValue(second as unknown as ChildProcess);
+    const done = runRefreshSubprocess({ timeoutMs: 1000, log });
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    second.emit('exit', 0, null);
+    await expect(done).resolves.toBeUndefined();
   });
 
   it('is a no-op when a refresh is already running', async () => {
@@ -130,7 +175,8 @@ describe('runRefreshSubprocess', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
 
     child.emit('exit', null, 'SIGKILL');
-    await done;
+    // A harvest killed mid-flight is a failed tick, not a completed one (#31).
+    await expect(done).rejects.toThrow(/terminated on timeout/);
     expect(log.error).toHaveBeenCalledWith(
       'Mirror refresh subprocess terminated on timeout',
       expect.objectContaining({ signal: 'SIGKILL' }),
@@ -160,7 +206,7 @@ describe('runRefreshSubprocess', () => {
     expect(log.error).toHaveBeenCalledWith('segfault in native module');
 
     child.emit('exit', 1, null);
-    await done;
+    await expect(done).rejects.toThrow();
   });
 });
 

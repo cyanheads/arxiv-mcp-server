@@ -43,14 +43,18 @@ let activeChild: ChildProcess | undefined;
 
 /**
  * Spawn one incremental mirror refresh in a child process and resolve when it
- * exits. Never rejects — a failed harvest is logged and swallowed so a cron
- * tick can't crash the server. A no-op (with a warning) when a refresh is
- * already running.
+ * exits cleanly. Rejects on spawn failure, non-zero exit, or a timeout kill, so
+ * a harvest that never finished isn't indistinguishable from one that did —
+ * `SchedulerService.schedule` catches the rejection and logs the tick as failed
+ * without crashing the server, which is the "a cron tick can't crash the
+ * server" backstop. A no-op (with a warning) when a refresh is already running.
  *
  * @param opts.timeoutMs - Wall-clock budget. On overrun the child gets SIGTERM,
  *   then SIGKILL after {@link SIGKILL_GRACE_MS} — synchronous SQLite can't be
  *   interrupted by a signal mid-statement, so the hard kill is the real backstop.
  * @param opts.log - Logger for lifecycle events and forwarded child output.
+ * @throws {Error} When the child fails to spawn, errors, exits non-zero, or is
+ *   killed on timeout. See issue #31.
  */
 export function runRefreshSubprocess(opts: {
   timeoutMs: number;
@@ -64,7 +68,7 @@ export function runRefreshSubprocess(opts: {
 
   const entry = fileURLToPath(new URL('./refresh-subprocess.js', import.meta.url));
 
-  return new Promise<void>((resolvePromise) => {
+  return new Promise<void>((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
     try {
       child = spawn(process.execPath, [entry], {
@@ -75,7 +79,11 @@ export function runRefreshSubprocess(opts: {
       log.error?.('Mirror refresh subprocess failed to spawn', {
         error: err instanceof Error ? err.message : String(err),
       });
-      resolvePromise();
+      rejectPromise(
+        new Error('Mirror refresh subprocess failed to spawn', {
+          cause: err,
+        }),
+      );
       return;
     }
 
@@ -100,26 +108,35 @@ export function runRefreshSubprocess(opts: {
       }
     }, timeoutMs + SIGKILL_GRACE_MS);
 
-    const settle = () => {
+    const settle = (failure?: Error) => {
       clearTimeout(sigterm);
       clearTimeout(sigkill);
       activeChild = undefined;
-      resolvePromise();
+      if (failure) rejectPromise(failure);
+      else resolvePromise();
     };
 
     child.on('error', (err) => {
       log.error?.('Mirror refresh subprocess error', { error: err.message });
-      settle();
+      settle(new Error(`Mirror refresh subprocess error: ${err.message}`, { cause: err }));
     });
     child.on('exit', (code, signal) => {
       if (code === 0) {
         log.info?.('Mirror refresh subprocess completed', { code });
-      } else if (timedOut) {
-        log.error?.('Mirror refresh subprocess terminated on timeout', { code, signal });
-      } else {
-        log.error?.('Mirror refresh subprocess exited non-zero', { code, signal });
+        settle();
+        return;
       }
-      settle();
+      if (timedOut) {
+        log.error?.('Mirror refresh subprocess terminated on timeout', { code, signal });
+        settle(
+          new Error(
+            `Mirror refresh subprocess terminated on timeout after ${timeoutMs}ms (signal ${signal})`,
+          ),
+        );
+        return;
+      }
+      log.error?.('Mirror refresh subprocess exited non-zero', { code, signal });
+      settle(new Error(`Mirror refresh subprocess exited with code ${code} (signal ${signal})`));
     });
   });
 }
