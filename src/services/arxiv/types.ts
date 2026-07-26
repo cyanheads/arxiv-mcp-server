@@ -40,9 +40,33 @@ export interface SearchResult {
   total_results: number;
 }
 
+/**
+ * Why a requested ID returned no metadata. The tool layer advertises these
+ * verbatim as its `not_found[].reason` enum, so a value added here widens that
+ * tool's output schema.
+ *
+ * - `not_in_arxiv` — arXiv itself returned nothing for the ID.
+ * - `version_not_in_mirror` — the paper exists and the local mirror holds it,
+ *   but at a different version, and live fallback is disabled. The ID is
+ *   unreachable in this configuration, not absent from arXiv. See issue #35.
+ */
+export const PaperNotFoundReasonSchema = z
+  .enum(['not_in_arxiv', 'version_not_in_mirror'])
+  .describe('Why the paper ID could not be returned.');
+
+export type PaperNotFoundReason = z.infer<typeof PaperNotFoundReasonSchema>;
+
+/** One requested ID that returned no metadata, with the reason it could not be served. */
+export interface PaperLookupMiss {
+  /** Human-readable supplement — names the version the mirror holds, when known. */
+  detail?: string;
+  id: string;
+  reason: PaperNotFoundReason;
+}
+
 export interface PaperLookupResult {
-  /** Paper IDs that returned no data from arXiv. Plain strings — the tool layer wraps them in the framework's partialResult shape. */
-  not_found_ids?: string[];
+  /** Requested IDs that returned no data, each with a stable reason the tool layer forwards verbatim. */
+  not_found?: PaperLookupMiss[];
   papers: PaperMetadata[];
 }
 

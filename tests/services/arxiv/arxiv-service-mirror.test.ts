@@ -206,7 +206,7 @@ describe('ArxivService — mirror integration', () => {
       expect(result.papers).toHaveLength(2);
       expect(result.papers[0]?.id).toBe('2401.10001v1');
       expect(result.papers[1]?.id).toBe('2401.10002v3');
-      expect(result.not_found_ids).toBeUndefined();
+      expect(result.not_found).toBeUndefined();
     });
 
     it('preserves input order regardless of stored order', async () => {
@@ -222,7 +222,7 @@ describe('ArxivService — mirror integration', () => {
 
       expect(mockFetch).not.toHaveBeenCalled();
       expect(result.papers.map((p) => p.id)).toEqual(['2401.10001v1', '2401.10002v3']);
-      expect(result.not_found_ids).toBeUndefined();
+      expect(result.not_found).toBeUndefined();
     });
 
     it('routes an explicit version the mirror does not hold to the live API (#25)', async () => {
@@ -238,14 +238,23 @@ describe('ArxivService — mirror integration', () => {
       expect(result.papers.map((p) => p.id)).toEqual(['2401.10001v9']);
     });
 
-    it('reports an explicit version the mirror does not hold as not found when fallback is disabled (#25)', async () => {
+    it('reports an explicit version the mirror does not hold as unreachable, not absent from arXiv (#25, #35)', async () => {
+      // The paper and the version both exist upstream — only this deployment
+      // cannot reach them. `not_in_arxiv` would tell the caller the ID is bad.
       configOverrides.mirrorFallbackLive = false;
       const ctx = createMockContext();
       const result = await service.getPapers(['2401.10001v9'], ctx);
 
       expect(mockFetch).not.toHaveBeenCalled();
       expect(result.papers).toHaveLength(0);
-      expect(result.not_found_ids).toEqual(['2401.10001v9']);
+      expect(result.not_found).toEqual([
+        {
+          id: '2401.10001v9',
+          reason: 'version_not_in_mirror',
+          detail: expect.stringContaining("'2401.10001v1'"),
+        },
+      ]);
+      expect(result.not_found?.[0]?.detail).toContain('version 1');
     });
 
     it('keeps two mirror-missing versions of one paper distinct through the live merge (#25 × #28)', async () => {
@@ -268,7 +277,7 @@ describe('ArxivService — mirror integration', () => {
         '2401.10001v3',
       ]);
       expect(result.papers[0]?.title).toBe('Mirror Paper One on Transformers');
-      expect(result.not_found_ids).toBeUndefined();
+      expect(result.not_found).toBeUndefined();
     });
 
     it('falls back to live API for misses when mirrorFallbackLive=true', async () => {
@@ -287,7 +296,7 @@ describe('ArxivService — mirror integration', () => {
       expect(result.papers[0]?.title).toBe('Mirror Paper One on Transformers');
       expect(result.papers[1]?.id).toBe('2402.99999v1');
       expect(result.papers[1]?.title).toBe('From Live API');
-      expect(result.not_found_ids).toBeUndefined();
+      expect(result.not_found).toBeUndefined();
     });
 
     it('reports still-missing IDs when fallback also returns nothing', async () => {
@@ -298,10 +307,12 @@ describe('ArxivService — mirror integration', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1);
       expect(result.papers).toHaveLength(1);
       expect(result.papers[0]?.id).toBe('2401.10001v1');
-      expect(result.not_found_ids).toEqual(['9999.99999']);
+      expect(result.not_found).toEqual([{ id: '9999.99999', reason: 'not_in_arxiv' }]);
     });
 
     it('skips fallback and reports misses when mirrorFallbackLive=false', async () => {
+      // A base ID the mirror has never seen is absent from arXiv as far as this
+      // deployment can tell — distinct from the version-pin case above (#35).
       configOverrides.mirrorFallbackLive = false;
       const ctx = createMockContext();
       const result = await service.getPapers(['2401.10001', '2402.99999'], ctx);
@@ -309,7 +320,26 @@ describe('ArxivService — mirror integration', () => {
       expect(mockFetch).not.toHaveBeenCalled();
       expect(result.papers).toHaveLength(1);
       expect(result.papers[0]?.id).toBe('2401.10001v1');
-      expect(result.not_found_ids).toEqual(['2402.99999']);
+      expect(result.not_found).toEqual([{ id: '2402.99999', reason: 'not_in_arxiv' }]);
+    });
+
+    it('builds both paper URLs from the version the record reports, on either backend (#34)', async () => {
+      // A mirror-served record used to pair a versioned `id` and `pdf_url` with
+      // a bare `abstract_url`, so the same tool returned two URL shapes
+      // depending on which backend answered.
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_LIVE_V9));
+      const ctx = createMockContext();
+      const [fromMirror] = (await service.getPapers(['2401.10001'], ctx)).papers;
+      const [fromLive] = (await service.getPapers(['2401.10001v9'], ctx)).papers;
+
+      expect(fromMirror?.id).toBe('2401.10001v1');
+      expect(fromMirror?.abstract_url).toBe('https://arxiv.org/abs/2401.10001v1');
+      expect(fromLive?.abstract_url).toBe('https://arxiv.org/abs/2401.10001v9');
+
+      for (const paper of [fromMirror, fromLive]) {
+        expect(paper?.abstract_url).toBe(`https://arxiv.org/abs/${paper?.id}`);
+        expect(paper?.pdf_url).toBe(`https://arxiv.org/pdf/${paper?.id}`);
+      }
     });
 
     it('bypasses the mirror entirely when mirrorEnabled=false', async () => {

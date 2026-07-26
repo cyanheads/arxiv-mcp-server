@@ -3,6 +3,7 @@
  * @module mcp-server/resources/definitions/paper.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { paperResource } from '@/mcp-server/resources/definitions/paper.resource.js';
@@ -98,5 +99,44 @@ describe('paperResource', () => {
     await expect(paperResource.handler({ paperId: '9999.99999' }, ctx)).rejects.toThrow(
       /not found/i,
     );
+  });
+
+  it('fails with version_unavailable, not no_match, on a mirror version miss (#35)', async () => {
+    // `no_match` says the ID is absent from arXiv. It is not — this deployment
+    // just cannot reach that version, and the detail names the one it can.
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [
+        {
+          id: '1706.03762v7',
+          reason: 'version_not_in_mirror',
+          detail: "The local mirror holds version 3 only. Request '1706.03762v3' instead.",
+        },
+      ],
+    });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await expect(paperResource.handler({ paperId: '1706.03762v7' }, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'version_unavailable' },
+      message: expect.stringContaining("'1706.03762v3'"),
+    });
+  });
+
+  it('still fails with no_match when the ID is genuinely absent from arXiv (#35)', async () => {
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+    });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await expect(paperResource.handler({ paperId: '9999.99999' }, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_match' },
+    });
   });
 });

@@ -8,7 +8,8 @@ import { ARXIV_CATEGORIES } from '@/services/arxiv/categories.js';
 
 export const categoriesResource = resource('arxiv://categories', {
   name: 'arXiv Categories',
-  description: 'Full arXiv category taxonomy. Returns grouped category list as JSON.',
+  description:
+    'Full arXiv category taxonomy. Returns JSON `{ categories: [...] }` — one flat array of every category, each carrying its code, name, and group.',
   mimeType: 'application/json',
 
   handler() {
@@ -20,7 +21,8 @@ export const categoriesResource = resource('arxiv://categories', {
       {
         uri: 'arxiv://categories',
         name: 'arXiv Categories',
-        description: 'Full arXiv category taxonomy with codes, names, and groups.',
+        description:
+          'Full arXiv category taxonomy — one flat array of every category with its code, name, and group.',
         mimeType: 'application/json',
       },
     ],

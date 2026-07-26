@@ -3,6 +3,7 @@
  * @module mcp-server/tools/definitions/arxiv-get-metadata.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
@@ -67,16 +68,87 @@ describe('arxivGetMetadata', () => {
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toThrow(/not found|no papers/i);
   });
 
+  it('fails with version_unavailable, not no_match, when every miss is a mirror version miss (#35)', async () => {
+    // `no_match` recovery tells the caller to doubt the ID. The ID is fine —
+    // this deployment just cannot reach that version.
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [
+        {
+          id: '1706.03762v7',
+          reason: 'version_not_in_mirror',
+          detail: "The local mirror holds version 3 only. Request '1706.03762v3' instead.",
+        },
+      ],
+    });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({ paper_ids: '1706.03762v7' });
+
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'version_unavailable' },
+      message: expect.stringContaining("'1706.03762v3'"),
+    });
+  });
+
+  it('still fails with no_match when the IDs are genuinely absent from arXiv (#35)', async () => {
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+    });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({ paper_ids: '9999.99999' });
+
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_match' },
+    });
+  });
+
+  it('forwards each miss with the reason the service assigned (#35)', async () => {
+    mockGetPapers.mockResolvedValue({
+      papers: [MOCK_PAPER],
+      not_found: [
+        { id: '1706.03762v7', reason: 'version_not_in_mirror', detail: 'Mirror holds version 3.' },
+        { id: '9999.99999', reason: 'not_in_arxiv' },
+      ],
+    });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({
+      paper_ids: ['2401.12345', '1706.03762v7', '9999.99999'],
+    });
+    const result = await arxivGetMetadata.handler(input, ctx);
+
+    expect(result.not_found).toEqual([
+      { id: '1706.03762v7', reason: 'version_not_in_mirror', detail: 'Mirror holds version 3.' },
+      { id: '9999.99999', reason: 'not_in_arxiv' },
+    ]);
+  });
+
   it('formats papers and not-found list', () => {
     const blocks =
       arxivGetMetadata.format?.({
         papers: [MOCK_PAPER],
         totalSucceeded: 1,
-        not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+        not_found: [
+          { id: '9999.99999', reason: 'not_in_arxiv' },
+          {
+            id: '1706.03762v7',
+            reason: 'version_not_in_mirror',
+            detail: 'Mirror holds version 3.',
+          },
+        ],
       }) ?? [];
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('**Test Paper**');
-    expect(text).toContain('Found 1 of 2 papers');
+    expect(text).toContain('Found 1 of 3 papers');
     expect(text).toContain('9999.99999 (not_in_arxiv)');
+    expect(text).toContain('1706.03762v7 (version_not_in_mirror): Mirror holds version 3.');
   });
 });

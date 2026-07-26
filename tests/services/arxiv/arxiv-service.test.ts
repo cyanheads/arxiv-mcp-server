@@ -531,7 +531,7 @@ describe('ArxivService.getPapers', () => {
 
     expect(result.papers).toHaveLength(1);
     expect(result.papers[0]?.id).toBe('2401.12345v1');
-    expect(result.not_found_ids).toBeUndefined();
+    expect(result.not_found).toBeUndefined();
 
     const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
     expect(url.searchParams.get('id_list')).toBe('2401.12345');
@@ -544,7 +544,7 @@ describe('ArxivService.getPapers', () => {
     const result = await service.getPapers(['2401.12345', '9999.99999'], ctx);
 
     expect(result.papers).toHaveLength(1);
-    expect(result.not_found_ids).toEqual(['9999.99999']);
+    expect(result.not_found).toEqual([{ id: '9999.99999', reason: 'not_in_arxiv' }]);
   });
 
   it('preserves input order regardless of arXiv response order (issue #5)', async () => {
@@ -650,7 +650,7 @@ describe('ArxivService.getPapers', () => {
     expect(url.searchParams.get('id_list')).toBe('1706.03762v1,1706.03762v7');
     expect(result.papers.map((p) => p.id)).toEqual(['1706.03762v1', '1706.03762v7']);
     expect(result.papers.map((p) => p.abstract)).toEqual(['v1', 'v7']);
-    expect(result.not_found_ids).toBeUndefined();
+    expect(result.not_found).toBeUndefined();
   });
 
   it('reports an explicitly requested version arXiv did not return as not found (issue #25)', async () => {
@@ -661,7 +661,7 @@ describe('ArxivService.getPapers', () => {
     const result = await service.getPapers(['2401.12345v2'], ctx);
 
     expect(result.papers).toHaveLength(0);
-    expect(result.not_found_ids).toEqual(['2401.12345v2']);
+    expect(result.not_found).toEqual([{ id: '2401.12345v2', reason: 'not_in_arxiv' }]);
   });
 
   it('handles sparse upstream entries without fabricating optional fields', async () => {

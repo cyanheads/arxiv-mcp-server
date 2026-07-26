@@ -35,6 +35,7 @@ import {
 } from './mirror/index.js';
 import type {
   PaperContent,
+  PaperLookupMiss,
   PaperLookupResult,
   PaperMetadata,
   ReadContentOptions,
@@ -343,8 +344,35 @@ function rowToMetadata(row: PaperRow): PaperMetadata {
     ...(row.journal_ref && { journal_ref: row.journal_ref }),
     ...(row.doi && { doi: row.doi }),
     pdf_url: `https://arxiv.org/pdf/${versionedId}`,
-    abstract_url: `https://arxiv.org/abs/${row.id}`,
+    // Every ID-derived field carries the version the record reports, matching
+    // what the live Atom `<link>` elements return. A bare abstract URL renders
+    // whichever revision is current, contradicting the `id` beside it. See #34.
+    abstract_url: `https://arxiv.org/abs/${versionedId}`,
   };
+}
+
+/**
+ * Explain why a requested ID produced no metadata. When the live API was never
+ * consulted and the mirror holds the paper at a different version, the ID is
+ * unreachable in this configuration rather than absent from arXiv — say which,
+ * and name the version that can be served. See issue #35.
+ */
+function describeLookupMiss(
+  id: string,
+  rows: readonly PaperRow[],
+  consultedLive: boolean,
+): PaperLookupMiss {
+  if (!consultedLive && parseVersion(id) !== undefined) {
+    const stored = rows.find((row) => row.id === stripVersion(id));
+    if (stored) {
+      return {
+        id,
+        reason: 'version_not_in_mirror',
+        detail: `The local mirror holds version ${stored.version} only and live arXiv fallback is disabled. Request '${stored.id}v${stored.version}' instead, or omit the version suffix for the latest.`,
+      };
+    }
+  }
+  return { id, reason: 'not_in_arxiv' };
 }
 
 /**
@@ -576,7 +604,8 @@ export class ArxivService {
     const slots = resolveRequestedIds(ids, rows.map(rowToMetadata), (p) => p.id);
 
     const missingIndices = slots.flatMap((p, i) => (p === undefined ? [i] : []));
-    if (missingIndices.length > 0 && config.mirrorFallbackLive) {
+    const consultedLive = missingIndices.length > 0 && config.mirrorFallbackLive;
+    if (consultedLive) {
       const missing = missingIndices.map((i) => ids[i] ?? '');
       ctx.log.info('Mirror miss; falling back to live', { missing });
       const live = await this.fetchLivePapers(missing, ctx);
@@ -587,10 +616,12 @@ export class ArxivService {
     }
 
     const papers = slots.filter((p): p is PaperMetadata => p !== undefined);
-    const notFoundIds = ids.filter((_, i) => slots[i] === undefined);
+    const notFound = ids.flatMap((id, i) =>
+      slots[i] === undefined ? [describeLookupMiss(id, rows, consultedLive)] : [],
+    );
     return {
       papers,
-      ...(notFoundIds.length > 0 ? { not_found_ids: notFoundIds } : {}),
+      ...(notFound.length > 0 ? { not_found: notFound } : {}),
     };
   }
 
@@ -624,11 +655,13 @@ export class ArxivService {
     // versions of one paper must keep them in their own slots. See issue #28.
     const resolved = resolveRequestedIds(ids, result.entries, (p) => p.id);
     const ordered = resolved.filter((p): p is PaperMetadata => p !== undefined);
-    const notFoundIds = ids.filter((_, i) => resolved[i] === undefined);
+    const notFound = ids.flatMap<PaperLookupMiss>((id, i) =>
+      resolved[i] === undefined ? [{ id, reason: 'not_in_arxiv' }] : [],
+    );
 
     return {
       papers: ordered,
-      ...(notFoundIds.length > 0 ? { not_found_ids: notFoundIds } : {}),
+      ...(notFound.length > 0 ? { not_found: notFound } : {}),
     };
   }
 
@@ -753,33 +786,10 @@ export class ArxivService {
       const text = await response.text();
       const contentType = response.headers.get('content-type') ?? '';
 
-      // arXiv quirk: 200 OK with plain text "Rate exceeded." instead of XML.
-      if (
-        !contentType.includes('application/xml') &&
-        !contentType.includes('text/xml') &&
-        !contentType.includes('application/atom+xml')
-      ) {
-        if (text.includes('Rate exceeded')) {
-          const cooldownAppliedMs = this.recordRateLimit();
-          throw rateLimited(this.rateLimitMessage(cooldownAppliedMs), {
-            url,
-            status: response.status,
-            body: text.slice(0, 500),
-            cooldownAppliedMs,
-            consecutiveRateLimits: this.consecutiveRateLimits,
-            reason: 'rate_limited',
-            ...ctx.recoveryFor('rate_limited'),
-          });
-        }
-        // Unexpected content-type indicates upstream behavior change or proxy
-        // interference — treat as non-transient so withRetry doesn't waste cycles.
-        throw serializationError(`arXiv API returned unexpected content-type: ${contentType}`, {
-          url,
-          contentType,
-          body: text.slice(0, 500),
-        });
-      }
-
+      // Status classification runs first so a non-XML error page — a proxy's
+      // 502 HTML, an edge 429 served as plain text — is classified by what the
+      // status says it is instead of falling into the content-type branch below
+      // and being surfaced as a non-retryable serialization failure. See #30.
       if (!response.ok) {
         // 5xx: arXiv treats 500/501 like service degradation, so we map all 5xx
         // to ServiceUnavailable for retry consistency (httpStatusToErrorCode
@@ -814,6 +824,48 @@ export class ArxivService {
           body: text.slice(0, 500),
           reason: 'invalid_request',
           ...ctx.recoveryFor('invalid_request'),
+        });
+      }
+
+      // An empty body is a transport-level symptom — dropped connection, edge
+      // throttle, truncated read — not a payload we failed to deserialize.
+      // Classify as transient so withRetry gets one more attempt, and name the
+      // condition instead of reporting a content-type that isn't there. Checked
+      // ahead of the content-type branch because an empty XML-typed body is the
+      // same failure. See issue #30.
+      if (text.trim() === '') {
+        throw serviceUnavailable('arXiv API returned an empty response', {
+          url,
+          status: response.status,
+          contentType,
+        });
+      }
+
+      // arXiv quirk: 200 OK with plain text "Rate exceeded." instead of XML.
+      if (
+        !contentType.includes('application/xml') &&
+        !contentType.includes('text/xml') &&
+        !contentType.includes('application/atom+xml')
+      ) {
+        if (text.includes('Rate exceeded')) {
+          const cooldownAppliedMs = this.recordRateLimit();
+          throw rateLimited(this.rateLimitMessage(cooldownAppliedMs), {
+            url,
+            status: response.status,
+            body: text.slice(0, 500),
+            cooldownAppliedMs,
+            consecutiveRateLimits: this.consecutiveRateLimits,
+            reason: 'rate_limited',
+            ...ctx.recoveryFor('rate_limited'),
+          });
+        }
+        // A non-empty body under an unexpected content-type indicates an
+        // upstream behavior change or proxy interference — non-transient, so
+        // withRetry doesn't waste cycles on a body that won't change.
+        throw serializationError(`arXiv API returned unexpected content-type: ${contentType}`, {
+          url,
+          contentType,
+          body: text.slice(0, 500),
         });
       }
 

@@ -40,7 +40,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
       retryable: true,
       recovery:
-        'Wait for the cooldown indicated by error.data.retryAfter (seconds) before retrying.',
+        'Wait error.data.cooldownAppliedMs milliseconds before retrying, and lower concurrent arXiv calls.',
     },
     {
       reason: 'invalid_request',

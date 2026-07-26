@@ -50,12 +50,19 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
         'Verify the paper ID format (e.g., "2401.12345") and confirm the paper exists via arxiv_search.',
     },
     {
+      reason: 'version_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The URI pinned a version the local mirror does not hold, and live arXiv fallback is disabled.',
+      recovery:
+        'Read the version named in the error detail, or drop the version suffix to get the latest.',
+    },
+    {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
       retryable: true,
       recovery:
-        'Wait for the cooldown indicated by error.data.retryAfter (seconds) before retrying.',
+        'Wait error.data.cooldownAppliedMs milliseconds before retrying, and lower concurrent arXiv calls.',
     },
     {
       reason: 'invalid_request',
@@ -82,6 +89,18 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     const result = await service.getPapers([paperId], ctx);
     const [paper] = result.papers;
     if (!paper) {
+      // A version the mirror lacks is reachable upstream, so `no_match` would
+      // tell the reader to doubt an ID that is in fact valid. Fail with the
+      // reason the service assigned, which names the version it can serve.
+      // See issue #35.
+      const [miss] = result.not_found ?? [];
+      if (miss?.reason === 'version_not_in_mirror') {
+        throw ctx.fail(
+          'version_unavailable',
+          [`Paper '${paperId}' could not be served.`, miss.detail].filter(Boolean).join(' '),
+          { paperId, not_found: miss, ...ctx.recoveryFor('version_unavailable') },
+        );
+      }
       throw ctx.fail('no_match', `Paper '${paperId}' not found.`, {
         paperId,
         ...ctx.recoveryFor('no_match'),

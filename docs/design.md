@@ -16,7 +16,7 @@
 | URI Template | Description | Delegates To |
 |:-------------|:------------|:-------------|
 | `arxiv://paper/{paperId}` | Paper metadata by arXiv ID. The segment is percent-decoded before lookup, so a legacy ID travels as `hep-th%2F9901001`; an ID that decodes to blank is rejected without an arXiv request. Returns `PaperMetadataSchema` as JSON text. | `ArxivService.getPapers([paperId])` |
-| `arxiv://categories` | Full arXiv category taxonomy. Returns grouped category list as JSON text. | Static taxonomy constant |
+| `arxiv://categories` | Full arXiv category taxonomy. Returns `{ categories: [...] }` as JSON text — one flat array of every category with its code, name, and group. Grouping is a `arxiv_list_categories` presentation concern, not a shape this resource emits. | Static taxonomy constant |
 
 ### Prompts
 
@@ -128,7 +128,8 @@ const PaperMetadataSchema = z.object({
 
 | Failure | Code | Recovery guidance |
 |:--------|:-----|:-----------------|
-| arXiv API unavailable / rate limited | `ServiceUnavailable` | "arXiv API is temporarily unavailable. Try again in a few seconds." |
+| arXiv API unavailable | `ServiceUnavailable` | "arXiv API is temporarily unavailable. Try again in a few seconds." |
+| arXiv throttling (429 or `Rate exceeded.` body) | `RateLimited` | Wait `error.data.cooldownAppliedMs` milliseconds and lower concurrency. Never retried server-side. |
 | Empty results | Not an error | Return `{ total_results: 0, papers: [] }` |
 
 ### `arxiv_get_metadata`
@@ -156,10 +157,17 @@ z.object({
 z.object({
   papers: z.array(PaperMetadataSchema)
     .describe('Papers found. May be fewer than requested if some IDs are invalid.'),
-  not_found: z.array(z.string()).optional()
-    .describe('Paper IDs that returned no results.'),
+  totalSucceeded: z.number(),
+  not_found: z.array(z.object({
+    id: z.string(),
+    reason: z.enum(['not_in_arxiv', 'version_not_in_mirror']),
+    detail: z.string().optional(),
+  })).optional()
+    .describe('Requested IDs that returned no data, each with the reason it was missed.'),
 })
 ```
+
+`version_not_in_mirror` distinguishes "unreachable from this deployment" from "absent from arXiv": the mirror stores the latest version only, so a version-pinned ID it lacks is a real paper the caller can still fetch with live fallback enabled or without the pin. `detail` names the version the mirror holds.
 
 **Format:** Same structured block per paper as `arxiv_search`. Lists not-found IDs separately.
 
@@ -168,6 +176,7 @@ z.object({
 | Failure | Code | Recovery guidance |
 |:--------|:-----|:-----------------|
 | All IDs not found | `NotFound` | "No papers found for the given IDs. Verify ID format (e.g., '2401.12345' or '2401.12345v2')." |
+| All IDs pin a version the mirror lacks, live fallback off | `ServiceUnavailable` | Request the version named in the error detail, or drop the version suffix. The IDs are valid — only unreachable in this configuration. |
 | Partial success | Not an error | Return found papers + `not_found` array |
 | Invalid ID format | `InvalidParams` | "Invalid arXiv ID format. Expected '2401.12345', '2401.12345v2', or 'hep-th/9901001'." |
 | API unavailable | `ServiceUnavailable` | "arXiv API is temporarily unavailable. Try again in a few seconds." |
@@ -321,7 +330,7 @@ class ArxivService {
 | Retry boundary | `withRetry` wraps full pipeline: fetch + parse (XML) or fetch (HTML) |
 | Backoff calibration | 1s base for API calls (rate-limited service), 2s for HTML content (heavier pages) |
 | Rate limiting | Internal request queue enforcing 3-second delay between arXiv API calls. HTML fetches to separate domains (arxiv.org/html, ar5iv) don't share this queue — different hosts, no shared rate limit. |
-| Parse failure | Detect non-XML responses (e.g., "Rate exceeded." plain text) and throw transient error for retry |
+| Response classification | HTTP status first: 5xx → `ServiceUnavailable` (retried), 429 → `RateLimited`, other 4xx → `InvalidRequest`. Then, on a 2xx: an empty body → `ServiceUnavailable` (a transport symptom, retried); a non-XML body carrying `Rate exceeded.` → `RateLimited` (never retried, per the fail-fast policy); any other non-XML body → `SerializationError` (never retried). |
 | HTML fallback | `arxiv.org/html/{id}` first → on 404, try `ar5iv.labs.arxiv.org/html/{id}` → on non-200, throw NotFound |
 | HTML 404 detection | arxiv.org returns clean HTTP 404. ar5iv returns 307 redirect to arxiv.org/abs (which then 404s) — don't follow redirects on ar5iv, treat 3xx as not-found. |
 | HTML page size | Raw HTML is 500KB-3MB+ for math-heavy papers. `max_characters` truncation keeps response size manageable. |
@@ -405,7 +414,7 @@ This is a data-access server. The value is in search, metadata retrieval, and co
 - **Raw HTML responses are large.** Since we return unprocessed HTML, responses can be 500KB-3MB+ for math-heavy papers. The `max_characters` parameter is the only size control. LLMs handle HTML well, but callers should set reasonable limits for their context budget.
 - **No PDF text extraction.** The server does not parse PDFs. When HTML is unavailable, it returns the PDF URL and lets the consumer handle it. PDF extraction is complex, error-prone, and better handled by specialized tools.
 - **Rate limits are server-wide.** The 3-second delay is per arXiv API request across all concurrent tool calls, not per-agent. Under high concurrency, agents queue behind each other. This matches arXiv's policy but limits throughput. HTML fetches hit separate hosts (arxiv.org/html, ar5iv) and are not queued.
-- **Paper ID normalization.** The arXiv API always returns IDs with a version suffix (e.g., `2401.12345v1`). Inputs accept both `2401.12345` and `2401.12345v2` and are passed through to arXiv verbatim — `id_list` and the HTML endpoints both honor a version suffix. An ID that pins a version resolves only to that version: it never falls back to another version, and the mirror (which stores the latest version only) is a miss for it. An unversioned ID resolves to the latest version. Returned `id` fields always include the version.
+- **Paper ID normalization.** The arXiv API always returns IDs with a version suffix (e.g., `2401.12345v1`). Inputs accept both `2401.12345` and `2401.12345v2` and are passed through to arXiv verbatim — `id_list` and the HTML endpoints both honor a version suffix. An ID that pins a version resolves only to that version: it never falls back to another version, and the mirror (which stores the latest version only) is a miss for it. An unversioned ID resolves to the latest version. Returned `id` fields always include the version, as do the `pdf_url` and `abstract_url` derived from them on both the mirror and live paths.
 - **Atom XML quirks.** The arXiv API returns HTTP 200 for all cases — empty results, not-found IDs, and rate limiting all return 200 with varying response bodies. Rate limiting returns plain text "Rate exceeded." (content-type `text/plain`, not XML) — must check content-type before parsing. Additional quirks: `<id>` uses `http://` while `<link>` uses `https://`; `<summary>` has leading/trailing whitespace; version suffix (`v1`, `v7`) is always present in `<id>` and must be stripped for base paper ID; `<arxiv:primary_category>` lacks the `scheme` attribute that `<category>` has.
 - **No real-time results.** arXiv updates daily. Search results reflect yesterday's index, not papers submitted today.
 

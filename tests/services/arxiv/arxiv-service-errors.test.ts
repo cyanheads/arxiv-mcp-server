@@ -159,6 +159,66 @@ describe('ArxivService.search — error paths', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  it('retries an empty upstream body while the soft-throttle body still fails fast (#30)', async () => {
+    // An empty body and a 200 + "Rate exceeded." body reach the same non-XML
+    // branch, and only the empty one is a transport symptom. Both halves are
+    // asserted together: widening the empty-body classification far enough to
+    // swallow the throttle body would reintroduce the retry storm #8 removed.
+    mockFetch
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    const result = await service.search('all:test', {}, ctx);
+    expect(result.papers).toHaveLength(1);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    mockFetch.mockReset();
+    mockFetch.mockResolvedValueOnce(
+      new Response('Rate exceeded.', { status: 200, headers: { 'content-type': 'text/plain' } }),
+    );
+    await expect(service.search('all:test', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it('names the empty-response condition rather than trailing off after a content-type (#30)', async () => {
+    mockFetch
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.search('all:test', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: expect.stringContaining('empty response'),
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  }, 30_000);
+
+  it('classifies a non-XML 5xx error page by its status, not its content-type (#30)', async () => {
+    // A proxy's HTML 502 used to land in the content-type branch and surface as
+    // a non-retryable serialization error. Status classification runs first now.
+    const badGateway = (): Response =>
+      new Response('<html><body>502 Bad Gateway</body></html>', {
+        status: 502,
+        headers: { 'content-type': 'text/html' },
+      });
+    mockFetch.mockResolvedValueOnce(badGateway()).mockResolvedValueOnce(badGateway());
+
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.search('all:test', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  }, 30_000);
+
   it('empty result set does not throw, returns total_results=0', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
@@ -180,7 +240,7 @@ describe('ArxivService.getPapers — additional cases', () => {
     const service = getArxivService();
     const result = await service.getPapers(['9999.99999'], ctx);
     expect(result.papers).toHaveLength(0);
-    expect(result.not_found_ids).toEqual(['9999.99999']);
+    expect(result.not_found).toEqual([{ id: '9999.99999', reason: 'not_in_arxiv' }]);
   });
 
   it('classifies 400 from getPapers as InvalidRequest', async () => {
