@@ -1,7 +1,7 @@
 # Agent Protocol
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
-**Version:** 1.2.16
+**Version:** 1.3.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -43,11 +43,11 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 - **Read-only, no auth.** All tools are `readOnlyHint: true`. No API keys needed. `MCP_AUTH_MODE: none`.
 - **Rate limiting.** arXiv enforces a 3-second crawl delay between API requests. The `ArxivService` manages an internal request queue. HTML fetches to `arxiv.org/html` and `ar5iv` are separate domains and don't share this queue.
-- **Rate-limit policy: fail fast, never retry.** A custom `isArxivTransient` predicate on `withRetry` excludes `RateLimited` from the retry set — when arXiv signals throttle (HTTP 429 or 200 OK with `Rate exceeded.` body), we surface the error to the caller in <1s instead of hammering during the throttle window. The 429 path captures `Retry-After` into `error.data.retryAfter` so clients can honor the cooldown. Only `ServiceUnavailable` and `Timeout` are retried (`maxRetries: 1`). See [#8](https://github.com/cyanheads/arxiv-mcp-server/issues/8).
+- **Rate-limit policy: fail fast, never retry.** A custom `isArxivTransient` predicate on `withRetry` excludes `RateLimited` from the retry set — when arXiv signals throttle (HTTP 429 or 200 OK with `Rate exceeded.` body), we surface the error to the caller in <1s instead of hammering during the throttle window. Both paths report the applied wait as `error.data.cooldownAppliedMs` — the field every `rate_limited` recovery hint points at, since the 200-body path has no header to report; the 429 path additionally passes `Retry-After` through as `error.data.retryAfter`. Only `ServiceUnavailable` and `Timeout` are retried (`maxRetries: 1`). See [#8](https://github.com/cyanheads/arxiv-mcp-server/issues/8), [#9](https://github.com/cyanheads/arxiv-mcp-server/issues/9).
 - **HTML fallback.** `arxiv_read_paper` tries native arXiv HTML first (`arxiv.org/html/{id}`), falls back to ar5iv (`ar5iv.labs.arxiv.org/html/{id}`). ar5iv returns 307 redirect (not 404) for missing papers — don't follow redirects, treat 3xx as not-found.
 - **API quirks.** arXiv API returns HTTP 200 for everything — empty results, not-found IDs, and rate limiting. Rate limiting returns plain text `"Rate exceeded."` (not XML) — check content-type before parsing.
 - **Raw HTML output.** `arxiv_read_paper` strips HTML head/boilerplate, then returns raw paper body HTML — the LLM interprets the content directly. `max_characters` (default: 100,000) controls slice size; `start` (default: 0) is the character offset into the cleaned body — together they page through long papers without re-reading the prefix. Raw HTML can be 500KB-3MB+ for math-heavy papers; `body_characters` in the response is the full cleaned length and is the upper bound for `start`.
-- **Paper ID normalization.** arXiv API always returns versioned IDs (`2401.12345v1`). Inputs accept both versioned and unversioned forms and reach arXiv verbatim — `id_list` and the HTML endpoints honor a version suffix. Resolution is version-aware: an ID pinning `vN` matches only that version (a mirror row at another version is a miss, not a substitute), an unversioned ID matches the latest. Returned `id` fields always include the version.
+- **Paper ID normalization.** arXiv API always returns versioned IDs (`2401.12345v1`). Inputs accept both versioned and unversioned forms and reach arXiv verbatim — `id_list` and the HTML endpoints honor a version suffix. Resolution is version-aware: an ID pinning `vN` matches only that version (a mirror row at another version is a miss, not a substitute), an unversioned ID matches the latest. Returned `id` fields always include the version, and so do the `pdf_url` / `abstract_url` derived from them — mirror path as well as live. A version-pinned ID the mirror cannot serve is reported as `version_not_in_mirror`, never `not_in_arxiv`.
 - **Dependencies:** `fast-xml-parser` (v5, class-based API) for Atom XML parsing. No HTML parsing library needed.
 
 ---

@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-07-26 22:53:30
+Generated on: 2026-07-26 23:43:53
 
 ```text
 arxiv-mcp-server/
@@ -24,6 +24,7 @@ arxiv-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 1.2.x/
+│   ├── 1.3.x/
 │   └── template.md
 ├── claude-plans/
 ├── data/
@@ -186,7 +187,8 @@ arxiv-mcp-server/
 │   │   │       ├── arxiv-search.tool.test.ts
 │   │   │       ├── input-validation.test.ts
 │   │   │       └── security.test.ts
-│   │   └── id-input-boundary.test.ts
+│   │   ├── id-input-boundary.test.ts
+│   │   └── rate-limit-recovery.test.ts
 │   └── services/
 │       └── arxiv/
 │           ├── mirror/

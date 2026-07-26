@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.3.0](changelog/1.3.x/1.3.0.md) — 2026-07-26
+
+Classify arXiv responses by HTTP status before content-type, distinguish mirror version-misses from not_in_arxiv, fix rate-limit recovery hints and abstract_url versioning, and reject failed mirror refreshes instead of resolving them (#9, #29, #30, #31, #34, #35)
+
 ## [1.2.16](changelog/1.2.x/1.2.16.md) — 2026-07-26
 
 Fix silent version substitution in metadata batch lookup, mirror fallback, and whitespace-only ID validation (#25, #26, #28, #33); adopt mcp-ts-core 0.11.0
