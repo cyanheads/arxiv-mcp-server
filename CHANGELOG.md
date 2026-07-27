@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.4.0](changelog/1.4.x/1.4.0.md) — 2026-07-27 · ⚠️ Breaking
+
+arxiv_read_paper falls back to PDF-text extraction when no HTML render exists, accepts max_characters: null for whole-paper reads, and no longer fails the whole chain on an ar5iv outage (#23, #24, #38)
+
 ## [1.3.1](changelog/1.3.x/1.3.1.md) — 2026-07-26
 
 Fix arxiv_search's effective_query echo to include applied filters, accept bare archive category codes, and add submitted_from/submitted_to date-window filtering past the pagination ceiling (#20, #27, #32)
