@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-07-26 23:43:53
+Generated on: 2026-07-27 06:49:06
 
 ```text
 arxiv-mcp-server/
@@ -170,6 +170,7 @@ arxiv-mcp-server/
 │   │       │   └── types.ts
 │   │       ├── arxiv-service.ts
 │   │       ├── categories.ts
+│   │       ├── date-window.ts
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
@@ -202,6 +203,7 @@ arxiv-mcp-server/
 │           ├── arxiv-service-mirror.test.ts
 │           ├── arxiv-service.test.ts
 │           ├── categories.test.ts
+│           ├── date-window.test.ts
 │           ├── types-extra.test.ts
 │           └── types.test.ts
 ├── .dockerignore

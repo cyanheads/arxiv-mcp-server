@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.3.1](changelog/1.3.x/1.3.1.md) — 2026-07-26
+
+Fix arxiv_search's effective_query echo to include applied filters, accept bare archive category codes, and add submitted_from/submitted_to date-window filtering past the pagination ceiling (#20, #27, #32)
+
 ## [1.3.0](changelog/1.3.x/1.3.0.md) — 2026-07-26
 
 Classify arXiv responses by HTTP status before content-type, distinguish mirror version-misses from not_in_arxiv, fix rate-limit recovery hints and abstract_url versioning, and reject failed mirror refreshes instead of resolving them (#9, #29, #30, #31, #34, #35)
