@@ -100,6 +100,50 @@ describe('arxivSearch input validation', () => {
     expect(input.sort_order).toBe('descending');
     expect(input.start).toBe(0);
   });
+
+  // Issue #32 — bare archive and group codes are valid filter targets now, so
+  // the schema must not be the thing that rejects them.
+  it('accepts bare archive and group category codes', () => {
+    for (const category of ['astro-ph', 'cond-mat', 'nlin', 'q-bio', 'cs', 'math', 'stat']) {
+      expect(() => arxivSearch.input.parse({ query: 'test', category })).not.toThrow();
+    }
+  });
+
+  // Issue #27 — the date window params.
+  it('accepts a well-formed submitted-date window', () => {
+    const input = arxivSearch.input.parse({
+      query: 'test',
+      submitted_from: '2024-01-01',
+      submitted_to: '2024-01-31',
+    });
+    expect(input.submitted_from).toBe('2024-01-01');
+    expect(input.submitted_to).toBe('2024-01-31');
+  });
+
+  it('accepts either date bound on its own', () => {
+    expect(() =>
+      arxivSearch.input.parse({ query: 'test', submitted_from: '2024-01-01' }),
+    ).not.toThrow();
+    expect(() =>
+      arxivSearch.input.parse({ query: 'test', submitted_to: '2024-01-31' }),
+    ).not.toThrow();
+  });
+
+  it('rejects date bounds that are not YYYY-MM-DD', () => {
+    for (const submitted_from of ['01/01/2024', '2024-1-1', '20240101', 'yesterday']) {
+      expect(() => arxivSearch.input.parse({ query: 'test', submitted_from })).toThrow(
+        /YYYY-MM-DD/,
+      );
+    }
+  });
+
+  // Form-based clients submit the full schema shape; an empty optional string is
+  // valid MCP behavior, so the schema stays permissive and the handler ignores it.
+  it('accepts empty date strings from form-based clients', () => {
+    expect(() =>
+      arxivSearch.input.parse({ query: 'test', submitted_from: '', submitted_to: '' }),
+    ).not.toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------

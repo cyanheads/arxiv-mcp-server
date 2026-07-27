@@ -32,9 +32,21 @@ export interface SearchOptions {
   sortBy?: 'relevance' | 'submitted' | 'updated';
   sortOrder?: 'ascending' | 'descending';
   start?: number;
+  /** Earliest submission date to include, inclusive, `YYYY-MM-DD` UTC. */
+  submittedFrom?: string;
+  /** Latest submission date to include, inclusive, `YYYY-MM-DD` UTC. */
+  submittedTo?: string;
 }
 
 export interface SearchResult {
+  /**
+   * The query carrying every filter the search actually applied — the category
+   * subtree and the submitted-date window folded into arXiv syntax alongside the
+   * caller's terms. It is what the live API received verbatim, and replaying it
+   * as `query` with no other options reproduces this result set on either path.
+   * Both paths populate it, so the tool's echo never has to reconstruct it.
+   */
+  effective_query: string;
   papers: PaperMetadata[];
   start: number;
   total_results: number;

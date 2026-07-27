@@ -24,9 +24,19 @@ import {
 } from '@cyanheads/mcp-ts-core/utils';
 import { XMLParser } from 'fast-xml-parser';
 import { getServerConfig } from '@/config/server-config.js';
-import { suggestCategories, VALID_CATEGORY_CODES } from './categories.js';
 import {
-  expandCategory,
+  categorySearchTerm,
+  categorySubtree,
+  SEARCHABLE_CATEGORY_CODES,
+  suggestCategories,
+} from './categories.js';
+import {
+  intersectBounds,
+  isCalendarDate,
+  submittedDateBounds,
+  submittedDateClause,
+} from './date-window.js';
+import {
   getStore,
   type MirrorStore,
   openStore,
@@ -413,6 +423,27 @@ async function tryReadyMirror(ctx: Context): Promise<{ store: MirrorStore } | un
 }
 
 /**
+ * Compose the one arXiv-syntax query string that carries every filter dimension
+ * the caller asked for: their terms, the category subtree, and the submitted-date
+ * window. The live API receives it verbatim, and BOTH paths echo it back as
+ * `effective_query`, so replaying the echo as `query` reproduces the same result
+ * set instead of silently widening it.
+ *
+ * The caller's query is wrapped in parens so every appended `AND` scopes to the
+ * whole expression. Without them arXiv's parser binds `AND` tighter than the
+ * implicit conjunction between bare terms — "mixture of experts AND cat:cs.CL"
+ * parses as "mixture ∧ of ∧ (experts AND cat:cs.CL)", leaking earlier terms
+ * across all categories.
+ */
+function buildSearchQuery(query: string, options: SearchOptions): string {
+  const clauses = [
+    options.category ? categorySearchTerm(options.category) : undefined,
+    submittedDateClause(options.submittedFrom, options.submittedTo),
+  ].filter((clause): clause is string => clause !== undefined);
+  return clauses.length === 0 ? query : `(${query}) AND ${clauses.join(' AND ')}`;
+}
+
+/**
  * Detect queries that should bypass the mirror to cover the nightly-update
  * gap — sort-by-submitted-descending with recent-window > 0.
  */
@@ -460,7 +491,7 @@ export class ArxivService {
   async search(query: string, options: SearchOptions, ctx: Context): Promise<SearchResult> {
     const config = getServerConfig();
 
-    if (options.category && !VALID_CATEGORY_CODES.has(options.category)) {
+    if (options.category && !SEARCHABLE_CATEGORY_CODES.has(options.category)) {
       const suggestions = suggestCategories(options.category);
       const hint =
         suggestions.length > 0
@@ -474,22 +505,21 @@ export class ArxivService {
       });
     }
 
+    this.assertValidDateWindow(options, ctx);
+
+    // Built before the path split so the mirror echoes the same string the live
+    // API would have received — one definition of "what was actually searched".
+    const searchQuery = buildSearchQuery(query, options);
+
     // Mirror path: enabled, harvest complete, and the query isn't sort-by-recent
     // (which needs the up-to-the-minute live API to cover the nightly gap).
     const bypassForRecency = shouldBypassForRecency(options, config.mirrorRecentDaysLive);
     if (!bypassForRecency) {
       const ready = await tryReadyMirror(ctx);
       if (ready) {
-        return this.searchMirror(ready.store, query, options, ctx);
+        return this.searchMirror(ready.store, query, searchQuery, options, ctx);
       }
     }
-
-    // Wrap the user query in parens so `AND cat:` scopes the category to the
-    // full expression. Without the parens, arXiv's parser binds `AND` tighter
-    // than the implicit conjunction between bare terms — "mixture of experts
-    // AND cat:cs.CL" parses as "mixture ∧ of ∧ (experts AND cat:cs.CL)",
-    // leaking earlier terms across all categories.
-    const searchQuery = options.category ? `(${query}) AND cat:${options.category}` : query;
 
     const url = buildApiUrl(config.apiBaseUrl, {
       search_query: searchQuery,
@@ -504,7 +534,12 @@ export class ArxivService {
         async () => {
           const xml = await this.fetchApi(url, ctx);
           const feed = this.parseAtomFeed(xml);
-          return { total_results: feed.totalResults, start: feed.startIndex, papers: feed.entries };
+          return {
+            total_results: feed.totalResults,
+            start: feed.startIndex,
+            papers: feed.entries,
+            effective_query: searchQuery,
+          };
         },
         {
           operation: 'arxivSearch',
@@ -521,26 +556,77 @@ export class ArxivService {
       ctx.log.warning('Live API failed on recency bypass; falling back to mirror', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return this.searchMirror(ready.store, query, options, ctx);
+      return this.searchMirror(ready.store, query, searchQuery, options, ctx);
+    }
+  }
+
+  /**
+   * Reject a submitted-date window the caller could not have meant: a bound that
+   * is not a real UTC calendar date, or a range that starts after it ends. Both
+   * would otherwise reach arXiv as a syntactically valid clause that silently
+   * matches nothing.
+   */
+  private assertValidDateWindow(options: SearchOptions, ctx: Context): void {
+    const bounds = [
+      ['submitted_from', options.submittedFrom],
+      ['submitted_to', options.submittedTo],
+    ] as const;
+    for (const [field, value] of bounds) {
+      if (value !== undefined && !isCalendarDate(value)) {
+        throw validationError(
+          `${field} '${value}' is not a real UTC calendar date. Use YYYY-MM-DD (e.g. '2024-01-31').`,
+          {
+            [field]: value,
+            reason: 'invalid_date_range',
+            ...ctx.recoveryFor('invalid_date_range'),
+          },
+        );
+      }
+    }
+    if (
+      options.submittedFrom !== undefined &&
+      options.submittedTo !== undefined &&
+      options.submittedFrom > options.submittedTo
+    ) {
+      throw validationError(
+        `submitted_from '${options.submittedFrom}' is after submitted_to '${options.submittedTo}'. Both bounds are inclusive, so the window must start on or before it ends.`,
+        {
+          submitted_from: options.submittedFrom,
+          submitted_to: options.submittedTo,
+          reason: 'invalid_date_range',
+          ...ctx.recoveryFor('invalid_date_range'),
+        },
+      );
     }
   }
 
   /**
    * Search the local OAI-PMH mirror via FTS5. Translates the arXiv query
-   * syntax, applies category-hierarchy expansion, and merges any tool-level
-   * `options.category` into the structured filter set.
+   * syntax, applies category-subtree expansion, and merges any tool-level
+   * `options.category` / submitted-date window into the structured filter set.
+   *
+   * `effectiveQuery` is the string {@link buildSearchQuery} produced for this
+   * call — echoed back unchanged so the mirror reports the same applied filters
+   * the live path would. The mirror's own translator understands every operand
+   * that string can contain (`cat:` subtree wildcards, `submittedDate:[…]`), so
+   * replaying the echo through `query` selects the same rows.
    */
   private searchMirror(
     store: MirrorStore,
     query: string,
+    effectiveQuery: string,
     options: SearchOptions,
     ctx: Context,
   ): SearchResult {
     const translated = translateQuery(query);
     const categoryFilters = new Set(translated.categoryFilters);
     if (options.category) {
-      for (const c of expandCategory(options.category)) categoryFilters.add(c);
+      for (const c of categorySubtree(options.category)) categoryFilters.add(c);
     }
+    const published = intersectBounds(
+      translated.published,
+      submittedDateBounds(options.submittedFrom, options.submittedTo),
+    );
     const limit = options.maxResults ?? 10;
     const offset = options.start ?? 0;
     const sortBy = options.sortBy ?? 'relevance';
@@ -553,6 +639,8 @@ export class ArxivService {
       ({ papers, total } = store.search({
         ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
         categoryFilters: [...categoryFilters],
+        ...(published.from !== undefined && { publishedFrom: published.from }),
+        ...(published.to !== undefined && { publishedTo: published.to }),
         limit,
         offset,
         sortBy: ftsSortBy,
@@ -582,11 +670,14 @@ export class ArxivService {
       returned: papers.length,
       matchExpr: translated.matchExpr,
       categoryFilters: [...categoryFilters],
+      publishedFrom: published.from,
+      publishedTo: published.to,
     });
     return {
       total_results: total,
       start: offset,
       papers: papers.map(rowToMetadata),
+      effective_query: effectiveQuery,
     };
   }
 

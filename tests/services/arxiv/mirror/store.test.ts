@@ -112,6 +112,86 @@ describe('MirrorStore', () => {
     expect(result.papers.map((p) => p.id).sort()).toEqual(['1', '2']);
   });
 
+  // Issue #27 — `published` bounds. The category-browse fast path pages straight
+  // off the junction index and never touches the generic WHERE clause, so a date
+  // window has to force the generic path or the filter silently does nothing.
+  describe('published date bounds', () => {
+    beforeEach(() => {
+      store.applyBatch(
+        [
+          mkRecord({
+            paper_id: 'early',
+            categories: 'cs.LG',
+            versions: [{ version: 'v1', date: '2024-03-09T23:59:59Z' }],
+          }),
+          mkRecord({
+            paper_id: 'inside',
+            categories: 'cs.LG',
+            versions: [{ version: 'v1', date: '2024-03-10T12:00:00Z' }],
+          }),
+          mkRecord({
+            paper_id: 'late',
+            categories: 'cs.LG',
+            versions: [{ version: 'v1', date: '2024-03-11T00:00:01Z' }],
+          }),
+        ],
+        [],
+      );
+    });
+
+    const search = (extra: Record<string, unknown>) =>
+      store.search({
+        limit: 10,
+        offset: 0,
+        sortBy: 'published',
+        sortOrder: 'ascending',
+        ...extra,
+      });
+
+    it('bounds rows inclusively on both ends', () => {
+      const result = search({
+        publishedFrom: '2024-03-10T00:00:00.000Z',
+        publishedTo: '2024-03-11T00:00:00.000Z',
+      });
+      expect(result.total).toBe(1);
+      expect(result.papers.map((p) => p.id)).toEqual(['inside']);
+    });
+
+    it('applies each bound on its own', () => {
+      expect(search({ publishedFrom: '2024-03-10T00:00:00.000Z' }).total).toBe(2);
+      expect(search({ publishedTo: '2024-03-10T00:00:00.000Z' }).total).toBe(1);
+    });
+
+    it('applies the window on the single-category browse shape', () => {
+      // Same shape that would otherwise take the junction-index fast path:
+      // one category, no FTS term, non-published sort.
+      const result = store.search({
+        categoryFilters: ['cs.LG'],
+        publishedFrom: '2024-03-10T00:00:00.000Z',
+        publishedTo: '2024-03-11T00:00:00.000Z',
+        limit: 10,
+        offset: 0,
+        sortBy: 'updated',
+        sortOrder: 'descending',
+      });
+      expect(result.total).toBe(1);
+      expect(result.papers.map((p) => p.id)).toEqual(['inside']);
+    });
+
+    it('applies the window alongside an FTS term', () => {
+      const result = store.search({
+        matchExpr: '"Default"',
+        publishedFrom: '2024-03-10T00:00:00.000Z',
+        publishedTo: '2024-03-11T00:00:00.000Z',
+        limit: 10,
+        offset: 0,
+        sortBy: 'published',
+        sortOrder: 'ascending',
+      });
+      expect(result.papers.map((p) => p.id)).toEqual(['inside']);
+    });
+  });
+
   it('persists harvest state across writes', () => {
     store.writeHarvestState({
       status: 'in_progress',

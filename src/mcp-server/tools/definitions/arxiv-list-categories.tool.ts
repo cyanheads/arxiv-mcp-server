@@ -16,7 +16,7 @@ const CategorySchema = z
 
 export const arxivListCategories = tool('arxiv_list_categories', {
   description:
-    'List arXiv category codes and names. Useful for discovering valid category filters for arxiv_search.',
+    'List arXiv category codes and names. Useful for discovering valid category filters for arxiv_search. Lists subject classes only; arxiv_search also accepts a bare archive code (the part before the dot, e.g. "astro-ph" or "cs") to search a whole archive at once.',
   annotations: { readOnlyHint: true },
 
   input: z.object({

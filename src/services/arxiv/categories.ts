@@ -228,10 +228,97 @@ export const VALID_CATEGORY_CODES: ReadonlySet<string> = new Set(
 );
 
 /**
- * Suggest up to `limit` valid category codes closest to an invalid input.
+ * Archives that were subdivided into dotted subject classes (`astro-ph`, `cs`,
+ * `math`, …). Derived from the taxonomy rather than listed, so adding an `x.YY`
+ * leaf makes the bare `x` searchable without a second edit. Standalone archives
+ * (`hep-th`, `quant-ph`, …) are absent — they have no subtree.
+ */
+const SUBDIVIDED_ARCHIVES: ReadonlySet<string> = new Set(
+  ARXIV_CATEGORIES.flatMap((cat) => {
+    const [archive, subject] = cat.code.split('.');
+    return archive !== undefined && subject !== undefined ? [archive] : [];
+  }),
+);
+
+/**
+ * Subdivided archives whose code is a string prefix of a *different* archive, so
+ * arXiv's `cat:X*` wildcard would also match that neighbour — `cat:math*` pulls
+ * in `math-ph`, a physics archive. Those cases spell the subtree out instead of
+ * wildcarding it. Derived from the taxonomy, so a future colliding archive is
+ * handled without a code change.
+ */
+const PREFIX_COLLIDING_ARCHIVES: ReadonlySet<string> = new Set(
+  [...SUBDIVIDED_ARCHIVES].filter((archive) =>
+    ARXIV_CATEGORIES.some(
+      (cat) =>
+        cat.code !== archive && cat.code.startsWith(archive) && !cat.code.startsWith(`${archive}.`),
+    ),
+  ),
+);
+
+/**
+ * Category codes a search-time `category` filter accepts: every taxonomy leaf
+ * and standalone archive, plus the bare codes of subdivided archives. A bare
+ * archive code means the whole subtree — its dotted subject classes *and* the
+ * legacy flat papers filed against the archive itself before it was subdivided.
+ *
+ * Wider than {@link VALID_CATEGORY_CODES}, which stays the taxonomy `arxiv_list_categories`
+ * enumerates: bare archive codes are searchable targets, not catalogue entries.
+ */
+export const SEARCHABLE_CATEGORY_CODES: ReadonlySet<string> = new Set([
+  ...VALID_CATEGORY_CODES,
+  ...SUBDIVIDED_ARCHIVES,
+]);
+
+/**
+ * Concrete category codes a filter covers. A leaf or standalone archive covers
+ * only itself; a subdivided archive covers its dotted subject classes plus the
+ * bare archive code that legacy flat papers still carry. arXiv's own subtree
+ * wildcards are accepted in the same vocabulary — `X*` matches every code with
+ * that string prefix (including a neighbouring archive, as on the live API),
+ * `X.*` only the dotted children. Unknown codes come back verbatim so callers
+ * can decide whether to warn.
+ */
+export function categorySubtree(code: string): string[] {
+  const trimmed = code.trim();
+  if (!trimmed) return [];
+  if (trimmed.endsWith('.*')) return codesStartingWith(trimmed.slice(0, -1));
+  if (trimmed.endsWith('*')) {
+    const prefix = trimmed.slice(0, -1);
+    const matches = codesStartingWith(prefix);
+    return SUBDIVIDED_ARCHIVES.has(prefix) ? [prefix, ...matches] : matches;
+  }
+  if (!SUBDIVIDED_ARCHIVES.has(trimmed)) return [trimmed];
+  return [trimmed, ...codesStartingWith(`${trimmed}.`)];
+}
+
+function codesStartingWith(prefix: string): string[] {
+  return ARXIV_CATEGORIES.filter((cat) => cat.code.startsWith(prefix)).map((cat) => cat.code);
+}
+
+/**
+ * The `cat:` operand a category filter becomes on the live arXiv API. Leaves and
+ * standalone archives match exactly. A subdivided archive becomes the `cat:X*`
+ * subtree wildcard, which covers its subject classes and the legacy flat papers
+ * a bare `cat:X` would match alone. Where that wildcard would leak a neighbouring
+ * archive sharing the prefix, the subtree is spelled out as `(cat:X.* OR cat:X)`
+ * so the neighbour stays out and the legacy flat papers stay in.
+ */
+export function categorySearchTerm(code: string): string {
+  const trimmed = code.trim();
+  if (!SUBDIVIDED_ARCHIVES.has(trimmed)) return `cat:${trimmed}`;
+  return PREFIX_COLLIDING_ARCHIVES.has(trimmed)
+    ? `(cat:${trimmed}.* OR cat:${trimmed})`
+    : `cat:${trimmed}*`;
+}
+
+/**
+ * Suggest up to `limit` searchable category codes closest to an invalid input.
  * Prefers codes sharing the archive prefix, then ranks within that group by
  * edit distance — `"cs.LB"` returns `"cs.LG"`, `"cs.LO"` ahead of `"cs.AI"`.
- * Falls back to closest match across the full taxonomy when no prefix matches.
+ * Falls back to closest match across the full searchable set when no prefix
+ * matches. Bare archive codes are in the pool, so a mistyped `"condmat"` can
+ * be answered with `"cond-mat"` rather than only its subject classes.
  * See issue #6.
  */
 export function suggestCategories(code: string, limit = 5): string[] {
@@ -239,22 +326,24 @@ export function suggestCategories(code: string, limit = 5): string[] {
   if (!trimmed) return [];
   const lower = trimmed.toLowerCase();
   const prefix = lower.split('.')[0];
+  const searchable = [...SEARCHABLE_CATEGORY_CODES];
 
-  const rankByDistance = (pool: readonly ArxivCategory[]): string[] =>
+  const rankByDistance = (pool: readonly string[]): string[] =>
     pool
-      .map((cat) => ({ code: cat.code, d: editDistance(lower, cat.code.toLowerCase()) }))
+      .map((candidate) => ({ code: candidate, d: editDistance(lower, candidate.toLowerCase()) }))
       .sort((a, b) => a.d - b.d)
       .slice(0, limit)
       .map((x) => x.code);
 
   if (prefix) {
-    const prefixed = ARXIV_CATEGORIES.filter(
-      (cat) => cat.code.toLowerCase().startsWith(`${prefix}.`) || cat.code.toLowerCase() === prefix,
+    const prefixed = searchable.filter(
+      (candidate) =>
+        candidate.toLowerCase().startsWith(`${prefix}.`) || candidate.toLowerCase() === prefix,
     );
     if (prefixed.length > 0) return rankByDistance(prefixed);
   }
 
-  return rankByDistance(ARXIV_CATEGORIES);
+  return rankByDistance(searchable);
 }
 
 /** Iterative Levenshtein distance — O(m*n) time, O(min(m,n)) space. */

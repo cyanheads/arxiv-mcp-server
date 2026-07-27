@@ -171,6 +171,158 @@ describe('ArxivService.search', () => {
     expect(url.searchParams.get('search_query')).toBe('(all:testing) AND cat:cs.AI');
   });
 
+  // Issue #20: the echo is the string that actually went on the wire. Before the
+  // fix the handler echoed the raw input query, so a category filter vanished
+  // from the reported query while still shaping the results.
+  it('returns the wire query as effective_query, category wrapper included', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    const result = await service.search('all:testing', { category: 'cs.AI' }, ctx);
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(result.effective_query).toBe(url.searchParams.get('search_query'));
+    expect(result.effective_query).toBe('(all:testing) AND cat:cs.AI');
+  });
+
+  // Issue #20 acceptance: replaying the echo as the bare query, with no filter
+  // options at all, has to reach arXiv as the identical search_query — otherwise
+  // a caller replaying it gets a different result set than was reported.
+  it('replays effective_query to the identical wire query (category + date window)', async () => {
+    // Fresh Response per call — a shared one throws ERR_BODY_ALREADY_USED.
+    mockFetch.mockImplementation(async () => atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    const first = await service.search(
+      'all:transformer',
+      { category: 'cs.CL', submittedFrom: '2020-01-01', submittedTo: '2020-01-31' },
+      ctx,
+    );
+    await service.search(first.effective_query, {}, ctx);
+
+    const originalQuery = new URL(String(mockFetch.mock.calls[0]?.[0])).searchParams.get(
+      'search_query',
+    );
+    const replayedQuery = new URL(String(mockFetch.mock.calls[1]?.[0])).searchParams.get(
+      'search_query',
+    );
+    expect(replayedQuery).toBe(originalQuery);
+    expect(originalQuery).toBe(
+      '(all:transformer) AND cat:cs.CL AND submittedDate:[202001010000 TO 202002010000]',
+    );
+  });
+
+  // Issue #32: a bare archive code has to reach the whole subtree. `cat:astro-ph`
+  // alone is only the 105,380 legacy flat papers, not the 388,854-paper archive.
+  it('wildcards a bare archive code to its subtree', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('dark matter', { category: 'astro-ph' }, ctx);
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('search_query')).toBe('(dark matter) AND cat:astro-ph*');
+  });
+
+  // Issue #32: `cat:math*` also prefix-matches math-ph, a physics archive with
+  // 91,063 papers of its own. The spelled-out subtree keeps it out.
+  it('avoids the math / math-ph prefix collision', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('manifold', { category: 'math' }, ctx);
+
+    const searchQuery = new URL(String(mockFetch.mock.calls[0]?.[0])).searchParams.get(
+      'search_query',
+    );
+    expect(searchQuery).toBe('(manifold) AND (cat:math.* OR cat:math)');
+    expect(searchQuery).not.toContain('cat:math*');
+  });
+
+  it('keeps a leaf code an exact match', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('folding', { category: 'q-bio.BM' }, ctx);
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('search_query')).toBe('(folding) AND cat:q-bio.BM');
+  });
+
+  it('accepts bare archive and group codes that used to be rejected', async () => {
+    const ctx = createMockContext();
+    const service = getArxivService();
+    for (const category of ['astro-ph', 'cond-mat', 'cs', 'econ', 'q-fin', 'physics']) {
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+      await expect(service.search('anything', { category }, ctx)).resolves.toBeDefined();
+    }
+  });
+
+  // Issue #27 — the date window reaches arXiv as a submittedDate clause, and the
+  // upper bound is midnight of the day AFTER submitted_to. A same-day 2359 bound
+  // would drop that day's last 59 seconds: arXiv compares the bound against the
+  // full-precision submission timestamp, not a minute bucket.
+  it('folds an inclusive date window into the wire query', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search(
+      'all:transformer',
+      { submittedFrom: '2020-01-01', submittedTo: '2020-01-31' },
+      ctx,
+    );
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('search_query')).toBe(
+      '(all:transformer) AND submittedDate:[202001010000 TO 202002010000]',
+    );
+  });
+
+  it('substitutes a sentinel for an omitted bound so the range stays well-formed', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('all:transformer', { submittedFrom: '2020-01-01' }, ctx);
+
+    const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('search_query')).toBe(
+      '(all:transformer) AND submittedDate:[202001010000 TO 300001010000]',
+    );
+  });
+
+  it('emits adjacent windows that meet at one instant, leaving no gap', async () => {
+    // Fresh Response per call — a shared one throws ERR_BODY_ALREADY_USED.
+    mockFetch.mockImplementation(async () => atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await service.search('q', { submittedFrom: '2020-01-01', submittedTo: '2020-01-15' }, ctx);
+    await service.search('q', { submittedFrom: '2020-01-16', submittedTo: '2020-01-31' }, ctx);
+
+    const first = new URL(String(mockFetch.mock.calls[0]?.[0])).searchParams.get('search_query');
+    const second = new URL(String(mockFetch.mock.calls[1]?.[0])).searchParams.get('search_query');
+    expect(first).toContain('TO 202001160000]');
+    expect(second).toContain('submittedDate:[202001160000 ');
+  });
+
+  it('rejects a date that is not a real calendar date', async () => {
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await expect(service.search('q', { submittedFrom: '2020-02-31' }, ctx)).rejects.toThrow(
+      /not a real UTC calendar date/,
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects an inverted date window', async () => {
+    const ctx = createMockContext();
+    const service = getArxivService();
+    await expect(
+      service.search('q', { submittedFrom: '2024-05-01', submittedTo: '2024-04-01' }, ctx),
+    ).rejects.toThrow(/is after submitted_to/);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('wraps multi-word unprefixed queries so category scopes the whole expression', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();

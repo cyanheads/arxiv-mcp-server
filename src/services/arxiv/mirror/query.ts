@@ -1,26 +1,42 @@
 /**
- * @fileoverview arXiv query syntax → FTS5 translator with category-hierarchy
+ * @fileoverview arXiv query syntax → FTS5 translator with category-subtree
  * expansion. Parses field prefixes (`ti:`, `au:`, `abs:`, `cat:`, `all:`),
  * boolean operators (`AND`, `OR`, `ANDNOT`), quoted phrases, and parens.
  * Extracts `cat:` operands into a structured filter so they apply against
- * the indexed `primary_category` / `categories` columns instead of FTS.
+ * the indexed category columns instead of FTS, and `submittedDate:[… TO …]`
+ * into ISO bounds on the indexed `published` column.
  * @module services/arxiv/mirror/query
  */
 
-import { ARXIV_CATEGORIES, GROUPS } from '../categories.js';
+import { categorySubtree } from '../categories.js';
+import { intersectBounds, stampToIso } from '../date-window.js';
 
 /** Result of translating an arXiv-syntax query to mirror inputs. */
 export interface TranslatedQuery {
-  /** Distinct category codes (already group/archive-expanded). Empty when the user did not use `cat:`. */
+  /** Distinct category codes (already subtree-expanded). Empty when the user did not use `cat:`. */
   categoryFilters: string[];
   /** FTS5 MATCH expression, or undefined when the user query had no full-text component. */
   matchExpr?: string;
+  /**
+   * Inclusive ISO 8601 bounds on `papers.published`, from any
+   * `submittedDate:[… TO …]` operand. Both members are absent when the query
+   * carried no window; multiple operands narrow to their intersection.
+   */
+  published: { from?: string; to?: string };
 }
 
 type Token =
   | { kind: 'and' | 'or' | 'andnot' | 'lparen' | 'rparen' }
+  | { kind: 'daterange'; from: string; to: string }
   | { kind: 'field'; field: 'ti' | 'au' | 'abs' | 'cat' | 'all'; value: string; phrase: boolean }
   | { kind: 'term'; value: string; phrase: boolean };
+
+/**
+ * arXiv's submitted-date range operand. Only a fully-formed clause with two
+ * `YYYYMMDDHHMM` stamps is lifted out; anything else falls through to ordinary
+ * tokenization rather than being silently reinterpreted as a date filter.
+ */
+const DATE_RANGE_PATTERN = /^submittedDate:\[\s*(\d{12})\s+TO\s+(\d{12})\s*\]/i;
 
 const FIELD_MAP: Record<string, 'ti' | 'au' | 'abs' | 'cat' | 'all'> = {
   ti: 'ti',
@@ -57,6 +73,12 @@ function tokenize(input: string): Token[] {
     if (ch === ')') {
       tokens.push({ kind: 'rparen' });
       i++;
+      continue;
+    }
+    const rangeMatch = DATE_RANGE_PATTERN.exec(input.slice(i));
+    if (rangeMatch?.[1] && rangeMatch[2]) {
+      tokens.push({ kind: 'daterange', from: rangeMatch[1], to: rangeMatch[2] });
+      i += rangeMatch[0].length;
       continue;
     }
     // Look for word followed by `:` (field prefix), allow quoted value
@@ -117,58 +139,35 @@ function consumeValue(
 }
 
 // ---------------------------------------------------------------------------
-// Category expansion
-// ---------------------------------------------------------------------------
-
-/**
- * Expand a single `cat:` value to one or more concrete category codes.
- * - `cs` → all `cs.*` codes (group/archive expansion)
- * - `physics` → all categories grouped under physics
- * - `cs.LG` → unchanged
- * Unknown codes are returned verbatim so the caller can decide whether to warn.
- */
-export function expandCategory(code: string): string[] {
-  const trimmed = code.trim();
-  if (!trimmed) return [];
-  if (trimmed.includes('.')) return [trimmed];
-  // Group-level (e.g. `cs`, `physics`)
-  const lower = trimmed.toLowerCase();
-  if ((GROUPS as readonly string[]).includes(lower)) {
-    return ARXIV_CATEGORIES.filter((cat) => cat.group === lower).map((cat) => cat.code);
-  }
-  // Archive code without dot (e.g. `hep-th` covers the entire archive)
-  const archivePrefix = `${trimmed}.`;
-  const archiveMatches = ARXIV_CATEGORIES.filter((cat) => cat.code.startsWith(archivePrefix)).map(
-    (cat) => cat.code,
-  );
-  if (archiveMatches.length > 0) return archiveMatches;
-  return [trimmed];
-}
-
-// ---------------------------------------------------------------------------
 // Translator
 // ---------------------------------------------------------------------------
 
 /**
- * Translate an arXiv-syntax query into an FTS5 MATCH expression and a list of
- * structured category filters. The category operands are stripped from the
- * FTS expression — they apply as a separate WHERE clause inside `MirrorStore`.
+ * Translate an arXiv-syntax query into an FTS5 MATCH expression plus the
+ * structured filters that cannot ride in FTS: category codes and a submitted-date
+ * window. Both operand kinds are stripped from the FTS expression — they apply as
+ * separate WHERE clauses inside `MirrorStore`.
  */
 export function translateQuery(query: string): TranslatedQuery {
   const tokens = tokenize(query);
   const categoryFilters = new Set<string>();
+  let published: { from?: string; to?: string } = {};
   const ftsParts: string[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (!t) continue;
 
-    // Strip `cat:` operands into the category filter set. The operators they
-    // leave behind (and any groups they empty out) are reconciled by
-    // `cleanupDanglingOps` after the main pass — local cleanup here is wrong
+    // Strip `cat:` and `submittedDate:` operands into structured filters. The
+    // operators they leave behind (and any groups they empty out) are reconciled
+    // by `cleanupDanglingOps` after the main pass — local cleanup here is wrong
     // whenever the next token is `)` or another operator, so don't try.
     if (t.kind === 'field' && t.field === 'cat') {
-      for (const c of expandCategory(t.value)) categoryFilters.add(c);
+      for (const c of categorySubtree(t.value)) categoryFilters.add(c);
+      continue;
+    }
+    if (t.kind === 'daterange') {
+      published = intersectBounds(published, { from: stampToIso(t.from), to: stampToIso(t.to) });
       continue;
     }
 
@@ -210,6 +209,7 @@ export function translateQuery(query: string): TranslatedQuery {
   return {
     ...(matchExpr !== undefined && { matchExpr }),
     categoryFilters: [...categoryFilters],
+    published,
   };
 }
 

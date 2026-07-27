@@ -19,7 +19,12 @@ vi.mock('@/services/arxiv/arxiv-service.js', () => ({
 
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 
-const MOCK_SEARCH_RESULT: SearchResult = { total_results: 0, start: 0, papers: [] };
+const MOCK_SEARCH_RESULT: SearchResult = {
+  total_results: 0,
+  start: 0,
+  papers: [],
+  effective_query: '',
+};
 const MOCK_CONTENT: PaperContent = {
   paper_id: '2401.12345v1',
   title: 'Test',

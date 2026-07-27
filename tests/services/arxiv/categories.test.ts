@@ -6,8 +6,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   ARXIV_CATEGORIES,
+  categorySearchTerm,
+  categorySubtree,
   GROUPS,
   getGroup,
+  SEARCHABLE_CATEGORY_CODES,
   suggestCategories,
   VALID_CATEGORY_CODES,
 } from '@/services/arxiv/categories.js';
@@ -57,6 +60,127 @@ describe('VALID_CATEGORY_CODES', () => {
     expect(VALID_CATEGORY_CODES.has('foo.BAR')).toBe(false);
     expect(VALID_CATEGORY_CODES.has('')).toBe(false);
   });
+
+  it('stays the catalogue set — bare archive codes are not taxonomy entries', () => {
+    expect(VALID_CATEGORY_CODES.has('astro-ph')).toBe(false);
+    expect(VALID_CATEGORY_CODES.has('cs')).toBe(false);
+  });
+});
+
+// Issue #32: archive- and group-level codes are heavily populated arXiv query
+// targets that the leaf-only validation set rejected outright.
+describe('SEARCHABLE_CATEGORY_CODES', () => {
+  it('accepts every subdivided archive and group code', () => {
+    for (const code of [
+      'astro-ph',
+      'cond-mat',
+      'nlin',
+      'physics',
+      'q-bio',
+      'q-fin',
+      'cs',
+      'econ',
+      'eess',
+      'math',
+      'stat',
+    ]) {
+      expect(SEARCHABLE_CATEGORY_CODES.has(code)).toBe(true);
+    }
+  });
+
+  it('accepts every taxonomy leaf and standalone archive', () => {
+    for (const cat of ARXIV_CATEGORIES) {
+      expect(SEARCHABLE_CATEGORY_CODES.has(cat.code)).toBe(true);
+    }
+  });
+
+  it('still rejects codes that are neither leaf nor archive', () => {
+    expect(SEARCHABLE_CATEGORY_CODES.has('cs.INVALID')).toBe(false);
+    expect(SEARCHABLE_CATEGORY_CODES.has('astro')).toBe(false);
+    expect(SEARCHABLE_CATEGORY_CODES.has('')).toBe(false);
+  });
+
+  it('adds exactly the eleven subdivided archives to the taxonomy set', () => {
+    expect(SEARCHABLE_CATEGORY_CODES.size).toBe(VALID_CATEGORY_CODES.size + 11);
+  });
+});
+
+describe('categorySubtree', () => {
+  it('leaves a leaf code alone', () => {
+    expect(categorySubtree('cs.LG')).toEqual(['cs.LG']);
+  });
+
+  it('leaves a standalone archive alone — it has no subtree', () => {
+    expect(categorySubtree('hep-th')).toEqual(['hep-th']);
+    expect(categorySubtree('quant-ph')).toEqual(['quant-ph']);
+  });
+
+  it('covers the bare archive code alongside its subject classes', () => {
+    // The bare code is what legacy flat papers carry — 105,380 of them under
+    // astro-ph. Expanding to the dotted children alone loses every one.
+    const astro = categorySubtree('astro-ph');
+    expect(astro).toContain('astro-ph');
+    expect(astro).toContain('astro-ph.CO');
+    expect(astro.filter((c) => c.startsWith('astro-ph.')).length).toBe(6);
+  });
+
+  it('scopes a group code to its own archive, never a prefix neighbour', () => {
+    // math-ph is a physics archive that merely shares math's string prefix.
+    const math = categorySubtree('math');
+    expect(math).toContain('math');
+    expect(math).toContain('math.AG');
+    expect(math).not.toContain('math-ph');
+  });
+
+  it('reads the subtree wildcards emitted on the live path', () => {
+    expect(categorySubtree('astro-ph*')).toEqual(categorySubtree('astro-ph'));
+    expect(categorySubtree('math.*')).not.toContain('math-ph');
+    // `X*` mirrors arXiv's own wildcard, which does reach a prefix neighbour.
+    expect(categorySubtree('math*')).toContain('math-ph');
+  });
+
+  it('returns unknown codes verbatim so the caller can decide what to do', () => {
+    expect(categorySubtree('zz.UNKNOWN')).toEqual(['zz.UNKNOWN']);
+    expect(categorySubtree('')).toEqual([]);
+  });
+});
+
+describe('categorySearchTerm', () => {
+  it('matches a leaf or standalone archive exactly', () => {
+    expect(categorySearchTerm('cs.CL')).toBe('cat:cs.CL');
+    expect(categorySearchTerm('hep-th')).toBe('cat:hep-th');
+  });
+
+  it('wildcards a subdivided archive so the subtree is covered', () => {
+    // cat:astro-ph alone is 105,380 legacy flat papers; cat:astro-ph* is 388,854.
+    expect(categorySearchTerm('astro-ph')).toBe('cat:astro-ph*');
+    expect(categorySearchTerm('cs')).toBe('cat:cs*');
+    expect(categorySearchTerm('q-bio')).toBe('cat:q-bio*');
+  });
+
+  it('spells out the subtree where a wildcard would leak a prefix neighbour', () => {
+    // cat:math* is 722,677 and pulls in math-ph (91,063 standalone). The spelled
+    // form keeps math-ph out while leaving room for legacy flat math papers.
+    expect(categorySearchTerm('math')).toBe('(cat:math.* OR cat:math)');
+  });
+
+  it('leaves every other archive on the plain wildcard', () => {
+    for (const code of ['astro-ph', 'cond-mat', 'nlin', 'physics', 'q-bio', 'q-fin']) {
+      expect(categorySearchTerm(code)).toBe(`cat:${code}*`);
+    }
+    for (const code of ['cs', 'econ', 'eess', 'stat']) {
+      expect(categorySearchTerm(code)).toBe(`cat:${code}*`);
+    }
+  });
+
+  it('agrees with categorySubtree on which codes name a subtree', () => {
+    // Both sides read the same derived archive set, so live and mirror cannot
+    // disagree about whether a code is a leaf or a whole archive.
+    for (const code of SEARCHABLE_CATEGORY_CODES) {
+      const isSubtree = categorySubtree(code).length > 1;
+      expect(categorySearchTerm(code).includes('*')).toBe(isSubtree);
+    }
+  });
 });
 
 describe('suggestCategories', () => {
@@ -90,10 +214,14 @@ describe('suggestCategories', () => {
   it('falls back to edit-distance ranking when the prefix is unknown', () => {
     const suggestions = suggestCategories('foo.BAR');
     expect(suggestions.length).toBeGreaterThan(0);
-    // Each suggestion must be a valid category code
+    // Each suggestion must be something the category filter would actually accept
     for (const code of suggestions) {
-      expect(VALID_CATEGORY_CODES.has(code)).toBe(true);
+      expect(SEARCHABLE_CATEGORY_CODES.has(code)).toBe(true);
     }
+  });
+
+  it('can suggest a bare archive code now that one is a valid filter', () => {
+    expect(suggestCategories('condmat')).toContain('cond-mat');
   });
 
   it('returns an empty list for empty input', () => {

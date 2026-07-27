@@ -69,9 +69,9 @@ z.object({
     ),
   category: z.string().optional()
     .describe(
-      'Filter by arXiv category (e.g., "cs.CL", "math.AG"). '
-      + 'Prepended as "AND cat:{category}" to the query. '
-      + 'Use arxiv_list_categories to discover valid codes.'
+      'Restrict results to an arXiv category. A leaf code ("cs.CL", "math.AG") '
+      + 'matches exactly; a bare archive code ("astro-ph", "cs", "math") matches '
+      + 'the whole archive. Use arxiv_list_categories to discover subject classes.'
     ),
   max_results: z.number().min(1).max(50).default(10)
     .describe('Maximum results to return (1-50). Default 10. '
@@ -83,9 +83,13 @@ z.object({
       + 'Maps to arXiv API: relevance→relevance, submitted→submittedDate, updated→lastUpdatedDate.'),
   sort_order: z.enum(['ascending', 'descending']).default('descending')
     .describe('Sort direction. "descending" returns newest/most relevant first.'),
-  start: z.number().min(0).default(0)
-    .describe('Pagination offset. Use with max_results to page through results. '
+  start: z.number().min(0).max(10_000).default(0)
+    .describe('Pagination offset (0-10000). Use with max_results to page through results. '
       + 'E.g., start=10 with max_results=10 returns results 11-20.'),
+  submitted_from: z.string().optional()
+    .describe('Earliest submission date to include, inclusive, UTC YYYY-MM-DD.'),
+  submitted_to: z.string().optional()
+    .describe('Latest submission date to include, inclusive, UTC YYYY-MM-DD.'),
 })
 ```
 
@@ -93,13 +97,27 @@ z.object({
 
 ```ts
 z.object({
-  total_results: z.number()
-    .describe('Total matching papers (may exceed returned count due to pagination).'),
-  start: z.number()
-    .describe('Pagination offset of this result set.'),
   papers: z.array(PaperMetadataSchema)
     .describe('Matching papers with full metadata.'),
 })
+```
+
+**Enrichment** (agent-facing context — merged into `structuredContent` and mirrored into a `content[]` trailer; not part of the domain payload):
+
+```ts
+{
+  effectiveQuery: z.string()
+    .describe('The query as actually searched, carrying every filter applied. '
+      + 'Replaying it as `query` with no other filters reproduces this result set.'),
+  totalFound: z.number().describe('Total matching papers reported by arXiv.'),
+  pageStart: z.number().describe('Pagination offset of this result page.'),
+  truncated: z.boolean().optional(),
+  shown: z.number().optional(),
+  cap: z.number().optional(),
+  notice: z.string().optional()
+    .describe('Guidance when results are empty, paging overshot, or matches exceed '
+      + 'the reachable offset.'),
+}
 ```
 
 **`PaperMetadataSchema`** (shared with `arxiv_get_metadata`):
@@ -122,15 +140,38 @@ const PaperMetadataSchema = z.object({
 });
 ```
 
-**Format:** Renders each paper as a structured block with title, authors, abstract, categories, dates, and links. Includes total count and pagination info.
+**Format:** Renders each paper as a structured block with title, authors, abstract, categories, dates, and links. Counts, the effective query, and pagination guidance ride in the enrichment trailer rather than `format()`.
 
 **Error modes:**
 
 | Failure | Code | Recovery guidance |
 |:--------|:-----|:-----------------|
+| Unknown category code | `ValidationError` | Near-match suggestions from the searchable set; `arxiv_list_categories` for the full taxonomy. |
+| Malformed or inverted date window | `ValidationError` | Both bounds as real UTC calendar dates, `submitted_from` on or before `submitted_to`. |
 | arXiv API unavailable | `ServiceUnavailable` | "arXiv API is temporarily unavailable. Try again in a few seconds." |
 | arXiv throttling (429 or `Rate exceeded.` body) | `RateLimited` | Wait `error.data.cooldownAppliedMs` milliseconds and lower concurrency. Never retried server-side. |
-| Empty results | Not an error | Return `{ total_results: 0, papers: [] }` |
+| Empty results | Not an error | Return `{ papers: [] }` with a `notice` enrichment explaining how to broaden. |
+
+#### Category resolution
+
+A `category` filter names either one taxonomy leaf or a whole archive, and both search paths resolve it from the same derived taxonomy so they cannot disagree:
+
+| Input | Live `search_query` operand | Mirror category filter |
+|:------|:----------------------------|:-----------------------|
+| `cs.CL` (leaf) | `cat:cs.CL` | `cs.CL` |
+| `hep-th` (standalone archive) | `cat:hep-th` | `hep-th` |
+| `astro-ph` (subdivided archive) | `cat:astro-ph*` | `astro-ph` + its six subject classes |
+| `math` (prefix collides with `math-ph`) | `(cat:math.* OR cat:math)` | `math` + its subject classes, never `math-ph` |
+
+A bare archive code covers the legacy flat papers filed before the archive was subdivided — 105,380 of them under `astro-ph` alone, which a subject-class-only expansion drops. `physics` resolves to the general-physics archive (`physics.*`), not the wider physics group; `astro-ph`, `cond-mat`, `hep-*` and `quant-ph` are separate archive codes.
+
+**Decision — a bare code means its archive, not its display group.** `physics` is the only code that is both an archive and a taxonomy group. Resolving it as the archive is what `cat:physics*` returns upstream, so live and mirror agree exactly; resolving it as the group would have required a thirteen-way `OR` on the live path and still diverged on cross-listed papers.
+
+#### Exhaustive retrieval past the offset ceiling
+
+`start` caps at 10,000 because arXiv answers HTTP 500 for deeper offsets — verified live at `start=10050` and `start=50000`. Matches beyond `10,000 + max_results` are therefore unreachable by paging alone, so `submitted_from` / `submitted_to` carve the result set into independently pageable windows, and the truncation guidance names them once `totalFound` exceeds what paging can reach.
+
+**Decision — a window's upper bound is midnight of the following day.** arXiv's `submittedDate:[A TO B]` takes `YYYYMMDDHHMM` stamps, includes both endpoints, and compares each against the paper's full-precision submission timestamp rather than a minute bucket (probed live: an upper bound of `…0339` includes a paper submitted at exactly `03:39:00Z`, while `…0149` excludes one at `01:49:16Z`). A same-day `…2359` bound would therefore drop every submission in that day's last 59 seconds into no window at all. Closing at the next midnight instead leaves adjacent windows sharing a single instant — a paper submitted at exactly `00:00:00Z` appears in both — which is the unavoidable residue of a doubly-inclusive operator and strictly preferable to a recurring hole. The mirror applies the identical instants as `published >= ? AND published <= ?`.
 
 ### `arxiv_get_metadata`
 

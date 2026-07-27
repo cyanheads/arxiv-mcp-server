@@ -45,6 +45,9 @@ Search for papers using free-text queries with field prefixes and boolean operat
 - Field prefixes: `ti:` (title), `au:` (author), `abs:` (abstract), `cat:` (category), `all:` (all fields)
 - Boolean operators: `AND`, `OR`, `ANDNOT`
 - Optional category filter, sorting (relevance, submitted, updated), and pagination
+- Category accepts a leaf code (`cs.CL`) or a whole archive (`astro-ph`, `cs`, `math`) — a bare archive covers its subject classes plus the legacy flat papers filed before it was subdivided
+- `submitted_from` / `submitted_to` bound the submission date (inclusive, UTC `YYYY-MM-DD`). Consecutive windows cover the matches with no gap — a paper submitted exactly at a midnight seam falls in both, so de-duplicate by ID — which is how to reach results past the 10,000 pagination ceiling
+- Echoes back the query as actually searched, with every filter folded in — replaying it reproduces the same result set
 - Returns up to 50 results per request with full metadata including abstract
 
 ---

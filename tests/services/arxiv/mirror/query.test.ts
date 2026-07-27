@@ -1,9 +1,10 @@
 /**
  * @fileoverview Tests for the arXiv → FTS5 query translator including
- * field prefixes, boolean operators, phrase quoting, category-hierarchy
- * expansion via the bundled taxonomy, parenthesis-boundary adjacency
- * (issue #13), and `cat:` extraction cleanup inside parens (issue #14),
- * all verified against a real in-memory FTS5 index.
+ * field prefixes, boolean operators, phrase quoting, category-subtree
+ * expansion via the bundled taxonomy, `submittedDate:` window extraction
+ * (issue #27), parenthesis-boundary adjacency (issue #13), and `cat:`
+ * extraction cleanup inside parens (issue #14), all verified against a real
+ * in-memory FTS5 index.
  * @module services/arxiv/mirror/query.test
  */
 
@@ -11,7 +12,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { expandCategory, translateQuery } from '@/services/arxiv/mirror/query.js';
+import { categorySubtree } from '@/services/arxiv/categories.js';
+import { translateQuery } from '@/services/arxiv/mirror/query.js';
 import { MirrorStore } from '@/services/arxiv/mirror/store.js';
 
 describe('translateQuery', () => {
@@ -49,13 +51,16 @@ describe('translateQuery', () => {
     expect(categoryFilters).toEqual(['cs.LG']);
   });
 
-  it('expands group-level cat:cs to every cs.* code in the taxonomy', () => {
+  it('expands archive-level cat:cs to the bare code plus every cs.* code', () => {
     const { matchExpr, categoryFilters } = translateQuery('attention AND cat:cs');
     expect(matchExpr).toBe('"attention"');
     expect(categoryFilters.length).toBeGreaterThan(10);
     expect(categoryFilters).toContain('cs.LG');
     expect(categoryFilters).toContain('cs.AI');
-    expect(categoryFilters.every((c) => c.startsWith('cs.'))).toBe(true);
+    // The bare archive code carries legacy flat papers filed before the archive
+    // was subdivided; dropping it makes the mirror narrower than live (#32).
+    expect(categoryFilters).toContain('cs');
+    expect(categoryFilters.every((c) => c === 'cs' || c.startsWith('cs.'))).toBe(true);
   });
 
   it('drops dangling boolean operators when cat: is the sole non-operator term', () => {
@@ -236,11 +241,11 @@ describe('translateQuery — cat: extraction cleanup (issue #14)', () => {
     expect(categoryFilters.sort()).toEqual(['cs.AI', 'cs.LG']);
   });
 
-  it('expands group-level cat: inside parens (cs → every cs.* code)', () => {
+  it('expands archive-level cat: inside parens (cs → bare code + every cs.* code)', () => {
     const { matchExpr, categoryFilters } = translateQuery('(term OR cat:cs)');
     expect(matchExpr).toBe('("term")');
     expect(categoryFilters.length).toBeGreaterThan(10);
-    expect(categoryFilters.every((c) => c.startsWith('cs.'))).toBe(true);
+    expect(categoryFilters.every((c) => c === 'cs' || c.startsWith('cs.'))).toBe(true);
   });
 
   it('does not regress non-cat parenthesized queries', () => {
@@ -370,28 +375,54 @@ describe('translateQuery → FTS5 parser parity (issue #13)', () => {
   });
 });
 
-describe('expandCategory', () => {
-  it('returns a single code untouched when fully qualified', () => {
-    expect(expandCategory('cs.LG')).toEqual(['cs.LG']);
+describe('cat: operand expansion', () => {
+  it('expands a cat: operand through the shared taxonomy subtree', () => {
+    expect(translateQuery('cat:cs.LG').categoryFilters).toEqual(categorySubtree('cs.LG'));
+    expect(translateQuery('cat:astro-ph').categoryFilters).toEqual(categorySubtree('astro-ph'));
   });
 
-  it('expands group codes (cs, math, physics, …) to all member categories', () => {
-    const cs = expandCategory('cs');
-    expect(cs.length).toBeGreaterThan(0);
-    expect(cs.every((c) => c.startsWith('cs.'))).toBe(true);
+  it('understands the subtree wildcards this server emits on the live path', () => {
+    // `categorySearchTerm` can produce `cat:math.*` / `cat:astro-ph*`. Replaying an
+    // echoed query through the mirror only works if the translator reads them too.
+    expect(translateQuery('cat:astro-ph*').categoryFilters).toContain('astro-ph.CO');
+    expect(translateQuery('cat:astro-ph*').categoryFilters).toContain('astro-ph');
+    expect(translateQuery('cat:math.*').categoryFilters).toContain('math.AG');
+    expect(translateQuery('cat:math.*').categoryFilters).not.toContain('math-ph');
+  });
+});
+
+describe('submittedDate: window extraction (issue #27)', () => {
+  it('lifts a submittedDate range out of the FTS expression into published bounds', () => {
+    const { matchExpr, published } = translateQuery(
+      'all:transformer AND submittedDate:[202001010000 TO 202002010000]',
+    );
+    expect(published.from).toBe('2020-01-01T00:00:00.000Z');
+    expect(published.to).toBe('2020-02-01T00:00:00.000Z');
+    // The range must not leak into FTS as bare terms.
+    expect(matchExpr).not.toContain('submittedDate');
+    expect(matchExpr).not.toContain('202001010000');
   });
 
-  it('expands archive codes inside physics with sub-categories (e.g. astro-ph)', () => {
-    const astro = expandCategory('astro-ph');
-    expect(astro.length).toBeGreaterThan(0);
-    expect(astro.every((c) => c.startsWith('astro-ph.'))).toBe(true);
+  it('drops the operator the extracted range leaves behind', () => {
+    const { matchExpr } = translateQuery('submittedDate:[202001010000 TO 202002010000]');
+    expect(matchExpr).toBeUndefined();
   });
 
-  it('returns archive codes that have no sub-categories untouched (e.g. hep-th)', () => {
-    expect(expandCategory('hep-th')).toEqual(['hep-th']);
+  it('narrows to the intersection when a query carries two windows', () => {
+    const { published } = translateQuery(
+      'submittedDate:[202001010000 TO 202004010000] AND submittedDate:[202002010000 TO 202006010000]',
+    );
+    expect(published.from).toBe('2020-02-01T00:00:00.000Z');
+    expect(published.to).toBe('2020-04-01T00:00:00.000Z');
   });
 
-  it('returns unknown codes verbatim so the caller can decide what to do', () => {
-    expect(expandCategory('zz.UNKNOWN')).toEqual(['zz.UNKNOWN']);
+  it('leaves a malformed range as ordinary terms rather than guessing a window', () => {
+    const { published } = translateQuery('submittedDate:[2020 TO yesterday]');
+    expect(published.from).toBeUndefined();
+    expect(published.to).toBeUndefined();
+  });
+
+  it('reports no window when the query has none', () => {
+    expect(translateQuery('all:transformer').published).toEqual({});
   });
 });

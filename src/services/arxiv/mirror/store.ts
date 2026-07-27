@@ -289,20 +289,31 @@ export class MirrorStore {
    * boundary where implicit conjunction would cross a parenthesized form
    * (see issue #13). Callers still wrap this in a SQLite-error catch for
    * defense in depth — see `ArxivService.searchMirror`. `categoryFilters` are
-   * expanded category codes (group/archive expansion handled upstream); each
+   * expanded category codes (subtree expansion handled upstream); each
    * is matched via the `paper_categories` junction table (index-backed —
    * see issue #19).
+   *
+   * `publishedFrom` / `publishedTo` bound `papers.published` inclusively (the
+   * `papers_published_idx` index backs the range). They are ISO 8601 instants in
+   * the normalized form `rawToRow` writes, so lexicographic comparison is
+   * chronological. Each bound names one exact instant, not a minute or a day: the
+   * upper bound for `submitted_to: 2021-03-10` is `2021-03-11T00:00:00.000Z`, the
+   * following midnight, so a record at `23:59:30Z` stays inside the window and one
+   * submitted exactly on the seam falls in both neighbours. See `date-window.ts`.
    */
   search(options: {
     categoryFilters?: readonly string[];
     limit: number;
     matchExpr?: string;
     offset: number;
+    publishedFrom?: string;
+    publishedTo?: string;
     sortBy: 'relevance' | 'published' | 'updated';
     sortOrder: 'ascending' | 'descending';
   }): { papers: PaperRow[]; total: number } {
     const hasCats = (options.categoryFilters?.length ?? 0) > 0;
     const cats = options.categoryFilters ?? [];
+    const hasDateWindow = options.publishedFrom !== undefined || options.publishedTo !== undefined;
     const dir = options.sortOrder === 'ascending' ? 'ASC' : 'DESC';
 
     // -------------------------------------------------------------------------
@@ -327,6 +338,15 @@ export class MirrorStore {
       papersParams.push(...cats);
     }
 
+    if (options.publishedFrom !== undefined) {
+      papersWhere.push(`papers.published >= ?`);
+      papersParams.push(options.publishedFrom);
+    }
+    if (options.publishedTo !== undefined) {
+      papersWhere.push(`papers.published <= ?`);
+      papersParams.push(options.publishedTo);
+    }
+
     const whereClause = papersWhere.length > 0 ? `WHERE ${papersWhere.join(' AND ')}` : '';
 
     // -------------------------------------------------------------------------
@@ -335,7 +355,7 @@ export class MirrorStore {
     // the FTS result set (already narrow) intersected with the junction.
     // -------------------------------------------------------------------------
     let total: number;
-    if (hasCats && !options.matchExpr) {
+    if (hasCats && !options.matchExpr && !hasDateWindow) {
       // Pure category filter: COUNT directly on the junction, which is indexed
       // on category. Multiple categories → UNION on primary keys (no dups).
       if (cats.length === 1) {
@@ -367,13 +387,14 @@ export class MirrorStore {
     // -------------------------------------------------------------------------
     // Row page.
     //
-    // Fast path: a single category, no FTS term, not sorted by published. This
-    // covers the dominant category-browse shape (default and updated sorts both
-    // order by `updated`). It pages straight off the (category, updated)
-    // junction index — no sort, no papers scan — so it stays fast for rare
-    // categories too, not just common ones (issue #19). Every other shape
-    // (multiple categories, an FTS term, or sort_by:published) takes the
-    // generic papers-table path below.
+    // Fast path: a single category, no FTS term, no date window, not sorted by
+    // published. This covers the dominant category-browse shape (default and
+    // updated sorts both order by `updated`). It pages straight off the
+    // (category, updated) junction index — no sort, no papers scan — so it stays
+    // fast for rare categories too, not just common ones (issue #19). Every
+    // other shape (multiple categories, an FTS term, a date window, or
+    // sort_by:published) takes the generic papers-table path below, which is the
+    // only one that applies `whereClause`.
     // -------------------------------------------------------------------------
     const columns = `papers.id, papers.version, papers.title, papers.authors,
              papers.abstract, papers.primary_category, papers.categories,
@@ -381,7 +402,11 @@ export class MirrorStore {
              papers.comment, papers.journal_ref, papers.doi`;
 
     const singleCat =
-      hasCats && !options.matchExpr && cats.length === 1 && options.sortBy !== 'published'
+      hasCats &&
+      !options.matchExpr &&
+      !hasDateWindow &&
+      cats.length === 1 &&
+      options.sortBy !== 'published'
         ? cats[0]
         : undefined;
 

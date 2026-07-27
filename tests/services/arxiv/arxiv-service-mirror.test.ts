@@ -611,6 +611,204 @@ describe('ArxivService — mirror integration', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Bare archive codes on the mirror path (#32). The live path reaches a whole
+  // archive with `cat:astro-ph*`, which covers the legacy flat papers filed
+  // before the archive was subdivided. Expanding to the dotted subject classes
+  // alone makes the mirror quietly narrower than live for the same input.
+  // -------------------------------------------------------------------------
+
+  describe('bare archive categories (#32)', () => {
+    beforeEach(async () => {
+      const store = await MirrorStore.open(configOverrides.mirrorPath);
+      store.applyBatch(
+        [
+          mkRecord({
+            paper_id: '9901.00001',
+            title: 'Legacy Flat Astrophysics Paper',
+            abstract: 'Cosmic ray observations from before the archive was subdivided.',
+            // Filed against the bare archive, as pre-2009 astro-ph papers are.
+            categories: 'astro-ph',
+            versions: [{ version: 'v1', date: '1999-01-11T00:00:00Z' }],
+          }),
+        ],
+        [],
+      );
+      store.close();
+    });
+
+    it('covers legacy flat papers as well as subject classes', async () => {
+      const ctx = createMockContext();
+      const result = await service.search(
+        'abs:cosmic',
+        { maxResults: 10, category: 'astro-ph' },
+        ctx,
+      );
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers.map((p) => p.id).sort()).toEqual(['2401.10002v3', '9901.00001v1']);
+    });
+
+    it('keeps a leaf code scoped to that subject class alone', async () => {
+      const ctx = createMockContext();
+      const result = await service.search(
+        'abs:cosmic',
+        { maxResults: 10, category: 'astro-ph.CO' },
+        ctx,
+      );
+
+      expect(result.papers.map((p) => p.id)).toEqual(['2401.10002v3']);
+    });
+
+    it('reaches the same rows through the cat: wildcard the live path emits', async () => {
+      const ctx = createMockContext();
+      const viaOption = await service.search(
+        'abs:cosmic',
+        { maxResults: 10, category: 'astro-ph' },
+        ctx,
+      );
+      const viaWildcard = await service.search(
+        'abs:cosmic AND cat:astro-ph*',
+        { maxResults: 10 },
+        ctx,
+      );
+
+      expect(viaWildcard.papers.map((p) => p.id).sort()).toEqual(
+        viaOption.papers.map((p) => p.id).sort(),
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Submitted-date windows on the mirror path (#27), and the echo that has to
+  // survive a replay (#20). Boundary records are the point: arXiv compares a
+  // window bound against the full-precision submission timestamp, so an encoding
+  // that stops at `…2359` drops a day's final seconds into no window at all.
+  // -------------------------------------------------------------------------
+
+  describe('submitted-date windows (#27)', () => {
+    /** paper_id → submission instant, chosen to sit on the interesting edges. */
+    const WINDOW_PAPERS: Record<string, string> = {
+      '2403.00000': '2024-03-09T23:59:59Z', // last instant before the window opens
+      '2403.00001': '2024-03-10T00:00:00Z', // exactly the opening instant
+      '2403.00002': '2024-03-10T12:00:00Z',
+      '2403.00003': '2024-03-10T23:59:30Z', // the record a `…2359` bound loses
+      '2403.00004': '2024-03-11T08:00:00Z',
+      '2403.00005': '2024-03-12T05:00:00Z',
+      '2403.00006': '2024-03-13T00:00:00Z', // exactly a shared window boundary
+    };
+
+    beforeEach(async () => {
+      const store = await MirrorStore.open(configOverrides.mirrorPath);
+      store.applyBatch(
+        Object.entries(WINDOW_PAPERS).map(([paper_id, date]) =>
+          mkRecord({
+            paper_id,
+            title: 'Windowed Chronometry Paper',
+            abstract: 'A paper used to probe submitted-date window boundaries.',
+            categories: 'cs.LG',
+            versions: [{ version: 'v1', date }],
+          }),
+        ),
+        [],
+      );
+      store.close();
+    });
+
+    const idsOf = async (options: Record<string, unknown>): Promise<string[]> => {
+      const ctx = createMockContext();
+      const result = await service.search('ti:chronometry', { maxResults: 50, ...options }, ctx);
+      return result.papers.map((p) => p.id).sort();
+    };
+
+    it('bounds a window inclusively at both ends', async () => {
+      const ids = await idsOf({ submittedFrom: '2024-03-10', submittedTo: '2024-03-10' });
+      // Opens on the 00:00:00 record, and still holds the 23:59:30 one.
+      expect(ids).toEqual(['2403.00001v1', '2403.00002v1', '2403.00003v1']);
+      expect(ids).not.toContain('2403.00000v1');
+    });
+
+    it('reconstructs the unpartitioned set from adjacent windows, by record identity', async () => {
+      const whole = await idsOf({ submittedFrom: '2024-03-10', submittedTo: '2024-03-12' });
+      const first = await idsOf({ submittedFrom: '2024-03-10', submittedTo: '2024-03-10' });
+      const second = await idsOf({ submittedFrom: '2024-03-11', submittedTo: '2024-03-12' });
+
+      const union = [...new Set([...first, ...second])].sort();
+      // Coverage is the property under test: the union is the unpartitioned set,
+      // so no record falls between the windows.
+      expect(union).toEqual(whole);
+      // This split carries no record at its 2024-03-11T00:00:00Z seam, which is
+      // the only reason the halves are disjoint too. Asserted so the disjointness
+      // below rests on the fixture rather than reading as a property of windowing
+      // in general — a record sitting on a seam belongs to both halves by design,
+      // which `shares the boundary instant rather than dropping it` covers.
+      expect(Object.values(WINDOW_PAPERS)).not.toContain('2024-03-11T00:00:00Z');
+      expect(first.length + second.length).toBe(whole.length);
+      expect(first.filter((id) => second.includes(id))).toEqual([]);
+      // The canary: a `…2359` upper bound would strand this one in no window.
+      expect(whole).toContain('2403.00003v1');
+      expect(first).toContain('2403.00003v1');
+    });
+
+    it('shares the boundary instant rather than dropping it', async () => {
+      // arXiv's range includes both endpoints, so a record submitted at exactly
+      // midnight lands in both adjacent windows. A duplicate is the trade for
+      // never leaving a hole — the behavior is documented, not accidental.
+      const first = await idsOf({ submittedFrom: '2024-03-12', submittedTo: '2024-03-12' });
+      const second = await idsOf({ submittedFrom: '2024-03-13', submittedTo: '2024-03-13' });
+
+      expect(first).toContain('2403.00006v1');
+      expect(second).toContain('2403.00006v1');
+    });
+
+    it('honors an open-ended window on either side', async () => {
+      expect(await idsOf({ submittedFrom: '2024-03-12' })).toEqual([
+        '2403.00005v1',
+        '2403.00006v1',
+      ]);
+      // The shared boundary instant again: an upper bound of 2024-03-09 closes at
+      // 2024-03-10T00:00:00Z, which is exactly when 2403.00001 was submitted.
+      expect(await idsOf({ submittedTo: '2024-03-09' })).toEqual(['2403.00000v1', '2403.00001v1']);
+    });
+
+    it('narrows the result set the same way the live path would', async () => {
+      const unbounded = await idsOf({});
+      const windowed = await idsOf({ submittedFrom: '2024-03-11', submittedTo: '2024-03-12' });
+      expect(windowed.length).toBeLessThan(unbounded.length);
+      expect(unbounded).toEqual(expect.arrayContaining(windowed));
+    });
+
+    // Issue #20 acceptance on the mirror path: the echo names every filter that
+    // was applied, and replaying it as the bare query reproduces the same rows.
+    it('replays effective_query to the identical result set', async () => {
+      const ctx = createMockContext();
+      const original = await service.search(
+        'ti:chronometry',
+        {
+          maxResults: 50,
+          category: 'cs.LG',
+          submittedFrom: '2024-03-10',
+          submittedTo: '2024-03-12',
+        },
+        ctx,
+      );
+      expect(original.effective_query).toBe(
+        '(ti:chronometry) AND cat:cs.LG AND submittedDate:[202403100000 TO 202403130000]',
+      );
+
+      const replay = await service.search(original.effective_query, { maxResults: 50 }, ctx);
+
+      expect(replay.total_results).toBe(original.total_results);
+      expect(replay.papers.map((p) => p.id).sort()).toEqual(
+        original.papers.map((p) => p.id).sort(),
+      );
+      // The replay must be narrower than the same query with no filters at all,
+      // or "reproduces the result set" is passing for the wrong reason.
+      const unfiltered = await service.search('ti:chronometry', { maxResults: 50 }, ctx);
+      expect(replay.total_results).toBeLessThan(unfiltered.total_results);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Refresh-window readiness (#21) — an incremental or failed refresh on top of
   // a complete mirror must keep serving the existing dataset, not drop to the
   // throttled live API. Readiness keys off the durable completed_at marker,
