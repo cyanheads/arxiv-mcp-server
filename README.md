@@ -35,7 +35,7 @@ Four tools for searching and reading arXiv papers:
 |:----------|:------------|
 | `arxiv_search` | Search arXiv papers by query with category and sort filters. |
 | `arxiv_get_metadata` | Get full metadata for one or more arXiv papers by ID. |
-| `arxiv_read_paper` | Fetch the full text content of an arXiv paper from its HTML rendering. |
+| `arxiv_read_paper` | Fetch the full text content of an arXiv paper from its HTML rendering, or from the PDF when no render exists. |
 | `arxiv_list_categories` | List arXiv category taxonomy, optionally filtered by group. |
 
 ### `arxiv_search`
@@ -65,12 +65,12 @@ Fetch full metadata for one or more papers by known arXiv ID.
 
 ### `arxiv_read_paper`
 
-Read the full HTML content of an arXiv paper.
+Read the full body of an arXiv paper.
 
-- Tries native arXiv HTML first, falls back to ar5iv for broader coverage
+- Tries native arXiv HTML first, then ar5iv, then text extracted from the PDF — the `source` field reports which one answered
 - Strips HTML head/boilerplate and collapses MathML to dollar-delimited LaTeX (`$…$` inline, `$$…$$` block) so the character budget targets paper content
-- `max_characters` defaults to 100,000; raw HTML can be 500KB-3MB+ for math-heavy papers
-- Returns raw HTML — no parsing or extraction; the LLM interprets content directly
+- Returns raw HTML — no parsing or extraction; the LLM interprets content directly. PDF-extracted bodies are plain text: prose is reliable, but math, tables, and heading structure flatten
+- `max_characters` defaults to 100,000; pass `null` for the whole paper in one call. Raw HTML can be 500KB-3MB+ for math-heavy papers, which is more than most clients accept in a single tool result — page with `start` instead
 
 ---
 
@@ -105,7 +105,7 @@ arXiv-specific:
 - Rate-limited request queue enforcing arXiv's 3-second crawl delay
 - Adaptive cooldown on rate-limit (5s → 10s → 20s → 30s), honors `Retry-After`
 - Retry with exponential backoff for transient failures
-- HTML content fallback chain: native arXiv HTML → ar5iv
+- Content fallback chain: native arXiv HTML → ar5iv → PDF text extraction (both HTML renders run LaTeXML, so they tend to fail together; the PDF is the artifact every paper has, and it also covers an ar5iv outage rather than letting one fail the read)
 - Full arXiv category taxonomy embedded as static data
 - Optional local OAI-PMH metadata mirror (SQLite + FTS5) — opt-in, eliminates rate-limit exposure for `arxiv_search` and `arxiv_get_metadata`. See [Optional: Local Mirror](#optional-local-mirror).
 
@@ -171,7 +171,7 @@ All configuration is optional — the server works out of the box with sensible 
 |:---------|:------------|:--------|
 | `ARXIV_API_BASE_URL` | arXiv API base URL. | `https://export.arxiv.org/api` |
 | `ARXIV_REQUEST_DELAY_MS` | Minimum delay between arXiv API requests (ms). | `3000` |
-| `ARXIV_CONTENT_TIMEOUT_MS` | Timeout for HTML content fetches (ms). | `30000` |
+| `ARXIV_CONTENT_TIMEOUT_MS` | Timeout for paper body fetches — HTML renders and PDF downloads (ms). | `30000` |
 | `ARXIV_API_TIMEOUT_MS` | Timeout for API search/metadata requests (ms). | `15000` |
 | `ARXIV_MIRROR_ENABLED` | Enable local OAI-PMH metadata mirror for search and metadata. | `false` |
 | `ARXIV_MIRROR_PATH` | SQLite path for the mirror. | `./data/arxiv-mirror.db` |

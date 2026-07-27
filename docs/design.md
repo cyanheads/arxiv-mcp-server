@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|
 | `arxiv_search` | Search arXiv papers by query with category and sort filters. | `query`, `category?`, `max_results?`, `sort_by?`, `sort_order?`, `start?` | `readOnlyHint: true` |
 | `arxiv_get_metadata` | Get full metadata for one or more arXiv papers by ID. | `paper_ids` (string or string[]) | `readOnlyHint: true` |
-| `arxiv_read_paper` | Fetch the full text content of an arXiv paper from its HTML rendering. Falls back from native HTML to ar5iv. | `paper_id`, `max_characters?` | `readOnlyHint: true` |
+| `arxiv_read_paper` | Fetch the full text content of an arXiv paper. Falls back from native HTML to ar5iv to PDF text extraction. | `paper_id`, `max_characters?`, `start?` | `readOnlyHint: true` |
 | `arxiv_list_categories` | List arXiv category taxonomy, optionally filtered by group. | `group?` | `readOnlyHint: true` |
 
 ### Resources
@@ -32,6 +32,7 @@ An MCP server that wraps the arXiv academic paper repository, giving LLM agents 
 - **arXiv API** (`export.arxiv.org/api/query`) — Atom XML feed returning paper metadata. Supports boolean search across fields (title, author, abstract, category), pagination, and sorting.
 - **arXiv HTML** (`arxiv.org/html/{id}`) — Native LaTeXML-converted HTML of papers. Default for Dec 2023+ submissions; older papers back to ~2017 are being backfilled but coverage varies.
 - **ar5iv HTML** (`ar5iv.labs.arxiv.org/html/{id}`) — Community-maintained HTML5 conversion covering the full corpus. ~97% at least partial conversion.
+- **arXiv PDF** (`arxiv.org/pdf/{id}`) — The one artifact published for every paper. Text is extracted with the framework's `pdfParser` (lazy-loaded `unpdf`) and used only when neither HTML render exists.
 
 **Target users:** LLM agents doing academic research — literature discovery, paper reading, citation following, topic exploration.
 
@@ -224,7 +225,7 @@ z.object({
 
 ### `arxiv_read_paper`
 
-Fetch the full HTML content of an arXiv paper. Tries native arXiv HTML first, falls back to ar5iv. Returns the raw HTML body — no parsing or extraction. The LLM interprets the content directly.
+Fetch the full body of an arXiv paper. Tries native arXiv HTML first, falls back to ar5iv, then to text extracted from the PDF. HTML bodies are returned raw — no parsing or extraction — and the LLM interprets the content directly.
 
 **Input:**
 
@@ -232,15 +233,20 @@ Fetch the full HTML content of an arXiv paper. Tries native arXiv HTML first, fa
 z.object({
   paper_id: z.string()
     .describe('arXiv paper ID (e.g., "2401.12345" or "2401.12345v2").'),
-  max_characters: z.number().optional()
+  max_characters: z.number().int().min(1).nullable().default(100_000)
     .describe(
-      'Maximum characters of content to return. '
-      + 'Raw HTML can be 500KB-3MB+ for math-heavy papers. '
-      + 'Recommended: set a limit based on your context budget. '
+      'Maximum characters of paper body to return. '
+      + 'Defaults to 100,000; null returns the entire body in one call. '
+      + 'Raw HTML can be 500KB-3MB+ for math-heavy papers, which exceeds most '
+      + 'clients tool-result size caps — prefer the default plus start-based paging. '
       + 'When truncated, a notice and total character count are included.'
     ),
+  start: z.number().int().min(0).default(0)
+    .describe('Character offset into the cleaned body to begin reading from.'),
 })
 ```
+
+The bounded default is deliberate: a default-unlimited read would be rejected client-side on a large paper with no content delivered, whereas truncation still returns a usable slice plus a continue hint. Unbounded reads stay available, but only when the caller asks for one.
 
 **Output:**
 
@@ -248,13 +254,18 @@ z.object({
 z.object({
   paper_id: z.string().describe('arXiv paper ID.'),
   title: z.string().describe('Paper title (from metadata, not parsed from HTML).'),
-  content: z.string().describe('Raw HTML content of the paper.'),
-  source: z.enum(['arxiv_html', 'ar5iv'])
-    .describe('Which HTML source the content was fetched from.'),
+  content: z.string()
+    .describe('Paper body — cleaned HTML for arxiv_html/ar5iv, plain text for pdf_text.'),
+  source: z.enum(['arxiv_html', 'ar5iv', 'pdf_text'])
+    .describe('Which upstream artifact the body was read from.'),
   truncated: z.boolean()
     .describe('Whether content was truncated due to max_characters.'),
+  start: z.number()
+    .describe('Character offset of the first returned character within the cleaned body.'),
   total_characters: z.number()
-    .describe('Total character count of the full (untruncated) content.'),
+    .describe('Character count of the body before cleaning.'),
+  body_characters: z.number()
+    .describe('Character count of the full cleaned body — the upper bound for start.'),
   pdf_url: z.string()
     .describe('Direct PDF download URL.'),
   abstract_url: z.string()
@@ -269,8 +280,9 @@ z.object({
 | Failure | Code | Recovery guidance |
 |:--------|:-----|:-----------------|
 | Paper not found | `NotFound` | "Paper '{id}' not found. Verify the ID format." |
-| HTML not available (conversion failed) | `NotFound` | "HTML content not available for this paper. The PDF is available at {pdf_url}." |
-| arXiv/ar5iv unavailable | `ServiceUnavailable` | "Content service temporarily unavailable. Try again shortly." |
+| No HTML render and no PDF (`content_unavailable`) | `NotFound` | "Read the abstract via `arxiv_get_metadata` — no full-text artifact exists." |
+| PDF has no text layer (`pdf_extraction_failed`) | `NotFound` | "Download `error.data.pdfUrl` and run OCR, or read the abstract via `arxiv_get_metadata`." |
+| arXiv unavailable, or ar5iv unavailable with no PDF to cover for it | `ServiceUnavailable` | "Content service temporarily unavailable. Try again shortly." |
 
 ### `arxiv_list_categories`
 
@@ -312,7 +324,7 @@ z.object({
 |:-----|:-----------|:-----------|:--------------|
 | Paper (metadata) | Search by query | `export.arxiv.org/api/query?search_query=` | `arxiv_search` tool |
 | Paper (metadata) | Get by ID(s) | `export.arxiv.org/api/query?id_list=` | `arxiv_get_metadata` tool + `arxiv://paper/{id}` resource |
-| Paper (content) | Read full text | `arxiv.org/html/{id}` → `ar5iv.labs.arxiv.org/html/{id}` | `arxiv_read_paper` tool |
+| Paper (content) | Read full text | `arxiv.org/html/{id}` → `ar5iv.labs.arxiv.org/html/{id}` → `arxiv.org/pdf/{id}` | `arxiv_read_paper` tool |
 | Category | List taxonomy | Static data embedded in server | `arxiv_list_categories` tool + `arxiv://categories` resource |
 
 ---
@@ -370,9 +382,9 @@ class ArxivService {
 |:--------|:---------|
 | Retry boundary | `withRetry` wraps full pipeline: fetch + parse (XML) or fetch (HTML) |
 | Backoff calibration | 1s base for API calls (rate-limited service), 2s for HTML content (heavier pages) |
-| Rate limiting | Internal request queue enforcing 3-second delay between arXiv API calls. HTML fetches to separate domains (arxiv.org/html, ar5iv) don't share this queue — different hosts, no shared rate limit. |
+| Rate limiting | Internal request queue enforcing 3-second delay between arXiv API calls. Content fetches (arxiv.org/html, ar5iv, arxiv.org/pdf) hit other hosts and don't share this queue. A 429 from the PDF fetch is still classified as `rate_limited` and records the shared cooldown rather than being read as a missing PDF. |
 | Response classification | HTTP status first: 5xx → `ServiceUnavailable` (retried), 429 → `RateLimited`, other 4xx → `InvalidRequest`. Then, on a 2xx: an empty body → `ServiceUnavailable` (a transport symptom, retried); a non-XML body carrying `Rate exceeded.` → `RateLimited` (never retried, per the fail-fast policy); any other non-XML body → `SerializationError` (never retried). |
-| HTML fallback | `arxiv.org/html/{id}` first → on 404, try `ar5iv.labs.arxiv.org/html/{id}` → on non-200, throw NotFound |
+| Content fallback | `arxiv.org/html/{id}` first → on 404, try `ar5iv.labs.arxiv.org/html/{id}` → on any non-2xx, fetch `arxiv.org/pdf/{id}` and extract its text → throw NotFound only when the PDF is absent (`content_unavailable`) or holds no text layer (`pdf_extraction_failed`). Both HTML renders run LaTeXML, so they are not independent — a submission that breaks one usually breaks the other, which is why the PDF is the rung that widens coverage. An ar5iv 5xx, network error, or timeout does not end the chain: it is held and re-raised only when the PDF comes up empty too, so an outage on a third-party conversion service narrows coverage rather than failing the call. |
 | HTML 404 detection | arxiv.org returns clean HTTP 404. ar5iv returns 307 redirect to arxiv.org/abs (which then 404s) — don't follow redirects on ar5iv, treat 3xx as not-found. |
 | HTML page size | Raw HTML is 500KB-3MB+ for math-heavy papers. `max_characters` truncation keeps response size manageable. |
 | Timeout | API calls: 15s, HTML fetches: 30s. Surface as `ServiceUnavailable`. Pass `ctx.signal` to all `fetch()` calls for cancellation. |
@@ -451,10 +463,10 @@ This is a data-access server. The value is in search, metadata retrieval, and co
 
 ## Known Limitations
 
-- **HTML availability varies.** Native arXiv HTML is default for Dec 2023+ and backfill extends to older papers (~2017), but not all convert successfully. ar5iv covers more but ~3% of papers fail conversion entirely. Some papers have no HTML at all — the tool returns a NotFound with a PDF link fallback.
-- **Raw HTML responses are large.** Since we return unprocessed HTML, responses can be 500KB-3MB+ for math-heavy papers. The `max_characters` parameter is the only size control. LLMs handle HTML well, but callers should set reasonable limits for their context budget.
-- **No PDF text extraction.** The server does not parse PDFs. When HTML is unavailable, it returns the PDF URL and lets the consumer handle it. PDF extraction is complex, error-prone, and better handled by specialized tools.
-- **Rate limits are server-wide.** The 3-second delay is per arXiv API request across all concurrent tool calls, not per-agent. Under high concurrency, agents queue behind each other. This matches arXiv's policy but limits throughput. HTML fetches hit separate hosts (arxiv.org/html, ar5iv) and are not queued.
+- **HTML availability varies.** Native arXiv HTML is default for Dec 2023+ and backfill extends to older papers (~2017), but not all convert successfully. ar5iv covers more, though ~3% of papers fail conversion entirely — and because both run LaTeXML, they fail on largely the same submissions. Those papers are served from the PDF instead.
+- **PDF extraction is text-only.** Extraction reads the PDF's text layer: prose survives, but math, tables, and heading structure flatten into the reading order the PDF encodes. Scanned or image-only submissions have no text layer at all and fail with `pdf_extraction_failed` — no OCR, no structured section/reference parsing.
+- **Raw HTML responses are large.** Since we return unprocessed HTML, responses can be 500KB-3MB+ for math-heavy papers. `max_characters` plus `start` are the size controls; `max_characters: null` lifts the bound for callers that can absorb a whole paper. LLMs handle HTML well, but callers should set reasonable limits for their context budget.
+- **Rate limits are server-wide.** The 3-second delay is per arXiv API request across all concurrent tool calls, not per-agent. Under high concurrency, agents queue behind each other. This matches arXiv's policy but limits throughput. Content fetches hit separate hosts (arxiv.org/html, ar5iv, arxiv.org/pdf) and are not queued.
 - **Paper ID normalization.** The arXiv API always returns IDs with a version suffix (e.g., `2401.12345v1`). Inputs accept both `2401.12345` and `2401.12345v2` and are passed through to arXiv verbatim — `id_list` and the HTML endpoints both honor a version suffix. An ID that pins a version resolves only to that version: it never falls back to another version, and the mirror (which stores the latest version only) is a miss for it. An unversioned ID resolves to the latest version. Returned `id` fields always include the version, as do the `pdf_url` and `abstract_url` derived from them on both the mirror and live paths.
 - **Atom XML quirks.** The arXiv API returns HTTP 200 for all cases — empty results, not-found IDs, and rate limiting all return 200 with varying response bodies. Rate limiting returns plain text "Rate exceeded." (content-type `text/plain`, not XML) — must check content-type before parsing. Additional quirks: `<id>` uses `http://` while `<link>` uses `https://`; `<summary>` has leading/trailing whitespace; version suffix (`v1`, `v7`) is always present in `<id>` and must be stripped for base paper ID; `<arxiv:primary_category>` lacks the `scheme` attribute that `<category>` has.
 - **No real-time results.** arXiv updates daily. Search results reflect yesterday's index, not papers submitted today.

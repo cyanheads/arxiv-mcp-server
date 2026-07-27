@@ -47,7 +47,7 @@
         },
         {
           "name": "ARXIV_CONTENT_TIMEOUT_MS",
-          "description": "Timeout for HTML content fetches (ms).",
+          "description": "Timeout for paper body fetches — HTML renders and PDF downloads (ms).",
           "format": "string",
           "isRequired": false,
           "default": "30000"
@@ -104,7 +104,7 @@
         },
         {
           "name": "ARXIV_CONTENT_TIMEOUT_MS",
-          "description": "Timeout for HTML content fetches (ms).",
+          "description": "Timeout for paper body fetches — HTML renders and PDF downloads (ms).",
           "format": "string",
           "isRequired": false,
           "default": "30000"
