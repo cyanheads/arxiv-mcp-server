@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.5.0](changelog/1.5.x/1.5.0.md) — 2026-07-27
+
+arxiv_search's cat: query operand now expands the same way on both search paths, co:/jr: prefixes resolve on the mirror, and query cat: composes with the category parameter the way arXiv does (#36, #37); mirror schema v3 rebuilds its full-text index automatically in place
+
 ## [1.4.0](changelog/1.4.x/1.4.0.md) — 2026-07-27 · ⚠️ Breaking
 
 arxiv_read_paper falls back to PDF-text extraction when no HTML render exists, accepts max_characters: null for whole-paper reads, and no longer fails the whole chain on an ar5iv outage (#23, #24, #38)

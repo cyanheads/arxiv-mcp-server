@@ -1,6 +1,6 @@
 {
   "name": "arxiv-mcp-server",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads"
