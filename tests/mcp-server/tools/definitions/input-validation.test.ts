@@ -240,6 +240,17 @@ describe('arxivReadPaper input validation', () => {
     ).not.toThrow();
   });
 
+  it('accepts max_characters of null as the explicit whole-paper read', () => {
+    const input = arxivReadPaper.input.parse({ paper_id: '2401.12345', max_characters: null });
+    expect(input.max_characters).toBeNull();
+  });
+
+  it('rejects a non-integer max_characters', () => {
+    expect(() =>
+      arxivReadPaper.input.parse({ paper_id: '2401.12345', max_characters: 1.5 }),
+    ).toThrow();
+  });
+
   it('rejects negative start', () => {
     expect(() => arxivReadPaper.input.parse({ paper_id: '2401.12345', start: -1 })).toThrow();
   });

@@ -133,7 +133,7 @@ describe('arxivReadPaper', () => {
     expect(text).toContain('start=0');
   });
 
-  it('surfaces raw HTML and body character counts distinctly in the header', () => {
+  it('surfaces raw and cleaned body character counts distinctly in the header', () => {
     const mixed: PaperContent = {
       ...MOCK_CONTENT,
       total_characters: 150_000,
@@ -141,8 +141,61 @@ describe('arxivReadPaper', () => {
     };
     const blocks = arxivReadPaper.format?.(mixed) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('Raw HTML: 150000 chars');
+    expect(text).toContain('Raw: 150000 chars');
     expect(text).toContain('Body: 40000 chars');
+  });
+
+  it('passes max_characters: null through as an unbounded read (#24)', async () => {
+    mockReadContent.mockResolvedValue(MOCK_CONTENT);
+    const ctx = createMockContext({ errors: arxivReadPaper.errors! }) as Parameters<
+      typeof arxivReadPaper.handler
+    >[1];
+    const input = arxivReadPaper.input.parse({ paper_id: '2401.12345', max_characters: null });
+    await arxivReadPaper.handler(input, ctx);
+
+    expect(mockReadContent).toHaveBeenCalledWith(
+      '2401.12345',
+      { maxCharacters: null, start: 0 },
+      ctx,
+    );
+  });
+
+  it('defaults max_characters to 100,000 when omitted (#24)', async () => {
+    mockReadContent.mockResolvedValue(MOCK_CONTENT);
+    const ctx = createMockContext({ errors: arxivReadPaper.errors! }) as Parameters<
+      typeof arxivReadPaper.handler
+    >[1];
+    const input = arxivReadPaper.input.parse({ paper_id: '2401.12345' });
+    await arxivReadPaper.handler(input, ctx);
+
+    expect(mockReadContent).toHaveBeenCalledWith(
+      '2401.12345',
+      { maxCharacters: 100_000, start: 0 },
+      ctx,
+    );
+  });
+
+  it('flags PDF-extracted content with its fidelity caveat in the text block (#23)', () => {
+    const pdfText: PaperContent = {
+      ...MOCK_CONTENT,
+      content: 'Chip-Scale Rydberg Atomic Electrometer',
+      source: 'pdf_text',
+    };
+    const blocks = arxivReadPaper.format?.(pdfText) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Source: pdf_text');
+    expect(text).toContain('Extracted from the PDF');
+    expect(text).toContain('flattened');
+  });
+
+  it('omits the PDF caveat for HTML sources (#23)', () => {
+    const blocks = arxivReadPaper.format?.(MOCK_CONTENT) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Extracted from the PDF');
+  });
+
+  it('advertises pdf_text in the source output enum (#23)', () => {
+    expect(arxivReadPaper.output.shape.source.options).toEqual(['arxiv_html', 'ar5iv', 'pdf_text']);
   });
 
   it('formats without truncation notice when not truncated and start=0', () => {

@@ -6,10 +6,11 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
+import { PaperContentSourceSchema } from '@/services/arxiv/types.js';
 
 export const arxivReadPaper = tool('arxiv_read_paper', {
   description:
-    'Fetch the full text of an arXiv paper as HTML. Tries arxiv.org/html first; falls back to ar5iv.labs.arxiv.org when the native render is unavailable. PDF-only papers (no HTML render on either source) return an html_unavailable error with the pdf_url for direct download. Page through long papers with the start and max_characters parameters.',
+    'Fetch the full text of an arXiv paper. Tries arxiv.org/html first, falls back to ar5iv.labs.arxiv.org, and falls back again to text extracted from the PDF when neither has an HTML render — check the source field to know which one answered. Page through long papers with start and max_characters, or pass max_characters null to get the entire body in one call.',
   annotations: { readOnlyHint: true },
 
   errors: [
@@ -21,10 +22,18 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
         'Verify the paper ID format (e.g., "2401.12345") and confirm via arxiv_search before retrying.',
     },
     {
-      reason: 'html_unavailable',
+      reason: 'content_unavailable',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Paper exists but neither arxiv.org/html nor ar5iv has an HTML rendering; only the PDF is available.',
-      recovery: 'Use the pdf_url returned by arxiv_get_metadata to fetch the source PDF directly.',
+      when: 'Paper exists but neither arxiv.org/html nor ar5iv has an HTML rendering and arXiv served no PDF either.',
+      recovery:
+        'Read the abstract via arxiv_get_metadata, since no full-text artifact exists for this paper.',
+    },
+    {
+      reason: 'pdf_extraction_failed',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Paper has no HTML rendering and its PDF carries no text layer — an image-only or scanned submission.',
+      recovery:
+        'Download error.data.pdfUrl and run optical character recognition, or read the abstract via arxiv_get_metadata.',
     },
     {
       reason: 'version_unavailable',
@@ -60,9 +69,10 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       .number()
       .int()
       .min(1)
+      .nullable()
       .default(100_000)
       .describe(
-        'Maximum characters of paper body content to return. Defaults to 100,000. HTML head/boilerplate is stripped before counting. When truncated, a notice and total character count are included.',
+        'Maximum characters of paper body to return, counted after boilerplate stripping. Defaults to 100,000; pass null to return the entire body in one call. Whole-paper reads can exceed a client tool-result size cap — math-heavy bodies run 300KB-1MB+ — so prefer the default plus start-based paging unless the full text is needed. When truncated, a notice and the total character count are included.',
       ),
     start: z
       .number()
@@ -80,11 +90,9 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     content: z
       .string()
       .describe(
-        'Cleaned paper body HTML for the requested slice. Empty when start is past body_characters.',
+        'Paper body for the requested slice — cleaned HTML when source is arxiv_html or ar5iv, plain text when source is pdf_text. Empty when start is past body_characters.',
       ),
-    source: z
-      .enum(['arxiv_html', 'ar5iv'])
-      .describe('Which HTML source the content was fetched from.'),
+    source: PaperContentSourceSchema,
     truncated: z
       .boolean()
       .describe(
@@ -93,11 +101,15 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     start: z
       .number()
       .describe('Character offset of the first character in content within the cleaned body.'),
-    total_characters: z.number().describe('Character count of the original unprocessed HTML body.'),
+    total_characters: z
+      .number()
+      .describe(
+        'Character count of the body before cleaning — the unprocessed HTML body for arxiv_html and ar5iv, and equal to body_characters for pdf_text, which needs no cleaning.',
+      ),
     body_characters: z
       .number()
       .describe(
-        'Character count of the full cleaned body HTML. Use with start and max_characters to page. Typically 3-4× smaller than total_characters for math-heavy papers.',
+        'Character count of the full cleaned body. Use with start and max_characters to page. Typically 3-4× smaller than total_characters for math-heavy HTML papers.',
       ),
     pdf_url: z.string().describe('Direct PDF download URL.'),
     abstract_url: z.string().describe('arXiv abstract page URL for attribution.'),
@@ -125,10 +137,15 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       `# ${result.title}`,
       // Raw integer values in the header so both character counts are discoverable
       // by text-only clients (format-parity) without locale formatting interfering.
-      `arXiv:${result.paper_id} | Source: ${result.source} | Raw HTML: ${result.total_characters} chars | Body: ${result.body_characters} chars${result.truncated ? ' (truncated)' : ''}`,
+      `arXiv:${result.paper_id} | Source: ${result.source} | Raw: ${result.total_characters} chars | Body: ${result.body_characters} chars${result.truncated ? ' (truncated)' : ''}`,
       `Abstract: ${result.abstract_url}`,
       `PDF: ${result.pdf_url}`,
     ];
+    if (result.source === 'pdf_text') {
+      lines.push(
+        '\n[Extracted from the PDF — no HTML render exists for this paper. Prose is reliable; math, tables, and heading structure are flattened into plain text.]',
+      );
+    }
     const sliceEnd = result.start + result.content.length;
     if (result.start >= result.body_characters && result.body_characters > 0) {
       lines.push(

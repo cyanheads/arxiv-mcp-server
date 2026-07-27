@@ -288,26 +288,35 @@ describe('ArxivService.readContent — additional error paths', () => {
     });
   }, 30_000);
 
-  it('throws ServiceUnavailable when ar5iv returns 500', async () => {
-    mockFetch
-      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
-      // arxiv.org/html → 404 (falls through to ar5iv)
-      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
-      // ar5iv → 500 (two times to exhaust retry)
-      .mockResolvedValueOnce(new Response('Server Error', { status: 500 }))
-      .mockResolvedValueOnce(new Response('Server Error', { status: 500 }));
+  it('re-raises an ar5iv 500 when the PDF cannot cover for it', async () => {
+    // The chain continues past an ar5iv 500 to the PDF, but a paper arXiv
+    // serves no PDF for leaves ar5iv's outage as what actually happened —
+    // retryable, and not a content_unavailable verdict about a render ar5iv
+    // never answered for.
+    const attempt = (): Response[] => [
+      new Response('Not Found', { status: 404 }), // arxiv.org/html
+      new Response('Server Error', { status: 500 }), // ar5iv
+      new Response('Not Found', { status: 404 }), // arxiv.org/pdf
+    ];
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+    // Two attempts — withRetry replays the whole chain once (maxRetries=1).
+    for (const response of [...attempt(), ...attempt()]) mockFetch.mockResolvedValueOnce(response);
 
     const ctx = createMockContext();
     const service = getArxivService();
 
     await expect(service.readContent('2401.12345', {}, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
+      message: expect.stringContaining('ar5iv'),
     });
+    // Both attempts reached the PDF — the 500 no longer ends the chain.
+    expect(mockFetch).toHaveBeenCalledTimes(7);
   }, 30_000);
 
-  it('ar5iv 404 falls through to html_unavailable notFound, not ServiceUnavailable', async () => {
+  it('ar5iv 404 falls through to the PDF rung, then notFound — not ServiceUnavailable', async () => {
     mockFetch
       .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
       .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
       .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
 
@@ -316,6 +325,7 @@ describe('ArxivService.readContent — additional error paths', () => {
 
     await expect(service.readContent('2401.12345', {}, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'content_unavailable' },
     });
   });
 

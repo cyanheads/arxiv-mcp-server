@@ -93,6 +93,41 @@ function htmlResponse(html: string): Response {
   });
 }
 
+/**
+ * Build a minimal but genuinely parseable single-page PDF carrying `text`. Pass
+ * an empty string for the image-only (scanned) case, where a page exists but no
+ * text layer does. Hand-built rather than mocked so these tests exercise the
+ * real `unpdf` extraction the service depends on.
+ */
+function makePdfBytes(text: string): Uint8Array {
+  const stream = text ? `BT /F1 12 Tf 72 720 Td (${text}) Tj ET` : '';
+  const objects = [
+    '<</Type/Catalog/Pages 2 0 R>>',
+    '<</Type/Pages/Kids[3 0 R]/Count 1>>',
+    '<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>',
+    `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
+    '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>',
+  ];
+  let body = '%PDF-1.4\n';
+  const offsets: number[] = [];
+  objects.forEach((object, i) => {
+    offsets.push(body.length);
+    body += `${i + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefStart = body.length;
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) body += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  body += `trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\nstartxref\n${xrefStart}\n%%EOF\n`;
+  return new TextEncoder().encode(body);
+}
+
+function pdfResponse(text: string): Response {
+  return new Response(makePdfBytes(text), {
+    status: 200,
+    headers: { 'content-type': 'application/pdf' },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -1003,7 +1038,7 @@ describe('ArxivService.readContent', () => {
   });
 
   it('points the PDF fallback hint at the same version that was requested (issue #10)', async () => {
-    // When HTML is genuinely unavailable, the error message points the caller
+    // When no artifact is available at all, the error message points the caller
     // at the PDF — and that hint must match the version they asked for, not the
     // stripped form.
     const ATOM_V1 = `<?xml version="1.0" encoding="UTF-8"?>
@@ -1022,7 +1057,8 @@ describe('ArxivService.readContent', () => {
     mockFetch
       .mockResolvedValueOnce(atomResponse(ATOM_V1))
       .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
-      .mockResolvedValueOnce(new Response('', { status: 307 }));
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
 
     const ctx = createMockContext();
     const service = getArxivService();
@@ -1040,18 +1076,245 @@ describe('ArxivService.readContent', () => {
     await expect(service.readContent('9999.99999', {}, ctx)).rejects.toThrow(/not found/i);
   });
 
-  it('throws notFound when no HTML source is available', async () => {
+  it('throws content_unavailable when no HTML render and no PDF exist', async () => {
     mockFetch
       .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
       // arxiv.org/html returns 404
       .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
       // ar5iv returns 307 redirect (paper not converted)
-      .mockResolvedValueOnce(new Response('', { status: 307 }));
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      // the PDF is gone too — nothing left to read
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
 
     const ctx = createMockContext();
     const service = getArxivService();
 
-    await expect(service.readContent('2401.12345', {}, ctx)).rejects.toThrow(/not available/i);
+    await expect(service.readContent('2401.12345', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'content_unavailable' },
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // PDF text extraction fallback (issue #23)
+  // -------------------------------------------------------------------------
+
+  it('extracts PDF text when neither arxiv.org/html nor ar5iv has a render', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(pdfResponse('Chip-Scale Rydberg Atomic Electrometer'));
+
+    const ctx = createMockContext();
+    const result = await getArxivService().readContent('2401.12345', {}, ctx);
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('Chip-Scale Rydberg Atomic Electrometer');
+    expect(result.truncated).toBe(false);
+    // Extracted text needs no cleaning, so both counts describe the same string.
+    expect(result.total_characters).toBe(result.body_characters);
+    expect(result.pdf_url).toBe('http://arxiv.org/pdf/2401.12345v1');
+  });
+
+  it('fetches the PDF from the metadata pdf_url', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(pdfResponse('body'));
+
+    await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(String(mockFetch.mock.calls[3]?.[0])).toBe('http://arxiv.org/pdf/2401.12345v1');
+  });
+
+  it('leaves extracted text unstripped — no HTML cleaning is applied to PDF output', async () => {
+    // The LaTeXML strippers key off markup that plain PDF text never contains;
+    // running them would only risk mangling literal angle brackets in the prose.
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(pdfResponse('id=42 class=ltx_para retained'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.content).toContain('id=42 class=ltx_para retained');
+  });
+
+  it('pages extracted PDF text with start and max_characters', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(pdfResponse('abcdefghijklmnopqrstuvwxyz'));
+
+    const result = await getArxivService().readContent(
+      '2401.12345',
+      { maxCharacters: 5, start: 3 },
+      createMockContext(),
+    );
+
+    expect(result.start).toBe(3);
+    expect(result.content).toBe('defgh');
+    expect(result.truncated).toBe(true);
+    expect(result.body_characters).toBe(26);
+  });
+
+  it('treats an empty extraction as a failure, not an empty success', async () => {
+    // An image-only (scanned) PDF parses fine but yields no text layer.
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(pdfResponse(''));
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'pdf_extraction_failed', pdfUrl: 'http://arxiv.org/pdf/2401.12345v1' },
+    });
+  });
+
+  it('never reaches the PDF when arxiv.org/html serves a render', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse('<article><p>native content</p></article>'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('arxiv_html');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a 5xx from the PDF host and surfaces ServiceUnavailable', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(new Response('Server Error', { status: 500 }))
+      // withRetry replays the whole chain once (maxRetries=1)
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(new Response('Server Error', { status: 500 }));
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  }, 30_000);
+
+  it('reports a 429 from the PDF host as rate_limited, not as an absent PDF', async () => {
+    // A throttled PDF request says nothing about whether the paper has a PDF.
+    // Collapsing it into content_unavailable would tell the caller no full-text
+    // artifact exists and to stop trying — permanent advice for a transient state.
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(
+        new Response('Rate exceeded.', { status: 429, headers: { 'retry-after': '12' } }),
+      );
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: {
+        reason: 'rate_limited',
+        retryAfter: '12',
+        cooldownAppliedMs: 12_000,
+        consecutiveRateLimits: 1,
+        url: 'http://arxiv.org/pdf/2401.12345v1',
+      },
+    });
+    // Fail fast: isArxivTransient excludes RateLimited, so the chain is not replayed.
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  // -------------------------------------------------------------------------
+  // ar5iv outages fall through to the PDF (issue #38)
+  // -------------------------------------------------------------------------
+
+  it('falls through an ar5iv 502 to the PDF rather than ending the chain', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('Bad Gateway', { status: 502 }))
+      .mockResolvedValueOnce(pdfResponse('Rydberg electrometer'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('Rydberg electrometer');
+    expect(String(mockFetch.mock.calls[3]?.[0])).toBe('http://arxiv.org/pdf/2401.12345v1');
+  });
+
+  it('falls through an ar5iv network error to the PDF', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockRejectedValueOnce(Object.assign(new Error('ECONNREFUSED'), { name: 'Error' }))
+      .mockResolvedValueOnce(pdfResponse('served from the PDF'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('served from the PDF');
+  });
+
+  it('reports the ar5iv outage, not pdf_extraction_failed, when the PDF has no text layer', async () => {
+    // ar5iv never answered whether a render exists, so the permanent "no text
+    // layer — go OCR it" verdict would foreclose a retry that could still
+    // return the HTML render.
+    const attempt = (): Response[] => [
+      new Response('Not Found', { status: 404 }),
+      new Response('Bad Gateway', { status: 502 }),
+      pdfResponse(''),
+    ];
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+    for (const response of [...attempt(), ...attempt()]) mockFetch.mockResolvedValueOnce(response);
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // Unbounded reads (issue #24)
+  // -------------------------------------------------------------------------
+
+  it('returns the entire body when maxCharacters is null', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse(`<article>${'q'.repeat(250_000)}</article>`));
+
+    const result = await getArxivService().readContent(
+      '2401.12345',
+      { maxCharacters: null },
+      createMockContext(),
+    );
+
+    expect(result.content).toHaveLength(result.body_characters);
+    expect(result.body_characters).toBeGreaterThan(250_000);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('honors start alongside a null maxCharacters — reads to the end of the body', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(htmlResponse('abcdefghij'.repeat(10)));
+
+    const result = await getArxivService().readContent(
+      '2401.12345',
+      { maxCharacters: null, start: 40 },
+      createMockContext(),
+    );
+
+    expect(result.start).toBe(40);
+    expect(result.content).toHaveLength(result.body_characters - 40);
+    expect(result.truncated).toBe(false);
   });
 
   it('collapses inline MathML to TeX annotation, reclaiming character budget (issue #4)', async () => {

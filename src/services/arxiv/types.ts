@@ -82,8 +82,31 @@ export interface PaperLookupResult {
   papers: PaperMetadata[];
 }
 
+/**
+ * Which upstream artifact the paper body was read from. The tool layer advertises
+ * these verbatim as its `source` enum, so a value added here widens that tool's
+ * output schema.
+ *
+ * - `arxiv_html` — arXiv's own LaTeXML render at `arxiv.org/html/{id}`.
+ * - `ar5iv` — the ar5iv LaTeXML conversion at `ar5iv.labs.arxiv.org/html/{id}`.
+ * - `pdf_text` — text extracted from the PDF, used when neither render exists.
+ *   Both HTML pipelines run LaTeXML, so a submission that breaks one usually
+ *   breaks the other and the PDF is the only artifact left. See issue #23.
+ */
+export const PaperContentSourceSchema = z
+  .enum(['arxiv_html', 'ar5iv', 'pdf_text'])
+  .describe(
+    'Which upstream artifact the body was read from. arxiv_html and ar5iv are HTML renders; pdf_text is text extracted from the PDF, where prose is reliable but math, tables, and heading structure are flattened.',
+  );
+
+export type PaperContentSource = z.infer<typeof PaperContentSourceSchema>;
+
 export interface ReadContentOptions {
-  maxCharacters?: number;
+  /**
+   * Maximum characters of cleaned body to return. `null` returns the entire
+   * body; omitted leaves the bound to the caller (the tool layer defaults it).
+   */
+  maxCharacters?: number | null;
   /** Character offset into the cleaned body to begin the slice. Defaults to 0. */
   start?: number;
 }
@@ -94,7 +117,7 @@ export interface PaperContent {
   content: string;
   paper_id: string;
   pdf_url: string;
-  source: 'arxiv_html' | 'ar5iv';
+  source: PaperContentSource;
   /** Character offset of the first character in `content` within the cleaned body. */
   start: number;
   title: string;

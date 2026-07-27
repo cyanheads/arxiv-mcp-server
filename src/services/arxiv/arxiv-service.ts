@@ -19,6 +19,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import {
   httpErrorFromResponse,
+  pdfParser,
   type RequestContext,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
@@ -45,6 +46,7 @@ import {
 } from './mirror/index.js';
 import type {
   PaperContent,
+  PaperContentSource,
   PaperLookupMiss,
   PaperLookupResult,
   PaperMetadata,
@@ -756,7 +758,10 @@ export class ArxivService {
     };
   }
 
-  /** Fetch paper metadata + full HTML content. Tries native arXiv HTML, falls back to ar5iv. */
+  /**
+   * Fetch paper metadata plus the full paper body. Tries native arXiv HTML,
+   * then ar5iv, then text extracted from the PDF.
+   */
   async readContent(
     paperId: string,
     options: ReadContentOptions,
@@ -804,10 +809,10 @@ export class ArxivService {
       );
     }
 
-    // HTML fetch with its own retry (2s base delay for heavier pages).
+    // Body fetch with its own retry (2s base delay for heavier pages).
     // Same fail-fast-on-rate-limit policy as API calls — see isArxivTransient.
-    const { content, source } = await withRetry(() => this.fetchHtml(paper.id, ctx), {
-      operation: 'arxivFetchHtml',
+    const { content, source } = await withRetry(() => this.fetchBody(paper, ctx), {
+      operation: 'arxivFetchBody',
       context: ctx as unknown as RequestContext,
       signal: ctx.signal,
       isTransient: isArxivTransient,
@@ -815,11 +820,14 @@ export class ArxivService {
       baseDelayMs: 2000,
     });
 
-    // Strip <head> / site chrome, then strip LaTeXML class/id noise so
-    // max_characters buys real body content, not `ltx_text` wrappers.
-    const bodyContent = stripHtmlHead(content);
+    // HTML sources: strip <head> / site chrome, then strip LaTeXML class/id
+    // noise so max_characters buys real body content, not `ltx_text` wrappers.
+    // PDF-extracted text carries neither, so it passes through untouched and
+    // total_characters equals body_characters.
+    const isHtmlSource = source !== 'pdf_text';
+    const bodyContent = isHtmlSource ? stripHtmlHead(content) : content;
     const totalCharacters = bodyContent.length;
-    const cleaned = stripLatexmlNoise(bodyContent);
+    const cleaned = isHtmlSource ? stripLatexmlNoise(bodyContent) : bodyContent;
     const bodyCharacters = cleaned.length;
 
     const start = options.start ?? 0;
@@ -1034,14 +1042,24 @@ export class ArxivService {
   }
 
   // -------------------------------------------------------------------------
-  // Private — HTML content fetching
+  // Private — body content fetching
   // -------------------------------------------------------------------------
 
-  private async fetchHtml(
-    paperId: string,
+  /**
+   * Resolve a paper's body from the first upstream artifact that serves it:
+   * native arXiv HTML, then ar5iv, then text extracted from the PDF.
+   *
+   * The two HTML rungs are not independent — both arxiv.org/html and ar5iv run
+   * LaTeXML, so a submission whose LaTeX breaks one usually breaks the other and
+   * they fail together. The PDF is the one artifact arXiv publishes for every
+   * paper, which makes it the fallback that actually widens coverage. See #23.
+   */
+  private async fetchBody(
+    paper: PaperMetadata,
     ctx: Context,
-  ): Promise<{ content: string; source: 'arxiv_html' | 'ar5iv' }> {
+  ): Promise<{ content: string; source: PaperContentSource }> {
     const config = getServerConfig();
+    const paperId = paper.id;
     // Pass the paperId through verbatim — both arxiv.org/html and ar5iv honor a
     // version suffix when present (`/html/2401.12345v1` serves v1; bare ID serves
     // latest). Stripping unconditionally discarded the caller's intent when they
@@ -1079,10 +1097,20 @@ export class ArxivService {
       // 404 or other 4xx → fall through to ar5iv
     }
 
-    // Fallback to ar5iv — don't follow redirects (307 = paper not converted)
+    /**
+     * Fallback to ar5iv — don't follow redirects (307 = paper not converted).
+     *
+     * A failure of this rung never ends the chain. ar5iv is a third-party
+     * LaTeXML conversion service; whether it is up says nothing about whether
+     * arXiv can serve the PDF, which is the artifact every paper has. The error
+     * is held and re-raised only when the PDF rung also comes up empty — so a
+     * caller the PDF can serve is served, and one it can't still gets ar5iv's
+     * retryable error and the whole-chain replay `withRetry` gives it. See #38.
+     */
+    let ar5ivFailure: McpError | undefined;
     {
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
-      let response: Response;
+      let response: Response | undefined;
       try {
         response = await fetch(`https://ar5iv.labs.arxiv.org/html/${paperId}`, {
           signal,
@@ -1091,34 +1119,125 @@ export class ArxivService {
         });
       } catch (err) {
         if (ctx.signal.aborted) throw err;
-        if (err instanceof Error && err.name === 'TimeoutError') {
-          throw timeout(
-            `ar5iv timed out after ${config.contentTimeoutMs}ms`,
-            { paperId, timeoutMs: config.contentTimeoutMs },
-            { cause: err },
-          );
-        }
-        throw serviceUnavailable('ar5iv network error', { paperId }, { cause: err });
+        ar5ivFailure =
+          err instanceof Error && err.name === 'TimeoutError'
+            ? timeout(
+                `ar5iv timed out after ${config.contentTimeoutMs}ms`,
+                { paperId, timeoutMs: config.contentTimeoutMs },
+                { cause: err },
+              )
+            : serviceUnavailable('ar5iv network error', { paperId }, { cause: err });
       }
-      if (response.ok) return { content: await response.text(), source: 'ar5iv' };
-      if (response.status >= 500) {
-        throw await httpErrorFromResponse(response, {
+      if (response?.ok) return { content: await response.text(), source: 'ar5iv' };
+      if (response !== undefined && response.status >= 500) {
+        ar5ivFailure = await httpErrorFromResponse(response, {
           service: 'ar5iv',
           codeOverride: (s) =>
             s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
         });
       }
-      // 3xx or 4xx → not available
+      // 3xx or 4xx → not converted. Either way, on to the PDF.
     }
 
+    // Last rung: the PDF, extracted to plain text.
+    const pdfText = await this.fetchPdfText(paper, ctx);
+    if (pdfText !== undefined && pdfText.trim() !== '') {
+      return { content: pdfText, source: 'pdf_text' };
+    }
+    // The PDF did not cover for ar5iv, so report what ar5iv did rather than a
+    // verdict about the paper's artifacts that ar5iv never answered.
+    if (ar5ivFailure) throw ar5ivFailure;
+    if (pdfText === undefined) {
+      throw notFound(
+        `No readable content for paper '${paperId}': neither arxiv.org/html nor ar5iv has an HTML render, and arXiv served no PDF at ${paper.pdf_url}.`,
+        {
+          paperId,
+          pdfUrl: paper.pdf_url,
+          reason: 'content_unavailable',
+          ...ctx.recoveryFor('content_unavailable'),
+        },
+      );
+    }
     throw notFound(
-      `HTML content not available for paper '${paperId}'. The PDF is available at https://arxiv.org/pdf/${paperId}`,
+      `Paper '${paperId}' has no HTML render, and its PDF yielded no extractable text — the file is image-only (scanned) or carries no text layer. Download it at ${paper.pdf_url}.`,
       {
         paperId,
-        reason: 'html_unavailable',
-        ...ctx.recoveryFor('html_unavailable'),
+        pdfUrl: paper.pdf_url,
+        reason: 'pdf_extraction_failed',
+        ...ctx.recoveryFor('pdf_extraction_failed'),
       },
     );
+  }
+
+  /**
+   * Download the paper's PDF and extract its text via the framework's
+   * `pdfParser` (lazy-loaded `unpdf`). Returns `undefined` when arXiv answers
+   * that it has no PDF (4xx other than 429), so the caller can distinguish "no
+   * artifact at all" from "PDF held no extractable text" and report the one
+   * that happened. A 429 is not an absent artifact — it is the same throttle
+   * `fetchApi` classifies, so it is raised as `rate_limited` rather than
+   * collapsing into a `content_unavailable` that would tell the caller the
+   * paper has no full text.
+   *
+   * The extracted string is plain text: prose survives intact, while math,
+   * tables, and heading structure flatten into the reading order the PDF
+   * encodes.
+   */
+  private async fetchPdfText(paper: PaperMetadata, ctx: Context): Promise<string | undefined> {
+    const config = getServerConfig();
+    const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
+
+    let response: Response;
+    try {
+      response = await fetch(paper.pdf_url, {
+        signal,
+        headers: { 'user-agent': USER_AGENT, accept: 'application/pdf' },
+      });
+    } catch (err) {
+      if (ctx.signal.aborted) throw err;
+      if (err instanceof Error && err.name === 'TimeoutError') {
+        throw timeout(
+          `arXiv PDF timed out after ${config.contentTimeoutMs}ms`,
+          { paperId: paper.id, timeoutMs: config.contentTimeoutMs },
+          { cause: err },
+        );
+      }
+      throw serviceUnavailable('arXiv PDF network error', { paperId: paper.id }, { cause: err });
+    }
+
+    if (!response.ok) {
+      if (response.status >= 500) {
+        throw await httpErrorFromResponse(response, {
+          service: 'arxiv.org/pdf',
+          codeOverride: (s) =>
+            s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
+        });
+      }
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('retry-after');
+        const parsedMs = retryAfter !== null ? parseRetryAfter(retryAfter) : null;
+        const cooldownAppliedMs = this.recordRateLimit(parsedMs ?? undefined);
+        throw rateLimited(this.rateLimitMessage(cooldownAppliedMs), {
+          paperId: paper.id,
+          url: paper.pdf_url,
+          status: response.status,
+          ...(retryAfter !== null && { retryAfter }),
+          cooldownAppliedMs,
+          consecutiveRateLimits: this.consecutiveRateLimits,
+          reason: 'rate_limited',
+          ...ctx.recoveryFor('rate_limited'),
+        });
+      }
+      return;
+    }
+
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const { text } = await pdfParser.extractText(
+      bytes,
+      { mergePages: true },
+      ctx as unknown as RequestContext,
+    );
+    return typeof text === 'string' ? text : text.join('\n\n');
   }
 
   // -------------------------------------------------------------------------
