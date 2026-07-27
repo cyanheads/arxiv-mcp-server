@@ -155,7 +155,7 @@ const PaperMetadataSchema = z.object({
 
 #### Category resolution
 
-A `category` filter names either one taxonomy leaf or a whole archive, and both search paths resolve it from the same derived taxonomy so they cannot disagree:
+A category filter names either one taxonomy leaf or a whole archive, and both search paths resolve it from the same derived taxonomy so they cannot disagree. This holds for the `category` parameter and for a `cat:` operand written inside `query` — the two are separate filters, but one code means one set:
 
 | Input | Live `search_query` operand | Mirror category filter |
 |:------|:----------------------------|:-----------------------|
@@ -167,6 +167,10 @@ A `category` filter names either one taxonomy leaf or a whole archive, and both 
 A bare archive code covers the legacy flat papers filed before the archive was subdivided — 105,380 of them under `astro-ph` alone, which a subject-class-only expansion drops. `physics` resolves to the general-physics archive (`physics.*`), not the wider physics group; `astro-ph`, `cond-mat`, `hep-*` and `quant-ph` are separate archive codes.
 
 **Decision — a bare code means its archive, not its display group.** `physics` is the only code that is both an archive and a taxonomy group. Resolving it as the archive is what `cat:physics*` returns upstream, so live and mirror agree exactly; resolving it as the group would have required a thirteen-way `OR` on the live path and still diverged on cross-listed papers.
+
+**Decision — a `cat:` operand inside `query` expands the same way the `category` parameter does.** The parameter always did; the operand did not. The mirror lifted it out and expanded it through the taxonomy, while the live path forwarded it verbatim to an API that matches a bare archive code literally — `cat:cs` reaches nothing at all upstream, because arXiv never assigns the bare group name, and `cat:astro-ph` reaches only the legacy flat papers. One input therefore meant a broader or narrower set depending on whether the mirror happened to be enabled and harvested, with nothing in the response telling the caller which they got. `buildSearchQuery` now rewrites each `cat:` operand to the operand `categorySearchTerm` produces before the query leaves for arXiv. The rewrite is confined to `cat:` — every other byte reaches arXiv as written — and a leaf code, a standalone archive, and an already-wildcarded operand all rewrite to themselves. `effective_query` carries the rewritten form, so the echo still says what was actually searched, and replaying it reproduces the same rows. See [#36](https://github.com/cyanheads/arxiv-mcp-server/issues/36).
+
+**Decision — a query `cat:` and the `category` parameter are separate filters, intersected.** They are independent inputs, and the live path has always AND-ed them (`(… cat:X …) AND cat:Y`). The mirror merged both into a single OR-ed set, so supplying both *widened* its result set while the same pair narrowed arXiv's. The mirror now passes them as separate category groups — codes OR-ed within a group, groups AND-ed — so a paper has to carry a code from each, and two filters that cannot both be satisfied return nothing on either path instead of everything matching either one.
 
 #### Exhaustive retrieval past the offset ceiling
 
@@ -496,6 +500,8 @@ This is a data-access server. The value is in search, metadata retrieval, and co
 | `jr` | Journal ref | `jr:Nature` |
 | `cat` | Category | `cat:cs.AI` |
 | `all` | All fields | `all:transformer` |
+
+Every prefix in this table resolves on the mirror path too. `ti` / `au` / `abs` / `co` / `jr` map to the five columns of the `papers_fts` index (`comment` and `journal_ref` joined it in schema v3 — FTS5 has no `ALTER TABLE`, so the upgrade drops the index and its sync triggers and rebuilds both from the rows already stored); `all` fans out across all five, and an unprefixed term reaches them all the same way, as it does upstream. `cat` never reaches FTS at all — it is lifted into a structured filter against the `paper_categories` junction table. See [#37](https://github.com/cyanheads/arxiv-mcp-server/issues/37).
 
 ### HTML Content URLs
 
