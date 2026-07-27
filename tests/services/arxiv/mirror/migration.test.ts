@@ -10,6 +10,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { MIRROR_SCHEMA_VERSION } from '@/services/arxiv/mirror/schema.js';
 import { MirrorStore, normalizeDateToIso, rawToRow } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
 
@@ -197,7 +198,7 @@ describe('v1→v2 migration', () => {
 
     // Junction table is populated — category filter returns correct papers.
     const clResult = store.search({
-      categoryFilters: ['cs.CL'],
+      categoryGroups: [['cs.CL']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -208,7 +209,7 @@ describe('v1→v2 migration', () => {
 
     // stat.ML — only attn (1706.03762).
     const mlResult = store.search({
-      categoryFilters: ['stat.ML'],
+      categoryGroups: [['stat.ML']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -217,15 +218,12 @@ describe('v1→v2 migration', () => {
     expect(mlResult.total).toBe(1);
     expect(mlResult.papers[0]?.id).toBe('1706.03762');
 
-    // Schema version updated to 2.
+    // A v1 DB is carried all the way to the current schema in one open.
+    expect(store.schemaVersion()).toEqual({
+      current: MIRROR_SCHEMA_VERSION,
+      expected: MIRROR_SCHEMA_VERSION,
+    });
     store.close();
-    const { Database } = await import('bun:sqlite');
-    const db = new Database(dbPath);
-    const ver = db
-      .prepare(`SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`)
-      .get() as { version: number } | undefined;
-    db.close();
-    expect(ver?.version).toBe(2);
   });
 
   it('migration is idempotent — opening a v2 DB again is a no-op', async () => {
@@ -273,7 +271,7 @@ describe('v1→v2 migration', () => {
     const store = await MirrorStore.open(dbPath);
     // Empty DB — no papers yet, so category search returns 0.
     const result = store.search({
-      categoryFilters: ['cs.LG'],
+      categoryGroups: [['cs.LG']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -281,6 +279,251 @@ describe('v1→v2 migration', () => {
     });
     expect(result.total).toBe(0);
     expect(result.papers).toEqual([]);
+    store.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2 → v3 migration (issue #37) — comment and journal_ref join the FTS index.
+// ---------------------------------------------------------------------------
+
+/** The v2 FTS index and its triggers, verbatim, as a pre-migration fixture. */
+const V2_FTS_SQL = `
+CREATE VIRTUAL TABLE papers_fts USING fts5(
+  title,
+  authors,
+  abstract,
+  content='papers',
+  content_rowid='rowid',
+  tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
+);
+CREATE TRIGGER papers_ai AFTER INSERT ON papers BEGIN
+  INSERT INTO papers_fts(rowid, title, authors, abstract)
+  VALUES (new.rowid, new.title, new.authors, new.abstract);
+END;
+CREATE TRIGGER papers_ad AFTER DELETE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract);
+END;
+CREATE TRIGGER papers_au AFTER UPDATE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract);
+  INSERT INTO papers_fts(rowid, title, authors, abstract)
+  VALUES (new.rowid, new.title, new.authors, new.abstract);
+END;
+`;
+
+describe('v2→v3 migration (#37)', () => {
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-migration-v3-test-'));
+    dbPath = join(dir, 'mirror.db');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const V2_RECORDS: ArxivRawRecord[] = [
+    mkRecord({
+      paper_id: '2101.00001',
+      title: 'Sparse Attention at Scale',
+      categories: 'cs.LG',
+      comments: 'Accepted at ICML 2021, 12 pages',
+      journal_ref: 'Nature Physics 17 (2021) 123',
+    }),
+    mkRecord({
+      paper_id: '2101.00002',
+      title: 'A paper with no publication metadata',
+      categories: 'cs.LG',
+    }),
+  ];
+
+  /**
+   * Build a DB carrying the v2 shape: rows already present, `papers_fts`
+   * indexing only title/authors/abstract, v2 triggers, schema_version = 2. The
+   * store writes the rows first so `papers` matches a real harvested mirror;
+   * the index is then rebuilt from them through the v2 DDL.
+   */
+  async function buildV2Db(records: ArxivRawRecord[] = V2_RECORDS): Promise<void> {
+    const store = await MirrorStore.open(dbPath);
+    store.applyBatch(records, []);
+    store.close();
+
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.exec(`
+      DROP TRIGGER papers_ai;
+      DROP TRIGGER papers_ad;
+      DROP TRIGGER papers_au;
+      DROP TABLE papers_fts;
+      ${V2_FTS_SQL}
+      INSERT INTO papers_fts(rowid, title, authors, abstract)
+        SELECT rowid, title, authors, abstract FROM papers;
+      DELETE FROM schema_version;
+      INSERT INTO schema_version(version, applied_at) VALUES (2, '2025-06-01T00:00:00.000Z');
+    `);
+    db.close();
+  }
+
+  async function ftsColumns(): Promise<string[]> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    const cols = db.prepare(`PRAGMA table_info(papers_fts)`).all() as { name: string }[];
+    db.close();
+    return cols.map((c) => c.name);
+  }
+
+  const idsFor = (store: MirrorStore, matchExpr: string): string[] =>
+    store
+      .search({ matchExpr, limit: 10, offset: 0, sortBy: 'relevance', sortOrder: 'descending' })
+      .papers.map((p) => p.id);
+
+  it('leaves a v2 mirror unable to answer co:/jr: before the upgrade', async () => {
+    // The premise of the migration: on the v2 index these columns do not exist,
+    // so routing a prefix at them is an error rather than an empty result.
+    await buildV2Db();
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    expect(() =>
+      db.prepare(`SELECT rowid FROM papers_fts WHERE papers_fts MATCH 'comment:"ICML"'`).all(),
+    ).toThrow(/no such column: comment/);
+    db.close();
+  });
+
+  it('rebuilds the index with comment and journal_ref and makes existing rows searchable', async () => {
+    await buildV2Db();
+
+    const store = await MirrorStore.open(dbPath);
+    expect(store.schemaVersion()).toEqual({
+      current: MIRROR_SCHEMA_VERSION,
+      expected: MIRROR_SCHEMA_VERSION,
+    });
+    // Rows harvested under v2 are searchable on the new prefixes without a
+    // re-harvest — the index is rebuilt from the content table.
+    expect(idsFor(store, 'comment:"ICML"')).toEqual(['2101.00001']);
+    expect(idsFor(store, 'journal_ref:"Nature"')).toEqual(['2101.00001']);
+    // …and the columns the v2 index already carried still resolve.
+    expect(idsFor(store, 'title:"Sparse"')).toEqual(['2101.00001']);
+    store.close();
+
+    expect(await ftsColumns()).toEqual(['title', 'authors', 'abstract', 'comment', 'journal_ref']);
+  });
+
+  it('recreates the sync triggers so post-migration writes keep the index current', async () => {
+    // A v2 trigger left in place would enumerate three columns against a
+    // five-column index: every subsequent write drifts silently.
+    await buildV2Db();
+    const store = await MirrorStore.open(dbPath);
+
+    store.applyBatch(
+      [
+        mkRecord({
+          paper_id: '2101.00003',
+          title: 'Inserted after the upgrade',
+          comments: 'Presented at NeurIPS',
+          journal_ref: 'JMLR 24 (2023) 1',
+        }),
+      ],
+      [],
+    );
+    expect(idsFor(store, 'comment:"NeurIPS"')).toEqual(['2101.00003']);
+    expect(idsFor(store, 'journal_ref:"JMLR"')).toEqual(['2101.00003']);
+
+    // Update: the old indexed comment must go, the new one must land.
+    store.applyBatch(
+      [
+        mkRecord({
+          paper_id: '2101.00003',
+          title: 'Inserted after the upgrade',
+          comments: 'Withdrawn by the authors',
+        }),
+      ],
+      [],
+    );
+    expect(idsFor(store, 'comment:"NeurIPS"')).toEqual([]);
+    expect(idsFor(store, 'comment:"Withdrawn"')).toEqual(['2101.00003']);
+    expect(idsFor(store, 'journal_ref:"JMLR"')).toEqual([]);
+
+    // Delete: the row leaves the index entirely.
+    store.applyBatch([], [{ paper_id: '2101.00003' }]);
+    expect(idsFor(store, 'comment:"Withdrawn"')).toEqual([]);
+
+    expect(store.integrityCheck().ok).toBe(true);
+    store.close();
+  });
+
+  it('is idempotent — a re-run over an already-rebuilt index does not duplicate rows', async () => {
+    await buildV2Db();
+    const first = await MirrorStore.open(dbPath);
+    first.close();
+
+    // Simulate a run killed after the refill but before the version write: the
+    // index is fully populated and schema_version is still 2, so the next open
+    // repeats the whole migration.
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.exec(`
+      DELETE FROM schema_version;
+      INSERT INTO schema_version(version, applied_at) VALUES (2, '2025-06-01T00:00:00.000Z');
+    `);
+    db.close();
+
+    const second = await MirrorStore.open(dbPath);
+    const result = second.search({
+      matchExpr: 'comment:"ICML"',
+      limit: 10,
+      offset: 0,
+      sortBy: 'relevance',
+      sortOrder: 'descending',
+    });
+    expect(result.total).toBe(1);
+    expect(result.papers.map((p) => p.id)).toEqual(['2101.00001']);
+    expect(second.integrityCheck().ok).toBe(true);
+    expect(second.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
+    second.close();
+  });
+
+  it('carries a v1 database through both migrations in one open', async () => {
+    await buildV2Db();
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.exec(`
+      UPDATE papers SET published = 'Wed, 31 Oct 2018 14:58:30 GMT',
+                        updated   = 'Wed, 31 Oct 2018 14:58:30 GMT';
+      DELETE FROM paper_categories;
+      DELETE FROM schema_version;
+      INSERT INTO schema_version(version, applied_at) VALUES (1, '2025-01-01T00:00:00.000Z');
+    `);
+    db.close();
+
+    const store = await MirrorStore.open(dbPath);
+    // v2's work: ISO dates and a populated junction table.
+    expect(store.getPapersByIds(['2101.00001'])[0]?.published).toBe('2018-10-31T14:58:30.000Z');
+    expect(
+      store.search({
+        categoryGroups: [['cs.LG']],
+        limit: 10,
+        offset: 0,
+        sortBy: 'updated',
+        sortOrder: 'descending',
+      }).total,
+    ).toBe(2);
+    // v3's work: the new columns are indexed.
+    expect(idsFor(store, 'journal_ref:"Nature"')).toEqual(['2101.00001']);
+    expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
+    store.close();
+  });
+
+  it('upgrades an empty mirror without touching harvest state', async () => {
+    await buildV2Db([]);
+    const store = await MirrorStore.open(dbPath);
+    expect(store.countPapers()).toBe(0);
+    expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
+    expect(store.readHarvestState().status).toBe('pending');
+    expect(await ftsColumns()).toEqual(['title', 'authors', 'abstract', 'comment', 'journal_ref']);
     store.close();
   });
 });
@@ -457,7 +700,7 @@ describe('category-only query (issue #19)', () => {
   it('returns exact set for single-category filter (no LIKE heuristic)', () => {
     seed();
     const result = store.search({
-      categoryFilters: ['cs.LG'],
+      categoryGroups: [['cs.LG']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -470,7 +713,7 @@ describe('category-only query (issue #19)', () => {
   it('total for category-only query matches paper count', () => {
     seed();
     const result = store.search({
-      categoryFilters: ['stat.ML'],
+      categoryGroups: [['stat.ML']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -483,7 +726,7 @@ describe('category-only query (issue #19)', () => {
   it('multi-category OR filter: paper appears once even if it matches both', () => {
     seed();
     const result = store.search({
-      categoryFilters: ['cs.CL', 'cs.LG'],
+      categoryGroups: [['cs.CL', 'cs.LG']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -498,7 +741,7 @@ describe('category-only query (issue #19)', () => {
     seed();
     // cs.L should not match cs.LG or cs.CL
     const result = store.search({
-      categoryFilters: ['cs.L'],
+      categoryGroups: [['cs.L']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -510,7 +753,7 @@ describe('category-only query (issue #19)', () => {
   it('category-only result is in date-descending order', () => {
     seed();
     const result = store.search({
-      categoryFilters: ['cs.LG'],
+      categoryGroups: [['cs.LG']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -523,7 +766,7 @@ describe('category-only query (issue #19)', () => {
   it('single-category ascending returns oldest-updated first', () => {
     seed();
     const result = store.search({
-      categoryFilters: ['cs.LG'],
+      categoryGroups: [['cs.LG']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',

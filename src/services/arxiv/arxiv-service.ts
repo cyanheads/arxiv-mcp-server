@@ -38,6 +38,7 @@ import {
   submittedDateClause,
 } from './date-window.js';
 import {
+  expandCategoryOperands,
   getStore,
   type MirrorStore,
   openStore,
@@ -436,13 +437,19 @@ async function tryReadyMirror(ctx: Context): Promise<{ store: MirrorStore } | un
  * implicit conjunction between bare terms — "mixture of experts AND cat:cs.CL"
  * parses as "mixture ∧ of ∧ (experts AND cat:cs.CL)", leaking earlier terms
  * across all categories.
+ *
+ * Any `cat:` operand the caller wrote is expanded to its subtree first, so it
+ * carries the meaning the mirror has always given it and the tool's `query`
+ * description has always advertised (issue #36). Everything else in the query
+ * reaches arXiv exactly as written.
  */
 function buildSearchQuery(query: string, options: SearchOptions): string {
+  const expanded = expandCategoryOperands(query);
   const clauses = [
     options.category ? categorySearchTerm(options.category) : undefined,
     submittedDateClause(options.submittedFrom, options.submittedTo),
   ].filter((clause): clause is string => clause !== undefined);
-  return clauses.length === 0 ? query : `(${query}) AND ${clauses.join(' AND ')}`;
+  return clauses.length === 0 ? expanded : `(${expanded}) AND ${clauses.join(' AND ')}`;
 }
 
 /**
@@ -607,6 +614,12 @@ export class ArxivService {
    * syntax, applies category-subtree expansion, and merges any tool-level
    * `options.category` / submitted-date window into the structured filter set.
    *
+   * The query's own `cat:` operands and `options.category` stay separate
+   * category groups rather than one merged set: the live path AND-s the two
+   * (`(… cat:X …) AND cat:Y`), so folding them into a single OR-ed set would
+   * make the same pair of inputs widen the result set here while narrowing it
+   * there.
+   *
    * `effectiveQuery` is the string {@link buildSearchQuery} produced for this
    * call — echoed back unchanged so the mirror reports the same applied filters
    * the live path would. The mirror's own translator understands every operand
@@ -621,10 +634,10 @@ export class ArxivService {
     ctx: Context,
   ): SearchResult {
     const translated = translateQuery(query);
-    const categoryFilters = new Set(translated.categoryFilters);
-    if (options.category) {
-      for (const c of categorySubtree(options.category)) categoryFilters.add(c);
-    }
+    const categoryGroups = [
+      translated.categoryFilters,
+      options.category ? categorySubtree(options.category) : [],
+    ].filter((group) => group.length > 0);
     const published = intersectBounds(
       translated.published,
       submittedDateBounds(options.submittedFrom, options.submittedTo),
@@ -640,7 +653,7 @@ export class ArxivService {
     try {
       ({ papers, total } = store.search({
         ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
-        categoryFilters: [...categoryFilters],
+        categoryGroups,
         ...(published.from !== undefined && { publishedFrom: published.from }),
         ...(published.to !== undefined && { publishedTo: published.to }),
         limit,
@@ -671,7 +684,7 @@ export class ArxivService {
       total,
       returned: papers.length,
       matchExpr: translated.matchExpr,
-      categoryFilters: [...categoryFilters],
+      categoryGroups,
       publishedFrom: published.from,
       publishedTo: published.to,
     });

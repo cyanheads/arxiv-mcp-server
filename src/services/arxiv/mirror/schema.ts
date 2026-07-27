@@ -13,10 +13,56 @@
  *     category-only COUNT and membership lookups index-backed; the trailing
  *     `updated` lets a single-category browse page in date order without a
  *     sort or a papers-table scan.
+ *
+ * v3 changes (issue #37):
+ *   - `papers_fts` indexes `comment` and `journal_ref` alongside title,
+ *     authors, and abstract, so the documented `co:` and `jr:` field prefixes
+ *     resolve on the mirror path the way they already do on the live API.
+ *     FTS5 has no `ALTER TABLE`, so the migration drops and rebuilds the index
+ *     and its sync triggers — see `migrateToV3` in `store.ts`.
  * @module services/arxiv/mirror/schema
  */
 
-export const MIRROR_SCHEMA_VERSION = 2;
+export const MIRROR_SCHEMA_VERSION = 3;
+
+/**
+ * The FTS5 index and its `papers` sync triggers. Split out of the main schema
+ * so the v3 migration can drop and recreate them from this single definition
+ * rather than a transcribed copy that would drift on the next column change.
+ *
+ * The triggers enumerate their columns explicitly, so every column added here
+ * has to be added to all three of them — a column missing from a trigger leaves
+ * the index silently diverging from `papers` on the next write.
+ */
+export const MIRROR_FTS_SQL = `
+CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
+  title,
+  authors,
+  abstract,
+  comment,
+  journal_ref,
+  content='papers',
+  content_rowid='rowid',
+  tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
+);
+
+CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
+  INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+END;
+
+CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+END;
+
+CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+END;
+`;
 
 export const MIRROR_SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -48,31 +94,7 @@ CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_categor
 CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published);
 CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
-  title,
-  authors,
-  abstract,
-  content='papers',
-  content_rowid='rowid',
-  tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
-);
-
-CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
-  INSERT INTO papers_fts(rowid, title, authors, abstract)
-  VALUES (new.rowid, new.title, new.authors, new.abstract);
-END;
-
-CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
-  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract);
-END;
-
-CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
-  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract);
-  INSERT INTO papers_fts(rowid, title, authors, abstract)
-  VALUES (new.rowid, new.title, new.authors, new.abstract);
-END;
+${MIRROR_FTS_SQL}
 
 -- Junction table: one row per (paper, category) pair, with the paper's ISO
 -- updated value denormalized in. Enables index-backed category filtering

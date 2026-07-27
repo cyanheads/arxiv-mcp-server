@@ -1,14 +1,18 @@
 /**
  * @fileoverview arXiv query syntax → FTS5 translator with category-subtree
- * expansion. Parses field prefixes (`ti:`, `au:`, `abs:`, `cat:`, `all:`),
- * boolean operators (`AND`, `OR`, `ANDNOT`), quoted phrases, and parens.
- * Extracts `cat:` operands into a structured filter so they apply against
- * the indexed category columns instead of FTS, and `submittedDate:[… TO …]`
- * into ISO bounds on the indexed `published` column.
+ * expansion. Parses field prefixes (`ti:`, `au:`, `abs:`, `cat:`, `co:`, `jr:`,
+ * `all:`), boolean operators (`AND`, `OR`, `ANDNOT`), quoted phrases, and
+ * parens. Extracts `cat:` operands into a structured filter so they apply
+ * against the indexed category columns instead of FTS, and
+ * `submittedDate:[… TO …]` into ISO bounds on the indexed `published` column.
+ *
+ * Also exports {@link expandCategoryOperands}, the live path's counterpart to
+ * the `cat:` subtree expansion this translator applies — one lexer, so a `cat:`
+ * operand means the same thing whichever backend answers.
  * @module services/arxiv/mirror/query
  */
 
-import { categorySubtree } from '../categories.js';
+import { categorySearchTerm, categorySubtree } from '../categories.js';
 import { intersectBounds, stampToIso } from '../date-window.js';
 
 /** Result of translating an arXiv-syntax query to mirror inputs. */
@@ -25,11 +29,23 @@ export interface TranslatedQuery {
   published: { from?: string; to?: string };
 }
 
-type Token =
-  | { kind: 'and' | 'or' | 'andnot' | 'lparen' | 'rparen' }
-  | { kind: 'daterange'; from: string; to: string }
-  | { kind: 'field'; field: 'ti' | 'au' | 'abs' | 'cat' | 'all'; value: string; phrase: boolean }
-  | { kind: 'term'; value: string; phrase: boolean };
+/** Field prefixes the lexer recognizes. Anything else stays a bare term. */
+type Field = 'ti' | 'au' | 'abs' | 'cat' | 'co' | 'jr' | 'all';
+
+/** Source span `[start, end)` every token carries, so a rewrite can splice
+ * one operand out of the original string and leave the rest byte-identical. */
+interface Span {
+  end: number;
+  start: number;
+}
+
+type Token = Span &
+  (
+    | { kind: 'and' | 'or' | 'andnot' | 'lparen' | 'rparen' }
+    | { kind: 'daterange'; from: string; to: string }
+    | { kind: 'field'; field: Field; value: string; phrase: boolean }
+    | { kind: 'term'; value: string; phrase: boolean }
+  );
 
 /**
  * arXiv's submitted-date range operand. Only a fully-formed clause with two
@@ -38,19 +54,32 @@ type Token =
  */
 const DATE_RANGE_PATTERN = /^submittedDate:\[\s*(\d{12})\s+TO\s+(\d{12})\s*\]/i;
 
-const FIELD_MAP: Record<string, 'ti' | 'au' | 'abs' | 'cat' | 'all'> = {
+const FIELD_MAP: Record<string, Field> = {
   ti: 'ti',
   au: 'au',
   abs: 'abs',
   cat: 'cat',
+  co: 'co',
+  jr: 'jr',
   all: 'all',
 };
 
-const FTS_COLUMN: Record<'ti' | 'au' | 'abs', string> = {
+/**
+ * Prefix → `papers_fts` column. Every entry here has to be an indexed column of
+ * the FTS5 table (schema v3 indexes all five) — routing a prefix at a column
+ * outside the index raises `no such column` at query time, not at build time.
+ */
+const FTS_COLUMN: Record<Exclude<Field, 'cat' | 'all'>, string> = {
   ti: 'title',
   au: 'authors',
   abs: 'abstract',
+  co: 'comment',
+  jr: 'journal_ref',
 };
+
+/** Columns `all:` fans out across — the whole FTS index, matching arXiv's own
+ * all-fields prefix. */
+const ALL_COLUMNS: readonly string[] = Object.values(FTS_COLUMN);
 
 // ---------------------------------------------------------------------------
 // Lexer
@@ -60,25 +89,26 @@ function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   while (i < input.length) {
+    const start = i;
     const ch = input[i] ?? '';
     if (/\s/.test(ch)) {
       i++;
       continue;
     }
     if (ch === '(') {
-      tokens.push({ kind: 'lparen' });
       i++;
+      tokens.push({ kind: 'lparen', start, end: i });
       continue;
     }
     if (ch === ')') {
-      tokens.push({ kind: 'rparen' });
       i++;
+      tokens.push({ kind: 'rparen', start, end: i });
       continue;
     }
     const rangeMatch = DATE_RANGE_PATTERN.exec(input.slice(i));
     if (rangeMatch?.[1] && rangeMatch[2]) {
-      tokens.push({ kind: 'daterange', from: rangeMatch[1], to: rangeMatch[2] });
       i += rangeMatch[0].length;
+      tokens.push({ kind: 'daterange', from: rangeMatch[1], to: rangeMatch[2], start, end: i });
       continue;
     }
     // Look for word followed by `:` (field prefix), allow quoted value
@@ -90,7 +120,7 @@ function tokenize(input: string): Token[] {
         i += fieldMatch[0].length;
         const { value, phrase, consumed } = consumeValue(input, i);
         i += consumed;
-        tokens.push({ kind: 'field', field, value, phrase });
+        tokens.push({ kind: 'field', field, value, phrase, start, end: i });
         continue;
       }
     }
@@ -100,18 +130,18 @@ function tokenize(input: string): Token[] {
     if (value.length === 0) continue;
     const upper = value.toUpperCase();
     if (upper === 'AND' && !phrase) {
-      tokens.push({ kind: 'and' });
+      tokens.push({ kind: 'and', start, end: i });
       continue;
     }
     if (upper === 'OR' && !phrase) {
-      tokens.push({ kind: 'or' });
+      tokens.push({ kind: 'or', start, end: i });
       continue;
     }
     if (upper === 'ANDNOT' && !phrase) {
-      tokens.push({ kind: 'andnot' });
+      tokens.push({ kind: 'andnot', start, end: i });
       continue;
     }
-    tokens.push({ kind: 'term', value, phrase });
+    tokens.push({ kind: 'term', value, phrase, start, end: i });
   }
   return tokens;
 }
@@ -191,7 +221,7 @@ export function translateQuery(query: string): TranslatedQuery {
         if (t.field === 'cat') break;
         if (t.field === 'all') {
           const v = quoteFtsValue(t.value, t.phrase);
-          ftsParts.push(`(title:${v} OR authors:${v} OR abstract:${v})`);
+          ftsParts.push(`(${ALL_COLUMNS.map((col) => `${col}:${v}`).join(' OR ')})`);
         } else {
           ftsParts.push(`${FTS_COLUMN[t.field]}:${quoteFtsValue(t.value, t.phrase)}`);
         }
@@ -211,6 +241,34 @@ export function translateQuery(query: string): TranslatedQuery {
     categoryFilters: [...categoryFilters],
     published,
   };
+}
+
+/**
+ * Rewrite every `cat:` operand in a query string to the operand
+ * {@link categorySearchTerm} produces, leaving the rest of the string
+ * byte-identical.
+ *
+ * arXiv matches a bare `cat:` code literally: `cat:astro-ph` reaches only the
+ * legacy flat papers filed under that exact string, and `cat:cs` reaches
+ * nothing at all, because arXiv never assigns the bare group name. The mirror
+ * has always read the same operand as its whole subtree. Expanding here gives
+ * the live path the subtree the `category` parameter already gets, so one
+ * `cat:` operand means one thing regardless of which backend answers — which is
+ * also what the tool's `query` description has always claimed. See issue #36.
+ *
+ * A leaf code, a standalone archive, and an already-wildcarded operand all
+ * rewrite to themselves. `translateQuery` needs no counterpart because it
+ * expands `cat:` through the same taxonomy on the way into its category filter.
+ */
+export function expandCategoryOperands(query: string): string {
+  let out = '';
+  let cursor = 0;
+  for (const t of tokenize(query)) {
+    if (t.kind !== 'field' || t.field !== 'cat') continue;
+    out += query.slice(cursor, t.start) + categorySearchTerm(t.value);
+    cursor = t.end;
+  }
+  return cursor === 0 ? query : out + query.slice(cursor);
 }
 
 function isBoolOp(s: string | undefined): boolean {

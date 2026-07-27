@@ -1,4 +1,4 @@
--- arxiv-mcp-server OAI-PMH mirror schema v2 (issues #18 + #19)
+-- arxiv-mcp-server OAI-PMH mirror schema v3 (issues #18 + #19 + #37)
 -- Created by SqliteAdapter.migrate(); kept under source control for review.
 
 PRAGMA journal_mode = WAL;
@@ -35,7 +35,9 @@ CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published);
 CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated);
 
 -- ---------------------------------------------------------------------------
--- papers_fts — full-text index over title, authors, abstract.
+-- papers_fts — full-text index over title, authors, abstract, comment, and
+-- journal_ref. The last two arrived in v3 so the documented `co:` and `jr:`
+-- prefixes resolve on the mirror as they do on the live API (issue #37).
 -- Tokenizer pinned: unicode61 with diacritic stripping and hyphen/underscore
 -- preserved (issue #12 decision). No stemming — keeps results aligned with
 -- arXiv's literal-match behavior.
@@ -44,27 +46,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
   title,
   authors,
   abstract,
+  comment,
+  journal_ref,
   content='papers',
   content_rowid='rowid',
   tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
 );
 
--- Sync triggers so writes to `papers` propagate to the FTS index.
+-- Sync triggers so writes to `papers` propagate to the FTS index. Every column
+-- of papers_fts must appear in all three, or the index diverges from `papers`
+-- on the next write.
 CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
-  INSERT INTO papers_fts(rowid, title, authors, abstract)
-  VALUES (new.rowid, new.title, new.authors, new.abstract);
+  INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
 END;
 
 CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
-  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract);
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
 END;
 
 CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
-  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract);
-  INSERT INTO papers_fts(rowid, title, authors, abstract)
-  VALUES (new.rowid, new.title, new.authors, new.abstract);
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
 END;
 
 -- ---------------------------------------------------------------------------

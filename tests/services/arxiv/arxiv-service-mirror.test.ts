@@ -608,6 +608,158 @@ describe('ArxivService — mirror integration', () => {
       expect(result.papers).toHaveLength(1);
       expect(result.papers[0]?.id).toBe('2401.10001v1');
     });
+
+    // -----------------------------------------------------------------------
+    // Issue #37 — co: and jr: were advertised in the query description, worked
+    // on the live path, and matched nothing here.
+    // -----------------------------------------------------------------------
+
+    describe('co: and jr: prefixes (#37)', () => {
+      beforeEach(async () => {
+        const store = await MirrorStore.open(configOverrides.mirrorPath);
+        store.applyBatch(
+          [
+            mkRecord({
+              paper_id: '2401.10003',
+              title: 'Mirror Paper Three on Optimization',
+              abstract: 'Convergence bounds for stochastic solvers.',
+              categories: 'math.OC',
+              comments: 'Accepted at ICML 2021, 12 pages',
+              journal_ref: 'Nature Physics 17 (2021) 123',
+            }),
+          ],
+          [],
+        );
+        store.close();
+      });
+
+      const idsFor = async (query: string): Promise<string[]> => {
+        const ctx = createMockContext();
+        const result = await service.search(query, { maxResults: 10 }, ctx);
+        expect(mockFetch).not.toHaveBeenCalled();
+        return result.papers.map((p) => p.id);
+      };
+
+      it('resolves a comment search', async () => {
+        expect(await idsFor('co:ICML')).toEqual(['2401.10003v1']);
+      });
+
+      it('resolves a journal-ref search', async () => {
+        expect(await idsFor('jr:Nature')).toEqual(['2401.10003v1']);
+      });
+
+      it('keeps a quoted comment value a single phrase', async () => {
+        expect(await idsFor('co:"12 pages"')).toEqual(['2401.10003v1']);
+        expect(await idsFor('co:"pages 12"')).toEqual([]);
+      });
+
+      it('composes with the other prefixes and with cat:', async () => {
+        expect(await idsFor('co:ICML AND jr:Nature')).toEqual(['2401.10003v1']);
+        expect(await idsFor('co:ICML AND cat:math.OC')).toEqual(['2401.10003v1']);
+        expect(await idsFor('co:ICML AND cat:cs.LG')).toEqual([]);
+        expect(await idsFor('co:ICML OR ti:transformers')).toEqual(
+          expect.arrayContaining(['2401.10003v1', '2401.10001v1']),
+        );
+      });
+
+      it('reaches the comment from all: and from a bare term', async () => {
+        expect(await idsFor('all:ICML')).toEqual(['2401.10003v1']);
+        expect(await idsFor('ICML')).toEqual(['2401.10003v1']);
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Issue #36 — a cat: operand in the query text means the same subtree on
+    // both paths, and stays an independent filter from the category parameter.
+    // -----------------------------------------------------------------------
+
+    describe('cat: in query text (#36)', () => {
+      it('reads a bare archive code in the query as its whole subtree', async () => {
+        const ctx = createMockContext();
+        // 2401.10002 is filed under astro-ph.CO; 9901.00001 under bare astro-ph.
+        const result = await service.search('cat:astro-ph', { maxResults: 10 }, ctx);
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(result.papers.map((p) => p.id).sort()).toEqual(['2401.10002v3']);
+      });
+
+      it('sends the expanded operand to the live API and echoes what it sent', async () => {
+        configOverrides.mirrorEnabled = false;
+        resetStore();
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+        const ctx = createMockContext();
+        const result = await service.search('ti:attention AND cat:cs', { maxResults: 10 }, ctx);
+
+        const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+        // A bare `cat:cs` matches nothing upstream — arXiv never assigns the
+        // bare group name — so the operand has to carry the subtree.
+        expect(url.searchParams.get('search_query')).toBe('ti:attention AND cat:cs*');
+        expect(result.effective_query).toBe('ti:attention AND cat:cs*');
+      });
+
+      it('spells out an archive whose wildcard would leak a neighbour', async () => {
+        configOverrides.mirrorEnabled = false;
+        resetStore();
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+        const ctx = createMockContext();
+        await service.search('cat:math', { maxResults: 10 }, ctx);
+
+        const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+        expect(url.searchParams.get('search_query')).toBe('(cat:math.* OR cat:math)');
+      });
+
+      it('leaves a leaf code and the rest of the query untouched', async () => {
+        configOverrides.mirrorEnabled = false;
+        resetStore();
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+        const ctx = createMockContext();
+        await service.search(
+          'au:"hinton g" AND cat:cs.LG ANDNOT ti:survey',
+          { maxResults: 10 },
+          ctx,
+        );
+
+        const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+        expect(url.searchParams.get('search_query')).toBe(
+          'au:"hinton g" AND cat:cs.LG ANDNOT ti:survey',
+        );
+      });
+
+      it('intersects a query cat: with the category parameter rather than widening', async () => {
+        // 2401.10001 is cs.LG + cs.AI; 2401.10002 is astro-ph.CO. Asking for
+        // cs.AI in the query and astro-ph in the parameter must match neither.
+        const ctx = createMockContext();
+        const both = await service.search(
+          'cat:cs.AI',
+          { maxResults: 10, category: 'astro-ph' },
+          ctx,
+        );
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(both.papers).toEqual([]);
+
+        // The same pair on a paper carrying a code from each group does match.
+        const overlap = await service.search(
+          'cat:cs.AI',
+          { maxResults: 10, category: 'cs.LG' },
+          ctx,
+        );
+        expect(overlap.papers.map((p) => p.id)).toEqual(['2401.10001v1']);
+      });
+
+      it('composes the two filters into one coherent live query', async () => {
+        configOverrides.mirrorEnabled = false;
+        resetStore();
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+        const ctx = createMockContext();
+        const result = await service.search(
+          'cat:cs.AI',
+          { maxResults: 10, category: 'astro-ph' },
+          ctx,
+        );
+
+        // Both operands survive, AND-ed — the same intersection the mirror applies.
+        expect(result.effective_query).toBe('(cat:cs.AI) AND cat:astro-ph*');
+      });
+    });
   });
 
   // -------------------------------------------------------------------------

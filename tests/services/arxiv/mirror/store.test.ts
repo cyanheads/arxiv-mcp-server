@@ -65,7 +65,7 @@ describe('MirrorStore', () => {
 
     const result = store.search({
       matchExpr: '"protein"',
-      categoryFilters: [],
+      categoryGroups: [],
       limit: 10,
       offset: 0,
       sortBy: 'relevance',
@@ -92,6 +92,139 @@ describe('MirrorStore', () => {
     expect(store.getPapersByIds(['9912.30001'])).toEqual([]);
   });
 
+  // Issue #37 — comment and journal_ref joined the FTS index in schema v3, so
+  // the documented co: / jr: prefixes have a column to route at.
+  describe('comment and journal_ref in the FTS index (#37)', () => {
+    const seedAnnotated = () =>
+      store.applyBatch(
+        [
+          mkRecord({
+            paper_id: 'annotated',
+            title: 'A paper with publication metadata',
+            comments: 'Accepted at ICML 2021, 12 pages',
+            journal_ref: 'Nature Physics 17 (2021) 123',
+          }),
+          mkRecord({ paper_id: 'bare', title: 'A paper with no publication metadata' }),
+        ],
+        [],
+      );
+
+    const idsFor = (matchExpr: string): string[] =>
+      store
+        .search({ matchExpr, limit: 10, offset: 0, sortBy: 'relevance', sortOrder: 'descending' })
+        .papers.map((p) => p.id);
+
+    it('matches a comment term through the comment column', () => {
+      seedAnnotated();
+      expect(idsFor('comment:"ICML"')).toEqual(['annotated']);
+      expect(idsFor('comment:"12 pages"')).toEqual(['annotated']);
+    });
+
+    it('matches a journal reference through the journal_ref column', () => {
+      seedAnnotated();
+      expect(idsFor('journal_ref:"Nature"')).toEqual(['annotated']);
+    });
+
+    it('keeps the columns distinct rather than pooling every field', () => {
+      seedAnnotated();
+      expect(idsFor('comment:"Nature"')).toEqual([]);
+      expect(idsFor('journal_ref:"ICML"')).toEqual([]);
+    });
+
+    it('reaches the new columns from an unqualified term, as arXiv does', () => {
+      seedAnnotated();
+      expect(idsFor('"ICML"')).toEqual(['annotated']);
+    });
+
+    it('leaves the columns empty for a paper with no comment or journal ref', () => {
+      seedAnnotated();
+      // No match, and no error — a NULL column is indexed as empty text.
+      expect(idsFor('comment:"anything"')).toEqual([]);
+    });
+
+    // The sync triggers enumerate their columns, so a trigger that missed the
+    // two new ones would leave the index frozen at the first-inserted values.
+    it('keeps the index in sync when a comment changes', () => {
+      seedAnnotated();
+      store.applyBatch(
+        [
+          mkRecord({
+            paper_id: 'annotated',
+            title: 'A paper with publication metadata',
+            comments: 'Withdrawn by the authors',
+            journal_ref: 'Nature Physics 17 (2021) 123',
+          }),
+        ],
+        [],
+      );
+      expect(idsFor('comment:"ICML"')).toEqual([]);
+      expect(idsFor('comment:"Withdrawn"')).toEqual(['annotated']);
+      expect(idsFor('journal_ref:"Nature"')).toEqual(['annotated']);
+    });
+
+    it('drops the indexed comment when the paper is tombstoned', () => {
+      seedAnnotated();
+      store.applyBatch([], [{ paper_id: 'annotated' }]);
+      expect(idsFor('comment:"ICML"')).toEqual([]);
+      expect(idsFor('journal_ref:"Nature"')).toEqual([]);
+    });
+  });
+
+  // Issue #36 — a `cat:` operand in the query text and the `category` parameter
+  // are independent filters that the live path AND-s together. Merging them into
+  // one OR-ed set would make the same inputs widen the result set here.
+  describe('category groups are AND-ed (#36)', () => {
+    beforeEach(() => {
+      store.applyBatch(
+        [
+          mkRecord({ paper_id: 'both', categories: 'cs.LG stat.ML' }),
+          mkRecord({ paper_id: 'lg-only', categories: 'cs.LG' }),
+          mkRecord({ paper_id: 'ml-only', categories: 'stat.ML' }),
+        ],
+        [],
+      );
+    });
+
+    const search = (categoryGroups: string[][]) =>
+      store
+        .search({
+          categoryGroups,
+          limit: 10,
+          offset: 0,
+          sortBy: 'updated',
+          sortOrder: 'descending',
+        })
+        .papers.map((p) => p.id)
+        .sort();
+
+    it('intersects two groups instead of unioning them', () => {
+      expect(search([['cs.LG'], ['stat.ML']])).toEqual(['both']);
+    });
+
+    it('still ORs codes within one group', () => {
+      expect(search([['cs.LG', 'stat.ML']])).toEqual(['both', 'lg-only', 'ml-only']);
+    });
+
+    it('counts the intersection, not the union', () => {
+      const result = store.search({
+        categoryGroups: [['cs.LG'], ['stat.ML']],
+        limit: 10,
+        offset: 0,
+        sortBy: 'updated',
+        sortOrder: 'descending',
+      });
+      expect(result.total).toBe(1);
+    });
+
+    it('returns nothing when the groups cannot both be satisfied', () => {
+      expect(search([['cs.LG'], ['astro-ph.CO']])).toEqual([]);
+    });
+
+    it('ignores an empty group rather than filtering everything out', () => {
+      expect(search([['cs.LG'], []])).toEqual(['both', 'lg-only']);
+    });
+  });
+
   it('matches category filters against primary or secondary tokens', () => {
     store.applyBatch(
       [
@@ -102,7 +235,7 @@ describe('MirrorStore', () => {
       [],
     );
     const result = store.search({
-      categoryFilters: ['stat.ML'],
+      categoryGroups: [['stat.ML']],
       limit: 10,
       offset: 0,
       sortBy: 'updated',
@@ -166,7 +299,7 @@ describe('MirrorStore', () => {
       // Same shape that would otherwise take the junction-index fast path:
       // one category, no FTS term, non-published sort.
       const result = store.search({
-        categoryFilters: ['cs.LG'],
+        categoryGroups: [['cs.LG']],
         publishedFrom: '2024-03-10T00:00:00.000Z',
         publishedTo: '2024-03-11T00:00:00.000Z',
         limit: 10,

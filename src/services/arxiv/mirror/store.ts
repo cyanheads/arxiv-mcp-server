@@ -7,7 +7,13 @@
  *   - `rawToRow` normalizes version dates to ISO 8601.
  *   - `paper_categories` junction table populated in `applyBatch`; enables
  *     index-backed category COUNT and ORDER BY.
- *   - `MirrorStore.open` runs an in-place v1→v2 backfill for existing DBs.
+ *
+ * Schema v3 (issue #37):
+ *   - `papers_fts` gains `comment` and `journal_ref`, backing the `co:` and
+ *     `jr:` query prefixes.
+ *
+ * `MirrorStore.open` runs the in-place migrations an existing DB still needs,
+ * in order, before returning the handle.
  * @module services/arxiv/mirror/store
  */
 
@@ -15,7 +21,7 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { databaseError } from '@cyanheads/mcp-ts-core/errors';
 import { runtimeCaps } from '@cyanheads/mcp-ts-core/utils';
-import { MIRROR_SCHEMA_SQL, MIRROR_SCHEMA_VERSION } from './schema.js';
+import { MIRROR_FTS_SQL, MIRROR_SCHEMA_SQL, MIRROR_SCHEMA_VERSION } from './schema.js';
 import type { ArxivRawRecord, HarvestState, PaperRow } from './types.js';
 
 /**
@@ -118,8 +124,15 @@ export class MirrorStore {
         )
         .get();
       const storedVersion = stored?.version ?? 0;
-      if (storedVersion < MIRROR_SCHEMA_VERSION) {
+      // Each step's version is written only after it returns, so an interrupted
+      // upgrade resumes at the step it died in on the next open.
+      if (storedVersion < 2) {
         migrateToV2(db);
+        writeSchemaVersion(db, 2);
+      }
+      if (storedVersion < 3) {
+        migrateToV3(db);
+        writeSchemaVersion(db, 3);
       }
       return new MirrorStore(db);
     } catch (err) {
@@ -288,10 +301,14 @@ export class MirrorStore {
    * arXiv-syntax lexer accepts — specifically, it inserts explicit `AND` at any
    * boundary where implicit conjunction would cross a parenthesized form
    * (see issue #13). Callers still wrap this in a SQLite-error catch for
-   * defense in depth — see `ArxivService.searchMirror`. `categoryFilters` are
-   * expanded category codes (subtree expansion handled upstream); each
-   * is matched via the `paper_categories` junction table (index-backed —
-   * see issue #19).
+   * defense in depth — see `ArxivService.searchMirror`.
+   *
+   * `categoryGroups` holds expanded category codes (subtree expansion handled
+   * upstream), matched via the `paper_categories` junction table (index-backed —
+   * see issue #19). Codes within a group are OR-ed; groups are AND-ed, which is
+   * how the live API composes a `cat:` operand in the query text with the
+   * `category` parameter's own operand — a paper must carry a code from every
+   * group. One group per independent filter the caller supplied.
    *
    * `publishedFrom` / `publishedTo` bound `papers.published` inclusively (the
    * `papers_published_idx` index backs the range). They are ISO 8601 instants in
@@ -302,7 +319,7 @@ export class MirrorStore {
    * submitted exactly on the seam falls in both neighbours. See `date-window.ts`.
    */
   search(options: {
-    categoryFilters?: readonly string[];
+    categoryGroups?: readonly (readonly string[])[];
     limit: number;
     matchExpr?: string;
     offset: number;
@@ -311,8 +328,7 @@ export class MirrorStore {
     sortBy: 'relevance' | 'published' | 'updated';
     sortOrder: 'ascending' | 'descending';
   }): { papers: PaperRow[]; total: number } {
-    const hasCats = (options.categoryFilters?.length ?? 0) > 0;
-    const cats = options.categoryFilters ?? [];
+    const groups = (options.categoryGroups ?? []).filter((g) => g.length > 0);
     const hasDateWindow = options.publishedFrom !== undefined || options.publishedTo !== undefined;
     const dir = options.sortOrder === 'ascending' ? 'ASC' : 'DESC';
 
@@ -327,15 +343,15 @@ export class MirrorStore {
       papersParams.push(options.matchExpr);
     }
 
-    if (hasCats) {
-      // Category filtering via the junction table: index-backed exact match.
-      // Multiple categories expand to OR — a paper matches if ANY of the
-      // requested categories appears in its junction rows.
-      const placeholders = cats.map(() => '?').join(', ');
+    // Category filtering via the junction table: index-backed exact match. One
+    // subquery per group, AND-ed by the surrounding WHERE — a paper matches when
+    // it carries at least one code from each group.
+    for (const group of groups) {
+      const placeholders = group.map(() => '?').join(', ');
       papersWhere.push(
         `papers.id IN (SELECT paper_id FROM paper_categories WHERE category IN (${placeholders}))`,
       );
-      papersParams.push(...cats);
+      papersParams.push(...group);
     }
 
     if (options.publishedFrom !== undefined) {
@@ -350,23 +366,25 @@ export class MirrorStore {
     const whereClause = papersWhere.length > 0 ? `WHERE ${papersWhere.join(' AND ')}` : '';
 
     // -------------------------------------------------------------------------
-    // COUNT — category-only path uses a direct junction query to avoid a
-    // full papers-table scan (issue #19). Combined FTS + category path scans
-    // the FTS result set (already narrow) intersected with the junction.
+    // COUNT — the single-group category-only path uses a direct junction query
+    // to avoid a full papers-table scan (issue #19). Every other shape (an FTS
+    // term, a date window, or a second category group to intersect against)
+    // takes the generic papers-table COUNT below.
     // -------------------------------------------------------------------------
+    const soleGroup = groups.length === 1 ? groups[0] : undefined;
     let total: number;
-    if (hasCats && !options.matchExpr && !hasDateWindow) {
+    if (soleGroup && !options.matchExpr && !hasDateWindow) {
       // Pure category filter: COUNT directly on the junction, which is indexed
       // on category. Multiple categories → UNION on primary keys (no dups).
-      if (cats.length === 1) {
+      if (soleGroup.length === 1) {
         const row = this.db
           .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM paper_categories WHERE category = ?`)
-          .get(cats[0]);
+          .get(soleGroup[0]);
         total = row?.n ?? 0;
       } else {
         // UNION removes duplicates across categories so a paper in cs.LG AND
         // cs.AI counts once.
-        const placeholders = cats.map(() => '?').join(', ');
+        const placeholders = soleGroup.map(() => '?').join(', ');
         const row = this.db
           .prepare<{ n: number }>(
             `SELECT COUNT(*) AS n FROM (
@@ -374,7 +392,7 @@ export class MirrorStore {
                WHERE category IN (${placeholders})
              )`,
           )
-          .get(...cats);
+          .get(...soleGroup);
         total = row?.n ?? 0;
       }
     } else {
@@ -387,14 +405,14 @@ export class MirrorStore {
     // -------------------------------------------------------------------------
     // Row page.
     //
-    // Fast path: a single category, no FTS term, no date window, not sorted by
-    // published. This covers the dominant category-browse shape (default and
+    // Fast path: exactly one category, no FTS term, no date window, not sorted
+    // by published. This covers the dominant category-browse shape (default and
     // updated sorts both order by `updated`). It pages straight off the
     // (category, updated) junction index — no sort, no papers scan — so it stays
     // fast for rare categories too, not just common ones (issue #19). Every
-    // other shape (multiple categories, an FTS term, a date window, or
-    // sort_by:published) takes the generic papers-table path below, which is the
-    // only one that applies `whereClause`.
+    // other shape (multiple categories, a second category group, an FTS term, a
+    // date window, or sort_by:published) takes the generic papers-table path
+    // below, which is the only one that applies `whereClause`.
     // -------------------------------------------------------------------------
     const columns = `papers.id, papers.version, papers.title, papers.authors,
              papers.abstract, papers.primary_category, papers.categories,
@@ -402,12 +420,12 @@ export class MirrorStore {
              papers.comment, papers.journal_ref, papers.doi`;
 
     const singleCat =
-      hasCats &&
+      soleGroup &&
       !options.matchExpr &&
       !hasDateWindow &&
-      cats.length === 1 &&
+      soleGroup.length === 1 &&
       options.sortBy !== 'published'
-        ? cats[0]
+        ? soleGroup[0]
         : undefined;
 
     let rows: PaperRow[];
@@ -459,6 +477,20 @@ export class MirrorStore {
   // -------------------------------------------------------------------------
   // Maintenance
   // -------------------------------------------------------------------------
+
+  /**
+   * Schema version this database carries, and the version the running code
+   * expects. They diverge only mid-upgrade — {@link MirrorStore.open} migrates
+   * before returning — so a mismatch reported here means a migration failed.
+   */
+  schemaVersion(): { current: number; expected: number } {
+    const row = this.db
+      .prepare<{ version: number }>(
+        `SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`,
+      )
+      .get();
+    return { current: row?.version ?? 0, expected: MIRROR_SCHEMA_VERSION };
+  }
 
   integrityCheck(): { ok: boolean; results: string[] } {
     const integrity = this.db.prepare<{ integrity_check: string }>(`PRAGMA integrity_check`).all();
@@ -528,9 +560,18 @@ export function rawToRow(r: ArxivRawRecord): PaperRow {
 // Schema migration
 // ---------------------------------------------------------------------------
 
+/** Record the schema version reached. Called only after a migration completes. */
+function writeSchemaVersion(db: SqliteHandle, version: number): void {
+  db.prepare(`DELETE FROM schema_version`).run();
+  db.prepare(`INSERT INTO schema_version(version, applied_at) VALUES (?, ?)`).run(
+    version,
+    new Date().toISOString(),
+  );
+}
+
 /**
- * Migrate an existing v1 mirror DB to v2 in place. Safe to call on a DB
- * that is already at v2 (idempotent — checks stored version before acting).
+ * Migrate an existing v1 mirror DB to v2 in place. Safe to re-run on a DB that
+ * already carries the v2 shape — every step is written idempotently.
  *
  * v1→v2 changes:
  *   1. Backfill `published`, `updated`, `latest_version` from RFC 2822 → ISO 8601.
@@ -539,7 +580,7 @@ export function rawToRow(r: ArxivRawRecord): PaperRow {
  * Memory safety: streams rows via rowid windows (default 5 000 per batch) and
  * commits each batch independently — never loads millions of rows at once, and
  * the WAL stays bounded. If the process is killed partway through, the stored
- * schema_version row is still 1 (it is written only after both steps complete),
+ * schema_version row is still 1 (the caller writes 2 only after this returns),
  * so re-opening resumes from the start without double-applying or corrupting.
  *
  * Progress: logs every batch to stdout so an operator can see the migration
@@ -608,14 +649,67 @@ function migrateToV2(db: SqliteHandle, batchSize = 5_000): void {
       if (rows.length < batchSize) break;
     }
   }
+}
 
-  // Write the new schema version only after both steps complete. An interrupted
-  // run leaves this row absent (or at 1), so re-opening re-runs the backfill.
-  db.prepare(`DELETE FROM schema_version`).run();
-  db.prepare(`INSERT INTO schema_version(version, applied_at) VALUES (?, ?)`).run(
-    MIRROR_SCHEMA_VERSION,
-    new Date().toISOString(),
+/**
+ * Migrate a v2 mirror DB to v3 in place: rebuild `papers_fts` with the
+ * `comment` and `journal_ref` columns so the documented `co:` and `jr:` field
+ * prefixes resolve on the mirror path (issue #37).
+ *
+ * FTS5 has no `ALTER TABLE ADD COLUMN`, so the index and its three sync
+ * triggers are dropped and recreated from {@link MIRROR_FTS_SQL} — the same
+ * definition a fresh database gets, so the two paths cannot drift. Dropping the
+ * triggers first matters: they enumerate their columns, and a v2 trigger firing
+ * against a v3 index would leave the index diverging from `papers` on every
+ * subsequent write.
+ *
+ * Refill is batched by rowid window rather than FTS5's one-shot `'rebuild'`
+ * command, for the same reasons as the v2 backfill: the WAL stays bounded on a
+ * multi-million-row mirror, and an operator sees progress in container logs.
+ *
+ * Idempotent by construction — a re-run after a partial failure drops the
+ * half-filled index and starts from an empty one. The caller writes
+ * schema_version 3 only after this returns, so an interrupted run repeats.
+ */
+function migrateToV3(db: SqliteHandle, batchSize = 5_000): void {
+  db.exec(`
+    DROP TRIGGER IF EXISTS papers_ai;
+    DROP TRIGGER IF EXISTS papers_ad;
+    DROP TRIGGER IF EXISTS papers_au;
+    DROP TABLE IF EXISTS papers_fts;
+  `);
+  db.exec(MIRROR_FTS_SQL);
+
+  const countRow = db.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM papers`).get();
+  const total = countRow?.n ?? 0;
+  if (total === 0) return;
+
+  let lastRowid = 0;
+  let processed = 0;
+  const select = db.prepare<{ rowid: number }>(
+    `SELECT rowid FROM papers WHERE rowid > ? ORDER BY rowid LIMIT ?`,
   );
+  // Reads straight from the content table, so the indexed text is by
+  // construction the text `papers` holds.
+  const fill = db.prepare(
+    `INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+     SELECT rowid, title, authors, abstract, comment, journal_ref
+     FROM papers WHERE rowid > ? AND rowid <= ?`,
+  );
+
+  while (true) {
+    const rows = select.all(lastRowid, batchSize);
+    if (rows.length === 0) break;
+    const upperRowid = rows[rows.length - 1]?.rowid ?? lastRowid;
+    const lowerRowid = lastRowid;
+    db.transaction(() => {
+      fill.run(lowerRowid, upperRowid);
+    });
+    processed += rows.length;
+    lastRowid = upperRowid;
+    process.stdout.write(`mirror migration v2→v3 (fts rebuild): ${processed}/${total} rows\n`);
+    if (rows.length < batchSize) break;
+  }
 }
 
 // ---------------------------------------------------------------------------
