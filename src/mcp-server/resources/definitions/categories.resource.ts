@@ -11,6 +11,7 @@ export const categoriesResource = resource('arxiv://categories', {
   description:
     'Full arXiv category taxonomy. Returns JSON `{ categories: [...] }` — one flat array of every category, each carrying its code, name, and group.',
   mimeType: 'application/json',
+  cacheHint: { ttlMs: 86_400_000, cacheScope: 'public' },
 
   handler() {
     return { categories: ARXIV_CATEGORIES };

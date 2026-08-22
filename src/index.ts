@@ -5,7 +5,7 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { requestContextService, schedulerService } from '@cyanheads/mcp-ts-core/utils';
+import { requestContextService, schedulerService, withExtra } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { allResourceDefinitions } from '@/mcp-server/resources/definitions/index.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
@@ -39,15 +39,16 @@ await createApp({
         cron,
         async (jobCtx) => {
           const mirrorLog = {
-            debug: (m: string, meta?: object) =>
-              core.logger.debug(m, { ...jobCtx, ...(meta ?? {}) }),
-            info: (m: string, meta?: object) => core.logger.info(m, { ...jobCtx, ...(meta ?? {}) }),
-            notice: (m: string, meta?: object) =>
-              core.logger.notice(m, { ...jobCtx, ...(meta ?? {}) }),
-            warning: (m: string, meta?: object) =>
-              core.logger.warning(m, { ...jobCtx, ...(meta ?? {}) }),
-            error: (m: string, meta?: object) =>
-              core.logger.error(m, { ...jobCtx, ...(meta ?? {}) }),
+            debug: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.debug(m, withExtra(jobCtx, meta ?? {})),
+            info: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.info(m, withExtra(jobCtx, meta ?? {})),
+            notice: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.notice(m, withExtra(jobCtx, meta ?? {})),
+            warning: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.warning(m, withExtra(jobCtx, meta ?? {})),
+            error: (m: string, meta?: Readonly<Record<string, unknown>>) =>
+              core.logger.error(m, withExtra(jobCtx, meta ?? {})),
           };
           // Run the harvest in a child process so its synchronous SQLite writes
           // never block the request event loop — the server keeps serving

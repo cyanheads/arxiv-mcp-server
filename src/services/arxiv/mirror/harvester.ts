@@ -15,11 +15,7 @@ import {
   timeout as timeoutError,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import {
-  httpErrorFromResponse,
-  type RequestContext,
-  withRetry,
-} from '@cyanheads/mcp-ts-core/utils';
+import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { XMLParser } from 'fast-xml-parser';
 import type { ArxivRawRecord, ArxivRawVersion, ArxivTombstone, OaiPage } from './types.js';
 
@@ -42,10 +38,12 @@ export interface HarvesterOptions {
 export function fetchListRecordsPage(
   params: { from?: string; metadataPrefix?: string; resumptionToken?: string },
   options: HarvesterOptions,
-  ctx: { log?: { warning?: (msg: string, meta?: object) => void }; signal: AbortSignal },
+  ctx: {
+    log?: { warning?: (msg: string, meta?: Readonly<Record<string, unknown>>) => void };
+    signal: AbortSignal;
+  },
 ): Promise<OaiPage> {
   const url = buildOaiUrl(options.baseUrl, params);
-  const ctxLike = ctx as unknown as RequestContext;
   return withRetry(
     async () => {
       const xml = await fetchOai(url, options.requestTimeoutMs, ctx.signal);
@@ -53,7 +51,6 @@ export function fetchListRecordsPage(
     },
     {
       operation: 'arxivMirrorListRecords',
-      context: ctxLike,
       signal: ctx.signal,
       maxRetries: 2,
       baseDelayMs: 5000,
@@ -74,7 +71,10 @@ export async function* harvestPages(
   startToken: string | undefined,
   from: string | undefined,
   options: HarvesterOptions,
-  ctx: { log?: { warning?: (m: string, meta?: object) => void }; signal: AbortSignal },
+  ctx: {
+    log?: { warning?: (m: string, meta?: Readonly<Record<string, unknown>>) => void };
+    signal: AbortSignal;
+  },
 ): AsyncGenerator<OaiPage> {
   let token: string | undefined = startToken;
   let useFrom: string | undefined = startToken ? undefined : from;

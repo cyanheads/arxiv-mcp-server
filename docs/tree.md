@@ -1,11 +1,9 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-07-27 15:20:44
+Generated on: 2026-08-22 13:37:10
 
 ```text
 arxiv-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ arxiv-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -29,7 +29,6 @@ arxiv-mcp-server/
 │   ├── 1.5.x/
 │   └── template.md
 ├── claude-plans/
-├── data/
 ├── dev-logs/
 ├── docs/
 │   ├── arxiv-mcp-server-research.md

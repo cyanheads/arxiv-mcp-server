@@ -206,12 +206,12 @@ function isLogLevel(value: unknown): value is LogLevel {
  */
 export async function runRefreshChild(log: MirrorLogger, signal: AbortSignal): Promise<void> {
   const result = await runHarvest({ log, signal }, { mode: 'refresh' });
-  log.info?.('Mirror refresh complete', result);
+  log.info?.('Mirror refresh complete', { ...result });
 }
 
 /** Logger that emits one JSON object per line on stdout for the parent to relay. */
 function makeChildLogger(): MirrorLogger {
-  const emit = (level: LogLevel, msg: string, meta?: object): void => {
+  const emit = (level: LogLevel, msg: string, meta?: Readonly<Record<string, unknown>>): void => {
     process.stdout.write(`${JSON.stringify({ level, msg, ...(meta ?? {}) })}\n`);
   };
   return {

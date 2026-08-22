@@ -9,7 +9,11 @@
 type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error';
 
 function makeLogger(prefix: string) {
-  const emit = (level: LogLevel, message: string, meta?: object): void => {
+  const emit = (
+    level: LogLevel,
+    message: string,
+    meta?: Readonly<Record<string, unknown>>,
+  ): void => {
     const tag = `[${new Date().toISOString()}] ${level.toUpperCase()} ${prefix}`;
     const metaStr = meta && Object.keys(meta).length > 0 ? ` ${JSON.stringify(meta)}` : '';
     const line = `${tag} ${message}${metaStr}`;
@@ -18,11 +22,11 @@ function makeLogger(prefix: string) {
     else console.log(line);
   };
   return {
-    debug: (m: string, meta?: object) => emit('debug', m, meta),
-    info: (m: string, meta?: object) => emit('info', m, meta),
-    notice: (m: string, meta?: object) => emit('notice', m, meta),
-    warning: (m: string, meta?: object) => emit('warning', m, meta),
-    error: (m: string, meta?: object) => emit('error', m, meta),
+    debug: (m: string, meta?: Readonly<Record<string, unknown>>) => emit('debug', m, meta),
+    info: (m: string, meta?: Readonly<Record<string, unknown>>) => emit('info', m, meta),
+    notice: (m: string, meta?: Readonly<Record<string, unknown>>) => emit('notice', m, meta),
+    warning: (m: string, meta?: Readonly<Record<string, unknown>>) => emit('warning', m, meta),
+    error: (m: string, meta?: Readonly<Record<string, unknown>>) => emit('error', m, meta),
   };
 }
 
