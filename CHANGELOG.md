@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.5.1](changelog/1.5.x/1.5.1.md) — 2026-08-22 · ⚠️ Breaking
+
+Adopts MCP SDK v2 with strict top-level tool inputs and 2026-07-28 HTTP negotiation; arxiv://categories advertises a public 24-hour cache hint.
+
 ## [1.5.0](changelog/1.5.x/1.5.0.md) — 2026-07-27
 
 arxiv_search's cat: query operand now expands the same way on both search paths, co:/jr: prefixes resolve on the mirror, and query cat: composes with the category parameter the way arXiv does (#36, #37); mirror schema v3 rebuilds its full-text index automatically in place
