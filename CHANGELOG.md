@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.5.2](changelog/1.5.x/1.5.2.md) — 2026-09-13 · ⚠️ Breaking
+
+Adopts mcp-ts-core 0.13.0 — the framework skill tree moves to framework-skills/ so an installing agent no longer inherits it, and the Bun floor rises to 1.4.0. Mirror and live arxiv_search are now held to identical results by an offline contract test.
+
 ## [1.5.1](changelog/1.5.x/1.5.1.md) — 2026-08-22 · ⚠️ Breaking
 
 Adopts MCP SDK v2 with strict top-level tool inputs and 2026-07-28 HTTP negotiation; arxiv://categories advertises a public 24-hour cache hint.
