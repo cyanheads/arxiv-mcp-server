@@ -144,7 +144,7 @@ Add to your MCP client config (e.g., `claude_desktop_config.json`):
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher.
+- [Bun v1.4.0](https://bun.sh/) or higher.
 
 ### Installation
 
@@ -177,12 +177,13 @@ All configuration is optional — the server works out of the box with sensible 
 | `ARXIV_MIRROR_PATH` | SQLite path for the mirror. | `./data/arxiv-mirror.db` |
 | `ARXIV_MIRROR_REFRESH_CRON` | UTC cron expression for in-process daily refresh (HTTP mode only). | unset |
 | `ARXIV_MIRROR_FALLBACK_LIVE` | Fall through to live API on local ID-lookup miss. | `true` |
-| `ARXIV_MIRROR_RECENT_DAYS_LIVE` | Route `sortBy=submitted` descending queries within this window to the live API. | `2` |
+| `ARXIV_MIRROR_RECENT_DAYS_LIVE` | Positive values route every `sort_by=submitted`, descending query to the live API; `0` disables the bypass. | `2` |
 | `ARXIV_MIRROR_OAI_BASE_URL` | arXiv OAI-PMH endpoint base URL. | `https://oaipmh.arxiv.org/oai` |
 | `ARXIV_MIRROR_OAI_REQUEST_DELAY_MS` | Minimum delay between OAI-PMH requests (ms). | `3000` |
 | `ARXIV_MIRROR_REFRESH_TIMEOUT_MS` | Abort budget for one scheduled refresh subprocess (ms). | `7200000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
+| `MCP_SESSION_MODE` | `auto`, `stateful`, or `stateless`; use `stateless` for this read-only server. | `auto` resolves to `stateful`; Docker sets `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 
@@ -229,7 +230,7 @@ bun run mirror:verify    # schema version + PRAGMA integrity_check / quick_check
 
 **Schema upgrades.** The mirror records a schema version and migrates itself in place the first time a newer server opens it — never a re-harvest, and never a separate operator step. The upgrade that added `comment` and `journal_ref` to the full-text index ([#37](https://github.com/cyanheads/arxiv-mcp-server/issues/37)) rebuilds that index from the rows already stored, so `co:` and `jr:` searches resolve against a mirror harvested before it. The rebuild runs at startup, before the store answers its first read, and logs `mirror migration v2→v3 (fts rebuild)` progress lines throughout — on a full-corpus mirror, expect the first start after the upgrade to take noticeably longer than usual. An interrupted rebuild is repeated on the next open rather than left half-applied. `bun run mirror:verify` prints the schema version the file carries and exits non-zero if a migration never completed.
 
-**Behavior notes.** Ranking divergence: FTS5 BM25 differs from arXiv's internal ranking, so `sortBy=relevance` against the mirror returns a different top-K than the live API. Queries sorted by `submitted` descending within `ARXIV_MIRROR_RECENT_DAYS_LIVE` days route to the live API to cover the nightly-update gap. Refresh resilience: after the initial cold harvest completes, an in-progress or failed daily refresh keeps serving the existing dataset from the mirror — `arxiv_search` and `arxiv_get_metadata` don't drop to the live API during the refresh window ([#21](https://github.com/cyanheads/arxiv-mcp-server/issues/21)). The scheduled HTTP-mode refresh runs in a child process, so the harvest's synchronous SQLite writes never block the request event loop — search and metadata stay responsive throughout ([#22](https://github.com/cyanheads/arxiv-mcp-server/issues/22)). The mirror stores the latest version only; per-version reads continue to use the live API. See [#12](https://github.com/cyanheads/arxiv-mcp-server/issues/12) for the full design.
+**Behavior notes.** Ranking divergence: FTS5 BM25 differs from arXiv's internal ranking, so `sort_by=relevance` against the mirror returns a different top-K than the live API. When `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive, every `sort_by=submitted`, descending query routes to the live API to cover the nightly-update gap; the value does not define a date window. Refresh resilience: after the initial cold harvest completes, an in-progress or failed daily refresh keeps serving the existing dataset from the mirror — `arxiv_search` and `arxiv_get_metadata` don't drop to the live API during the refresh window ([#21](https://github.com/cyanheads/arxiv-mcp-server/issues/21)). The scheduled HTTP-mode refresh runs in a child process, so the harvest's synchronous SQLite writes never block the request event loop — search and metadata stay responsive throughout ([#22](https://github.com/cyanheads/arxiv-mcp-server/issues/22)). The mirror stores the latest version only; per-version reads continue to use the live API. See [#12](https://github.com/cyanheads/arxiv-mcp-server/issues/12) for the full design.
 
 ### Docker
 
@@ -262,11 +263,11 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks before submitting:
+Issues are welcome. Run checks before submitting:
 
 ```sh
 bun run devcheck
-bun test
+bun run test
 ```
 
 ## License

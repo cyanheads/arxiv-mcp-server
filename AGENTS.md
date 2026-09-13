@@ -2,10 +2,10 @@
 
 **Server:** arxiv-mcp-server — arXiv academic paper search, metadata retrieval, and full-text reading for LLM agents.
 **Version:** 1.5.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.12.3`
-**Engines:** Bun ≥1.3.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.0`
+**Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
-**Zod:** ^4.4.3
+**Zod:** ^4.6.1
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 > **Design doc:** `docs/design.md` has full tool schemas, service design, API reference, and domain decisions.
@@ -182,7 +182,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats. Recommended path: declare a typed contract.
 
-**1. Typed error contract (recommended).** Add `errors[]` to the tool/resource and throw via `ctx.fail(reason, …)`. The contract `recovery` string (≥ 5 words, lint-validated) is the single source of truth for the agent's next move; spread `ctx.recoveryFor(reason)` into `data` to mirror it onto the wire as `data.recovery.hint`. The framework also mirrors the hint into `content[]` text so format-only clients see the same guidance.
+**1. Typed error contract (recommended).** Add `errors[]` to the tool/resource and throw via `ctx.fail(reason, …)`. The contract `recovery` string (≥ 5 words, lint-validated) is the single source of truth for the agent's next move; spread `ctx.recoveryFor(reason)` into `data` to mirror it onto the wire as `data.recovery.hint`. The framework also mirrors the hint into `content[]` text so format-only clients see the same guidance. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) need no declaration; malformed tool arguments return `InvalidParams` (-32602).
 
 ```ts
 errors: [
@@ -287,9 +287,9 @@ src/
 
 ## Skills
 
-Skills are modular instructions in `skills/` at the project root. Read them directly when a task matches — e.g., `skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry.
+Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Keep root `skills/` free for skills intended for installing agents: plugin hosts auto-load that directory.
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
+**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
 Available skills:
 
@@ -308,8 +308,9 @@ Available skills:
 | `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
-| `git-wrapup` | Land working-tree changes as a versioned commit + annotated tag — version bump, changelog, verify, tag. Local only. |
-| `release-and-publish` | Push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
+| `git-wrapup` | Land verified changes as a versioned commit stack; opens a release PR only when the project declares that mode. |
+| `release-pr-review` | Review an open release PR, apply fixups, and keep the PR body current. Release PR mode only. |
+| `release-and-publish` | Tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup`. |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
 | `orchestrations` | Chain task skills into a gated multi-phase pipeline — build-out, QA-fix, update-ship — when you can spawn sub-agents |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
@@ -328,7 +329,7 @@ Available skills:
 | `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
 | `api-workers` | Cloudflare Workers runtime |
 
-**Chaining skills into pipelines.** When the user wants a multi-phase effort — build this server out, QA-and-fix the surface, update-and-ship — *and you can spawn sub-agents*, `skills/orchestrations/SKILL.md` sequences the task skills above into a gated pipeline with verification at each step. Read it to drive the run. Optional: skip it if you can't orchestrate sub-agents, and ignore it entirely if you were *spawned* as one — you've already been scoped to a single phase.
+**Chaining skills into pipelines.** When the user wants a multi-phase effort — build this server out, QA-and-fix the surface, update-and-ship — *and you can spawn sub-agents*, `framework-skills/orchestrations/SKILL.md` sequences the task skills above into a gated pipeline with verification at each step. Read it to drive the run. Optional: skip it if you can't orchestrate sub-agents, and ignore it entirely if you were *spawned* as one — you've already been scoped to a single phase.
 
 When you complete a skill's checklist, check the boxes and add a completion timestamp at the end (e.g., `Completed: 2026-03-11`).
 
@@ -344,7 +345,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run rebuild` | Clean + build |
 | `bun run clean` | Remove build artifacts |
 | `bun run devcheck` | Lint + format + typecheck + security + changelog sync |
-| `bun run audit:refresh` | Delete `bun.lock`, reinstall, and re-run `bun audit`. Use when `devcheck` flags a transitive advisory — Bun's `update` is sticky on transitive resolutions, so the advisory may be a stale-lockfile false positive. If it survives the refresh, it's real. |
+| `bun run audit:fix` | Run `bun audit fix` to patch vulnerable packages within existing ranges. Try first, then `bun update <name>`, then `bun dedupe`. |
+| `bun run audit:refresh` | Delete `bun.lock`, reinstall, and re-run `bun audit`. Last resort: every ranged dependency re-resolves, including the framework. |
 | `bun run lint:mcp` | Run the MCP definition linter standalone (rule catalog: `api-linter` skill) |
 | `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
 | `bun run list-skills` | Print the skill registry |
@@ -362,11 +364,11 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB is stdio-only — HTTP deployments are unaffected.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB is stdio-only — HTTP deployments are unaffected.
 
-**Adding an env var requires both files:** `server.json` (`environmentVariables[]`) and `manifest.json` (`mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match.
+**Adding an env var requires both files:** `server.json` (`environmentVariables[]`) and `manifest.json` (`mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match. Wire each user option as `${user_config.<key>}`; optional string options use `"default": ""`. A raw `${ENV_VAR}` is not substituted by the MCPB host.
 
-**README install badges** (Claude Desktop `.mcpb`, Cursor, VS Code) and the `base64` / `encodeURIComponent` config-generation commands are ship-time concerns — run the `polish-docs-meta` skill, which carries the badge format, layout, and generation snippets in `skills/polish-docs-meta/references/readme.md`.
+**README install badges** (Claude Desktop `.mcpb`, Cursor, VS Code) and the `base64` / `encodeURIComponent` config-generation commands are ship-time concerns — run the `polish-docs-meta` skill, which carries the badge format, layout, and generation snippets in `framework-skills/polish-docs-meta/references/readme.md`.
 
 ---
 
@@ -391,7 +393,7 @@ security: false                            # optional — true ONLY for a source
 
 `agent-notes` is an optional free-form field for maintenance agents processing the release downstream. Content here won't appear in the rendered CHANGELOG — it's consumed by agents running the `maintenance` skill. Use it for adoption instructions that don't fit the human-facing sections: new files to create, fields to populate, one-time migration steps. Omit entirely when there's nothing to say.
 
-**Section order** (Keep a Changelog): Added, Changed, Deprecated, Removed, Fixed, Security. Include only sections with entries — don't ship empty headers.
+**Section order** (Keep a Changelog): Added, Changed, Deprecated, Removed, Fixed, Security, then Dependencies. Include only sections with entries — don't ship empty headers.
 
 **Tag annotations** render as GitHub Release bodies via `--notes-from-tag`. They must be structured markdown — never a flat comma-separated string. Subject omits the version number (GitHub prepends it). See `changelog/template.md` for the full format reference.
 
@@ -424,7 +426,7 @@ import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 - [ ] Tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
-- [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = package name; `interface.shortDescription` from `package.json` description
-- [ ] `.codex-plugin/mcp.json` updated — server name key matches `package.json` name; env vars added for any required API keys
-- [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; inline `mcpServers` entry with server name key, env vars for any required API keys
+- [ ] `.codex-plugin/plugin.json` populated — identity and description from `package.json`; `name` and `interface.displayName` use the unscoped repo name, `arxiv-mcp-server`.
+- [ ] `.codex-plugin/mcp.json` updated — server key is `arxiv-mcp-server`; user-supplied variables use `env_vars`, never empty `env` values that replace exported configuration.
+- [ ] `.claude-plugin/plugin.json` populated — metadata from `package.json`; inline `mcpServers` key is `arxiv-mcp-server`. User-supplied variables use `userConfig` plus `${user_config.<option>}` references; optional strings default to `""`.
 - [ ] `bun run devcheck` passes
