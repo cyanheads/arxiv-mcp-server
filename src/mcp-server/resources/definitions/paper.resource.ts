@@ -63,12 +63,14 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
       retryable: true,
       recovery:
         'Wait error.data.cooldownAppliedMs milliseconds before retrying, and lower concurrent arXiv calls.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_request',
       code: JsonRpcErrorCode.InvalidRequest,
       when: 'arXiv rejected the request (HTTP 4xx other than 429), e.g. malformed ID syntax.',
       recovery: 'Verify the paper ID format (e.g., "2401.12345") and retry.',
+      thrownBy: 'service',
     },
   ],
 

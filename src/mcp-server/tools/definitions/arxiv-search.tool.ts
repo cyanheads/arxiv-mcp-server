@@ -31,6 +31,7 @@ export const arxivSearch = tool('arxiv_search', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Provided category code is not part of the arXiv taxonomy.',
       recovery: 'Call arxiv_list_categories to discover valid category codes and retry.',
+      thrownBy: 'service',
     },
     {
       reason: 'rate_limited',
@@ -39,6 +40,7 @@ export const arxivSearch = tool('arxiv_search', {
       retryable: true,
       recovery:
         'Wait error.data.cooldownAppliedMs milliseconds before retrying, and lower concurrent arXiv calls.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_request',
@@ -46,6 +48,7 @@ export const arxivSearch = tool('arxiv_search', {
       when: 'arXiv rejected the request (HTTP 4xx other than 429), typically malformed query syntax.',
       recovery:
         'Check query syntax — use field prefixes ti:, au:, abs:, cat: and boolean operators AND, OR, ANDNOT.',
+      thrownBy: 'service',
     },
     {
       reason: 'unsupported_query_syntax',
@@ -53,6 +56,7 @@ export const arxivSearch = tool('arxiv_search', {
       when: 'Query translates to a mirror FTS5 expression the search engine cannot parse, typically two operands juxtaposed across a parenthesized group without an explicit operator.',
       recovery:
         'Add an explicit AND or OR between adjacent terms and parenthesized groups, then retry.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_date_range',
@@ -60,6 +64,7 @@ export const arxivSearch = tool('arxiv_search', {
       when: 'submitted_from or submitted_to is not a real UTC calendar date, or the window starts after it ends.',
       recovery:
         'Give both bounds as real UTC calendar dates in YYYY-MM-DD form, with submitted_from on or before submitted_to.',
+      thrownBy: 'service',
     },
   ],
 

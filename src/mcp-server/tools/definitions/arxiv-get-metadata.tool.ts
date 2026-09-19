@@ -36,6 +36,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       when: 'None of the requested IDs returned data from arXiv.',
       recovery:
         'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and confirm the paper exists via arxiv_search.',
+      severity: 'notice',
     },
     {
       reason: 'version_unavailable',
@@ -51,12 +52,14 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       retryable: true,
       recovery:
         'Wait error.data.cooldownAppliedMs milliseconds before retrying, and lower concurrent arXiv calls.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_request',
       code: JsonRpcErrorCode.InvalidRequest,
       when: 'arXiv rejected the request (HTTP 4xx other than 429), e.g. malformed ID syntax.',
       recovery: 'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and retry.',
+      thrownBy: 'service',
     },
   ],
 

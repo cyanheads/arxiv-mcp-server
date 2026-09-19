@@ -18,6 +18,7 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import {
+  defaultIsTransient,
   httpErrorFromResponse,
   pdfParser,
   type RequestContext,
@@ -142,14 +143,18 @@ function parseRetryAfter(value: string): number | null {
  *   timeouts the same as explicit rate-limits — surface immediately.
  *
  * Only `ServiceUnavailable` (5xx and raw network blips) and unknown non-McpError
- * throws stay retryable.
+ * throws stay retryable. Everything else defers to `defaultIsTransient` rather
+ * than mirroring the framework's code set, so a change there — including its
+ * `data.retryable === false` opt-out — reaches these calls too.
  */
 function isArxivTransient(err: unknown): boolean {
-  if (err instanceof McpError) {
-    return err.code === JsonRpcErrorCode.ServiceUnavailable;
+  if (
+    err instanceof McpError &&
+    (err.code === JsonRpcErrorCode.RateLimited || err.code === JsonRpcErrorCode.Timeout)
+  ) {
+    return false;
   }
-  // Non-McpError (raw network errors, unexpected throws): treat as transient.
-  return true;
+  return defaultIsTransient(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +813,7 @@ export class ArxivService {
             paperId,
             mirrorVersion: stored.version,
             reason: 'version_unavailable',
+            retryable: true,
             ...ctx.recoveryFor('version_unavailable'),
           },
           { cause: err },
@@ -927,6 +933,7 @@ export class ArxivService {
             cooldownAppliedMs,
             consecutiveRateLimits: this.consecutiveRateLimits,
             reason: 'rate_limited',
+            retryable: true,
             ...ctx.recoveryFor('rate_limited'),
           });
         }
@@ -968,6 +975,7 @@ export class ArxivService {
             cooldownAppliedMs,
             consecutiveRateLimits: this.consecutiveRateLimits,
             reason: 'rate_limited',
+            retryable: true,
             ...ctx.recoveryFor('rate_limited'),
           });
         }
@@ -1238,6 +1246,7 @@ export class ArxivService {
           cooldownAppliedMs,
           consecutiveRateLimits: this.consecutiveRateLimits,
           reason: 'rate_limited',
+          retryable: true,
           ...ctx.recoveryFor('rate_limited'),
         });
       }

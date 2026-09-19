@@ -20,6 +20,8 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       when: 'Paper ID is not present in the arXiv index.',
       recovery:
         'Verify the paper ID format (e.g., "2401.12345") and confirm via arxiv_search before retrying.',
+      thrownBy: 'service',
+      severity: 'notice',
     },
     {
       reason: 'content_unavailable',
@@ -27,6 +29,8 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       when: 'Paper exists but neither arxiv.org/html nor ar5iv has an HTML rendering and arXiv served no PDF either.',
       recovery:
         'Read the abstract via arxiv_get_metadata, since no full-text artifact exists for this paper.',
+      thrownBy: 'service',
+      severity: 'notice',
     },
     {
       reason: 'pdf_extraction_failed',
@@ -34,6 +38,8 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       when: 'Paper has no HTML rendering and its PDF carries no text layer — an image-only or scanned submission.',
       recovery:
         'Download error.data.pdfUrl and run optical character recognition, or read the abstract via arxiv_get_metadata.',
+      thrownBy: 'service',
+      severity: 'notice',
     },
     {
       reason: 'version_unavailable',
@@ -42,6 +48,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       retryable: true,
       recovery:
         'Retry once arXiv is reachable, or request the version reported in error.data.mirrorVersion.',
+      thrownBy: 'service',
     },
     {
       reason: 'rate_limited',
@@ -50,12 +57,14 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       retryable: true,
       recovery:
         'Wait error.data.cooldownAppliedMs milliseconds before retrying, and lower concurrent arXiv calls.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_request',
       code: JsonRpcErrorCode.InvalidRequest,
       when: 'arXiv rejected the metadata lookup (HTTP 4xx other than 429), e.g. malformed ID syntax.',
       recovery: 'Verify the paper ID format (e.g., "2401.12345" or "2401.12345v2") and retry.',
+      thrownBy: 'service',
     },
   ],
 
