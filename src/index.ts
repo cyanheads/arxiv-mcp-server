@@ -19,6 +19,11 @@ await createApp({
   resources: allResourceDefinitions,
   prompts: [],
   landing: { requireAuth: false },
+  // Every tool here is a read-only arXiv lookup — no tool calls ctx.requestInput,
+  // and ctx.state is tenant-scoped storage rather than a session store. Stateless
+  // drops the per-session McpServer allocation and lets the process scale
+  // horizontally. MCP_SESSION_MODE still overrides this when set. See issue #40.
+  sessionMode: 'stateless',
   instructions:
     'Use the arxiv_* tools to access the arXiv paper corpus: search by query, fetch metadata by ID, read full-text HTML, and list the subject category taxonomy. Papers are addressed by arXiv ID (e.g. 2401.12345 or 2401.12345v2 with version); search queries support field prefixes (ti:, au:, abs:, cat:) and boolean operators (AND, OR, ANDNOT).',
   async setup(core) {

@@ -229,7 +229,7 @@ All configuration is optional — the server works out of the box with sensible 
 | `ARXIV_MIRROR_REFRESH_TIMEOUT_MS` | Abort budget for one scheduled refresh subprocess (ms). | `7200000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_SESSION_MODE` | `auto`, `stateful`, or `stateless`; use `stateless` for this read-only server. | `auto` resolves to `stateful`; Docker sets `stateless` |
+| `MCP_SESSION_MODE` | `auto`, `stateful`, or `stateless`. The server declares `stateless` in `src/index.ts` — it holds no per-session state — so every run path resolves the same way unless this variable overrides it. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry) (spans, metrics, completion logs). | `false` |
