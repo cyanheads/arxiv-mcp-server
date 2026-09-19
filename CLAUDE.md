@@ -5,7 +5,7 @@
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
-**Zod:** ^4.6.1
+**Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 > **Design doc:** `docs/design.md` has full tool schemas, service design, API reference, and domain decisions.
@@ -171,7 +171,7 @@ await createApp({
 
 `sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). This server declares `stateless`: every tool is a read-only arXiv lookup, none calls `ctx.requestInput`, and `ctx.state` is tenant-scoped storage rather than a session store. `require: 'stateful'` would be the declaration on a server whose tools do gate on `ctx.requestInput`; adding one here means revisiting the mode. See [#40](https://github.com/cyanheads/arxiv-mcp-server/issues/40).
 
-`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). This server declares none: the only ref'd timer `setup()` leaves behind is the `node-cron` mirror-refresh job, and the framework disposes `schedulerService` itself on the step right after the hook — a `teardown` calling `destroyAll()` would only run it twice. The `MirrorStore` handle is opened lazily on first query rather than in `setup()`, and the in-process path writes only during open-time migration, so there is no pending WAL at shutdown to checkpoint.
+`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). This server declares none: the only ref'd timer `setup()` leaves behind is the `node-cron` mirror-refresh job, and the framework disposes `schedulerService` itself further down the same shutdown sequence — a `teardown` calling `destroyAll()` would only run it twice. The `MirrorStore` handle is opened lazily on first query rather than in `setup()`, and the in-process path writes only during open-time migration, so there is no pending WAL at shutdown to checkpoint.
 
 ---
 
