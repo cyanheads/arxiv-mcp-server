@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.5.3](changelog/1.5.x/1.5.3.md) — 2026-09-19
+
+Adopts mcp-ts-core 0.13.1-0.13.6 — sessionMode is now declared as stateless in src/index.ts, tool errors close with a machine-readable reason/retryable suffix, argument handling tolerates client-added keys and case-style aliases, and upstream fetch errors no longer carry the request URL.
+
 ## [1.5.2](changelog/1.5.x/1.5.2.md) — 2026-09-13 · ⚠️ Breaking
 
 Adopts mcp-ts-core 0.13.0 — the framework skill tree moves to framework-skills/ so an installing agent no longer inherits it, and the Bun floor rises to 1.4.0. Mirror and live arxiv_search are now held to identical results by an offline contract test.

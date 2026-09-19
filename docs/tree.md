@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-09-13 17:51:50
+Generated on: 2026-09-19 15:21:26
 
 ```text
 arxiv-mcp-server/
@@ -14,6 +14,8 @@ arxiv-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
@@ -191,6 +193,7 @@ arxiv-mcp-server/
 │   │   │       ├── arxiv-search.tool.test.ts
 │   │   │       ├── input-validation.test.ts
 │   │   │       └── security.test.ts
+│   │   ├── error-envelope.test.ts
 │   │   ├── id-input-boundary.test.ts
 │   │   └── rate-limit-recovery.test.ts
 │   └── services/
