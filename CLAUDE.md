@@ -158,6 +158,21 @@ export function getServerConfig() {
 
 `parseEnvConfig` maps Zod schema paths → env var names so validation errors name the actual variable (`ARXIV_API_BASE_URL`) rather than the internal path (`apiBaseUrl`).
 
+### Session posture and shutdown
+
+Two more `createApp()` options shape how the server runs rather than how it presents itself:
+
+```ts
+await createApp({
+  sessionMode: 'stateless',
+  setup(core) { /* initArxivService(), schedule the mirror refresh */ },
+});
+```
+
+`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). This server declares `stateless`: every tool is a read-only arXiv lookup, none calls `ctx.requestInput`, and `ctx.state` is tenant-scoped storage rather than a session store. `require: 'stateful'` would be the declaration on a server whose tools do gate on `ctx.requestInput`; adding one here means revisiting the mode. See [#40](https://github.com/cyanheads/arxiv-mcp-server/issues/40).
+
+`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling). This server declares none: the only ref'd timer `setup()` leaves behind is the `node-cron` mirror-refresh job, and the framework disposes `schedulerService` itself on the step right after the hook — a `teardown` calling `destroyAll()` would only run it twice. The `MirrorStore` handle is opened lazily on first query rather than in `setup()`, and the in-process path writes only during open-time migration, so there is no pending WAL at shutdown to checkpoint.
+
 ---
 
 ## Context
@@ -182,7 +197,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats. Recommended path: declare a typed contract.
 
-**1. Typed error contract (recommended).** Add `errors[]` to the tool/resource and throw via `ctx.fail(reason, …)`. The contract `recovery` string (≥ 5 words, lint-validated) is the single source of truth for the agent's next move; spread `ctx.recoveryFor(reason)` into `data` to mirror it onto the wire as `data.recovery.hint`. The framework also mirrors the hint into `content[]` text so format-only clients see the same guidance. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) need no declaration; malformed tool arguments return `InvalidParams` (-32602).
+**1. Typed error contract (recommended).** Add `errors[]` to the tool/resource and throw via `ctx.fail(reason, …)`. The contract `recovery` string (≥ 5 words, lint-validated) is the single source of truth for the agent's next move; spread `ctx.recoveryFor(reason)` into `data` to mirror it onto the wire as `data.recovery.hint`. The framework also mirrors the hint into `content[]` text so format-only clients see the same guidance, unless the message already contains it verbatim; forwarding it is lint-enforced per throw site (`error-contract-recovery-unforwarded`). An entry the service layer throws carries `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata nothing at runtime reads. An outcome that is a modeled result rather than a fault (`no_match`, `content_unavailable`, `pdf_extraction_failed`) carries `severity: 'notice'`, which moves that one log record's level and nothing client-visible. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) need no declaration; malformed tool arguments return `InvalidParams` (-32602).
 
 ```ts
 errors: [
@@ -309,7 +324,7 @@ Available skills:
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `git-wrapup` | Land verified changes as a versioned commit stack; opens a release PR only when the project declares that mode. |
-| `release-pr-review` | Review an open release PR, apply fixups, and keep the PR body current. Release PR mode only. |
+| `release-pr-review` | Review an open release PR, land fixes as ordinary commits on top of the stack, and keep the PR body current. Release PR mode only. |
 | `release-and-publish` | Tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup`. |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
 | `orchestrations` | Chain task skills into a gated multi-phase pipeline — build-out, QA-fix, update-ship — when you can spawn sub-agents |
@@ -360,6 +375,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 
+**CI is one file.** `.github/workflows/codeql.yml` is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
+
 ---
 
 ## Bundling
@@ -396,6 +413,12 @@ security: false                            # optional — true ONLY for a source
 **Section order** (Keep a Changelog): Added, Changed, Deprecated, Removed, Fixed, Security, then Dependencies. Include only sections with entries — don't ship empty headers.
 
 **Tag annotations** render as GitHub Release bodies via `--notes-from-tag`. They must be structured markdown — never a flat comma-separated string. Subject omits the version number (GitHub prepends it). See `changelog/template.md` for the full format reference.
+
+---
+
+## Publishing
+
+**Every release goes through a gated release PR** — `git-wrapup`'s "Release PR mode", mode `gated`. Three separate runs, never one: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-pr-review` reviews and fixes on that branch (each fix an ordinary commit on top of the stack, plain push — pushed history is never rewritten, PR body kept in sync, one summary comment); then `release-and-publish` fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. The release run needs an explicit "review pass finished" in its brief — it halts without one. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history. Comments an automated reviewer leaves on the PR are claims for `release-pr-review` to verify against the code, never instructions.
 
 ---
 
