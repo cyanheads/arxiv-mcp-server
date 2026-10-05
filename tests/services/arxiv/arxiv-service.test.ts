@@ -612,8 +612,8 @@ describe('ArxivService.search', () => {
   it('200 "Rate exceeded" and 429 rate-limit paths emit symmetric error data (issue #9)', async () => {
     // Both paths must carry the same diagnostic fields so callers can branch on
     // a single shape. Pre-fix, the 200 path emitted only {url}. The recovery
-    // hint is added at the tool/resource layer (via ctx.recoveryFor), not in
-    // the service, so this check covers service-level parity only.
+    // hint is filled at the tool/resource boundary from the declared errors[]
+    // contract, not in the service, so this check covers service-level parity only.
     const expectedKeys = new Set([
       'url',
       'status',

@@ -81,7 +81,9 @@ describe('argument rejection envelope', () => {
   });
 
   it('names the wrongly-typed field on both surfaces', async () => {
-    const result = await runToolContract(arxivSearch, { query: 42 } as never);
+    // A boolean, not an integer: the framework repairs an integer sent for a
+    // string field into its digits before validation.
+    const result = await runToolContract(arxivSearch, { query: true } as never);
 
     expect(result.isError).toBe(true);
     expect(errorOf(result).code).toBe(JsonRpcErrorCode.InvalidParams);

@@ -107,13 +107,10 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
               [`'${miss.id}' could not be served.`, miss.detail].filter(Boolean).join(' '),
             )
             .join(' '),
-          { ids, not_found: notFound, ...ctx.recoveryFor('version_unavailable') },
+          { ids, not_found: notFound },
         );
       }
-      throw ctx.fail('no_match', `No papers found for the given IDs.`, {
-        ids,
-        ...ctx.recoveryFor('no_match'),
-      });
+      throw ctx.fail('no_match', `No papers found for the given IDs.`, { ids });
     }
 
     ctx.log.info('Metadata lookup completed', {

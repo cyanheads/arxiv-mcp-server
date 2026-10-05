@@ -84,7 +84,6 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     if (!paperId) {
       throw ctx.fail('empty_id', `Paper ID '${params.paperId}' is blank once decoded.`, {
         paperId: params.paperId,
-        ...ctx.recoveryFor('empty_id'),
       });
     }
 
@@ -100,13 +99,10 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
         throw ctx.fail(
           'version_unavailable',
           [`Paper '${paperId}' could not be served.`, miss.detail].filter(Boolean).join(' '),
-          { paperId, not_found: miss, ...ctx.recoveryFor('version_unavailable') },
+          { paperId, not_found: miss },
         );
       }
-      throw ctx.fail('no_match', `Paper '${paperId}' not found.`, {
-        paperId,
-        ...ctx.recoveryFor('no_match'),
-      });
+      throw ctx.fail('no_match', `Paper '${paperId}' not found.`, { paperId });
     }
     return paper;
   },

@@ -515,11 +515,10 @@ export class ArxivService {
         category: options.category,
         suggestions,
         reason: 'unknown_category',
-        ...ctx.recoveryFor('unknown_category'),
       });
     }
 
-    this.assertValidDateWindow(options, ctx);
+    this.assertValidDateWindow(options);
 
     // Built before the path split so the mirror echoes the same string the live
     // API would have received — one definition of "what was actually searched".
@@ -580,7 +579,7 @@ export class ArxivService {
    * would otherwise reach arXiv as a syntactically valid clause that silently
    * matches nothing.
    */
-  private assertValidDateWindow(options: SearchOptions, ctx: Context): void {
+  private assertValidDateWindow(options: SearchOptions): void {
     const bounds = [
       ['submitted_from', options.submittedFrom],
       ['submitted_to', options.submittedTo],
@@ -592,7 +591,6 @@ export class ArxivService {
           {
             [field]: value,
             reason: 'invalid_date_range',
-            ...ctx.recoveryFor('invalid_date_range'),
           },
         );
       }
@@ -608,7 +606,6 @@ export class ArxivService {
           submitted_from: options.submittedFrom,
           submitted_to: options.submittedTo,
           reason: 'invalid_date_range',
-          ...ctx.recoveryFor('invalid_date_range'),
         },
       );
     }
@@ -678,7 +675,6 @@ export class ArxivService {
             query,
             matchExpr: translated.matchExpr,
             reason: 'unsupported_query_syntax',
-            ...ctx.recoveryFor('unsupported_query_syntax'),
           },
         );
       }
@@ -814,7 +810,6 @@ export class ArxivService {
             mirrorVersion: stored.version,
             reason: 'version_unavailable',
             retryable: true,
-            ...ctx.recoveryFor('version_unavailable'),
           },
           { cause: err },
         );
@@ -824,7 +819,7 @@ export class ArxivService {
     if (!paper) {
       throw notFound(
         `Paper '${paperId}' not found. Verify the ID format (e.g., '2401.12345' or '2401.12345v2').`,
-        { paperId, reason: 'no_match', ...ctx.recoveryFor('no_match') },
+        { paperId, reason: 'no_match' },
       );
     }
 
@@ -934,7 +929,6 @@ export class ArxivService {
             consecutiveRateLimits: this.consecutiveRateLimits,
             reason: 'rate_limited',
             retryable: true,
-            ...ctx.recoveryFor('rate_limited'),
           });
         }
         throw invalidRequest(`arXiv API returned HTTP ${response.status}`, {
@@ -942,7 +936,6 @@ export class ArxivService {
           status: response.status,
           body: text.slice(0, 500),
           reason: 'invalid_request',
-          ...ctx.recoveryFor('invalid_request'),
         });
       }
 
@@ -976,7 +969,6 @@ export class ArxivService {
             consecutiveRateLimits: this.consecutiveRateLimits,
             reason: 'rate_limited',
             retryable: true,
-            ...ctx.recoveryFor('rate_limited'),
           });
         }
         // A non-empty body under an unexpected content-type indicates an
@@ -1175,7 +1167,6 @@ export class ArxivService {
           paperId,
           pdfUrl: paper.pdf_url,
           reason: 'content_unavailable',
-          ...ctx.recoveryFor('content_unavailable'),
         },
       );
     }
@@ -1185,7 +1176,6 @@ export class ArxivService {
         paperId,
         pdfUrl: paper.pdf_url,
         reason: 'pdf_extraction_failed',
-        ...ctx.recoveryFor('pdf_extraction_failed'),
       },
     );
   }
@@ -1247,7 +1237,6 @@ export class ArxivService {
           consecutiveRateLimits: this.consecutiveRateLimits,
           reason: 'rate_limited',
           retryable: true,
-          ...ctx.recoveryFor('rate_limited'),
         });
       }
       return;

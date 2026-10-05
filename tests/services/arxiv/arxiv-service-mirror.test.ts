@@ -11,11 +11,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
 import { arxivSearch } from '@/mcp-server/tools/definitions/arxiv-search.tool.js';
-import { ArxivService } from '@/services/arxiv/arxiv-service.js';
+import { ArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
 import { MirrorStore, resetStore } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
 
@@ -506,16 +506,13 @@ describe('ArxivService — mirror integration', () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('rethrows a store-side fts5 SQLiteError as a validationError carrying the original query, matchExpr, and recovery hint from the tool contract', async () => {
+    it('rethrows a store-side fts5 SQLiteError as a validationError carrying the original query and matchExpr', async () => {
       const spy = vi.spyOn(MirrorStore.prototype, 'search').mockImplementation(() => {
         throw new Error('fts5: syntax error near ":"');
       });
       try {
-        // Wire the mock context to the arxiv_search errors[] contract so the
-        // service's `ctx.recoveryFor('unsupported_query_syntax')` resolves to
-        // the real recovery hint a production caller would see.
         const ctx = createMockContext({ errors: arxivSearch.errors! });
-        expect.assertions(5);
+        expect.assertions(4);
         try {
           await service.search('language all:automated', { maxResults: 1 }, ctx);
         } catch (err) {
@@ -526,8 +523,29 @@ describe('ArxivService — mirror integration', () => {
             reason: 'unsupported_query_syntax',
           });
           expect((err as McpError).data).toHaveProperty('matchExpr');
-          expect((err as McpError).data).toHaveProperty('recovery');
         }
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('surfaces the arxiv_search contract recovery hint for an fts5 failure at the tool boundary', async () => {
+      const spy = vi.spyOn(MirrorStore.prototype, 'search').mockImplementation(() => {
+        throw new Error('fts5: syntax error near ":"');
+      });
+      try {
+        initArxivService();
+        const result = await runToolContract(arxivSearch, {
+          query: 'language all:automated',
+          max_results: 1,
+        });
+
+        expect(result.isError, JSON.stringify(result)).toBe(true);
+        const error = (result.structuredContent as { error: { data: Record<string, unknown> } })
+          .error;
+        expect(error.data.reason).toBe('unsupported_query_syntax');
+        const declared = arxivSearch.errors!.find((e) => e.reason === 'unsupported_query_syntax');
+        expect(error.data.recovery).toEqual({ hint: declared!.recovery });
       } finally {
         spy.mockRestore();
       }
