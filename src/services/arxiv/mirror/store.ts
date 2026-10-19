@@ -95,8 +95,8 @@ const WRITER_BUSY_TIMEOUT_MS = 5_000;
  * How long a migration lease holds without a renewal (issue #71). Its holder
  * renews it as each migration transaction commits, so a running migration's
  * lease ages by at most one transaction: the longest is the drop of the old
- * index, tens of seconds on a full corpus, and the TTL stays well clear of it
- * so a lease is never read as lapsed while its holder works. One left older
+ * index, and the TTL stays well clear of it so a lease is never read as
+ * lapsed while its holder works. One left older
  * than this belongs to a writer that died or stalled, and the next writer takes
  * the migration over. A stalled holder that resumes finds the lease gone at its
  * next transaction and stops, so the value bounds how long a dead writer blocks
@@ -895,7 +895,7 @@ function leaseLost(path: string, held: MigrationLease | undefined): McpError {
  * writer, unless another writer holds a live lease on it.
  *
  * Another writer's transaction can outlast the busy wait — a migration batch,
- * or the drop of a full-corpus index. The open then reads the lease without the
+ * or the drop of the old index. The open then reads the lease without the
  * lock (WAL serves the last commit) and reports a live one as the migration it
  * is; any other `SQLITE_BUSY` is rethrown.
  *
