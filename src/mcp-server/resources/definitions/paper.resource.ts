@@ -67,6 +67,13 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
         'Read the version named in the error detail, or drop the version suffix to get the latest.',
     },
     {
+      reason: 'version_not_served',
+      code: JsonRpcErrorCode.NotFound,
+      when: "The URI pinned a superseded version of a pre-2007 paper that arXiv's API answers HTTP 500 for. The version exists, but its metadata cannot be returned.",
+      recovery:
+        'Read the latest version named in the error detail, or drop the version suffix to get the latest.',
+    },
+    {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
@@ -106,17 +113,19 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     const result = await service.getPapers([paperId], ctx);
     const [paper] = result.papers;
     if (!paper) {
-      // A version the mirror lacks is reachable upstream, so `no_match` would
-      // tell the reader to doubt an ID that is in fact valid. Fail with the
-      // reason the service assigned, which names the version it can serve.
-      // See issue #35.
+      // A version the mirror lacks (#35) or one arXiv will not serve (#53) is a
+      // real version, so `no_match` would tell the reader to doubt an ID that
+      // is in fact valid. Fail with the reason the service assigned, whose
+      // detail names the version that can be served.
       const [miss] = result.not_found ?? [];
+      const message = [`Paper '${paperId}' could not be served.`, miss?.detail]
+        .filter(Boolean)
+        .join(' ');
       if (miss?.reason === 'version_not_in_mirror') {
-        throw ctx.fail(
-          'version_unavailable',
-          [`Paper '${paperId}' could not be served.`, miss.detail].filter(Boolean).join(' '),
-          { paperId, not_found: miss },
-        );
+        throw ctx.fail('version_unavailable', message, { paperId, not_found: miss });
+      }
+      if (miss?.reason === 'version_not_served') {
+        throw ctx.fail('version_not_served', message, { paperId, not_found: miss });
       }
       throw ctx.fail('no_match', `Paper '${paperId}' not found.`, { paperId });
     }

@@ -96,6 +96,15 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       thrownBy: 'service',
     },
     {
+      reason: 'version_not_served',
+      code: JsonRpcErrorCode.NotFound,
+      when: "paper_id pins a superseded version of a pre-2007 paper that arXiv's API answers HTTP 500 for. The version exists, but its metadata cannot be returned.",
+      recovery:
+        'Read the latest version the error message names, or download this version from error.data.pdfUrl.',
+      thrownBy: 'service',
+      severity: 'notice',
+    },
+    {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       when: 'arXiv has throttled requests (HTTP 429 or "Rate exceeded." body).',
@@ -169,6 +178,12 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       ),
     pdf_url: z.string().describe('Direct PDF download URL.'),
     abstract_url: z.string().describe('arXiv abstract page URL for attribution.'),
+    revision_unconfirmed: z
+      .literal(true)
+      .optional()
+      .describe(
+        'Present, true, when source is ar5iv: ar5iv keeps one render per paper whatever version is asked for, so the body may be another revision than paper_id, while pdf_url is exactly the paper_id revision. Absent for every other source, and for an unversioned read of a paper whose only version is v1.',
+      ),
     outline: z
       .array(OutlineEntrySchema)
       .optional()
@@ -227,6 +242,11 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     if (result.source === 'pdf_text') {
       lines.push(
         '\n[Extracted from the PDF — no HTML render exists for this paper. Prose is reliable; math, tables, and heading structure are flattened into plain text.]',
+      );
+    }
+    if (result.revision_unconfirmed) {
+      lines.push(
+        `\n[Revision unconfirmed: ar5iv keeps one render per paper, so this body may be another revision than arXiv:${result.paper_id}. The PDF at ${result.pdf_url} is exactly arXiv:${result.paper_id}.]`,
       );
     }
     const sliceEnd = result.start + result.content.length;

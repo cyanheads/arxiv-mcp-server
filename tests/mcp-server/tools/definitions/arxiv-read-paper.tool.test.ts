@@ -3,6 +3,12 @@
  * @module mcp-server/tools/definitions/arxiv-read-paper.test
  */
 
+import {
+  JsonRpcErrorCode,
+  notFound,
+  serviceUnavailable,
+  timeout,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
@@ -316,5 +322,144 @@ describe('arxivReadPaper', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('PDF: https://arxiv.org/pdf/2401.12345v1');
     expect(text).toContain('Abstract: https://arxiv.org/abs/2401.12345v1');
+  });
+
+  // -------------------------------------------------------------------------
+  // ar5iv keeps one render per paper (#63)
+  // -------------------------------------------------------------------------
+
+  const AR5IV_UNCONFIRMED: PaperContent = {
+    ...MOCK_CONTENT,
+    paper_id: '2411.15218v2',
+    source: 'ar5iv',
+    pdf_url: 'https://arxiv.org/pdf/2411.15218v2',
+    abstract_url: 'https://arxiv.org/abs/2411.15218v2',
+    revision_unconfirmed: true,
+  };
+
+  const NOTICE =
+    '[Revision unconfirmed: ar5iv keeps one render per paper, so this body may be another revision than arXiv:2411.15218v2. The PDF at https://arxiv.org/pdf/2411.15218v2 is exactly arXiv:2411.15218v2.]';
+
+  it('discloses an unconfirmed ar5iv revision through structuredContent and content[]', async () => {
+    mockReadContent.mockResolvedValue(AR5IV_UNCONFIRMED);
+    const result = await runToolContract(arxivReadPaper, { paper_id: '2411.15218v2' });
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const structured = result.structuredContent as { revision_unconfirmed?: boolean };
+    expect(structured.revision_unconfirmed).toBe(true);
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain(NOTICE);
+    expect(text.indexOf(NOTICE)).toBeLessThan(text.indexOf(AR5IV_UNCONFIRMED.content));
+  });
+
+  it('carries no flag and no notice when the service sets none', async () => {
+    for (const source of ['arxiv_html', 'ar5iv', 'pdf_text'] as const) {
+      mockReadContent.mockResolvedValue({ ...MOCK_CONTENT, source });
+      const result = await runToolContract(arxivReadPaper, { paper_id: '2401.12345' });
+
+      expect(result.structuredContent, source).not.toHaveProperty('revision_unconfirmed');
+      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      expect(text, source).not.toContain('Revision unconfirmed');
+    }
+  });
+
+  it('declares the flag as present-or-absent, never false', () => {
+    const shape = arxivReadPaper.output.shape;
+    expect(shape.revision_unconfirmed.safeParse(true).success).toBe(true);
+    expect(shape.revision_unconfirmed.safeParse(undefined).success).toBe(true);
+    expect(shape.revision_unconfirmed.safeParse(false).success).toBe(false);
+    expect(shape.revision_unconfirmed.description).toContain(
+      'pdf_url is exactly the paper_id revision',
+    );
+    expect(shape.source.description).toContain('ar5iv keeps one render per paper');
+  });
+
+  it('puts the version_not_served recovery on both surfaces, as a failure not to retry (#53)', async () => {
+    mockReadContent.mockRejectedValue(
+      notFound(
+        "Paper 'hep-th/9901001v1' could not be served. arXiv's API answered HTTP 500 for the lookup holding this version; the latest version is v3.",
+        {
+          paperId: 'hep-th/9901001v1',
+          pdfUrl: 'https://arxiv.org/pdf/hep-th/9901001v1',
+          reason: 'version_not_served',
+        },
+      ),
+    );
+    const result = await runToolContract(arxivReadPaper, { paper_id: 'hep-th/9901001v1' });
+
+    expect(result.isError).toBe(true);
+    const contract = arxivReadPaper.errors?.find((e) => e.reason === 'version_not_served');
+    expect(contract).toMatchObject({ code: JsonRpcErrorCode.NotFound });
+    expect(contract).not.toHaveProperty('retryable', true);
+    const error = (
+      result.structuredContent as {
+        error: {
+          code: number;
+          data: { pdfUrl?: string; recovery?: { hint: string }; retryable?: boolean };
+        };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.data.recovery?.hint).toBe(contract?.recovery);
+    expect(error.data.retryable).not.toBe(true);
+    // The recovery sends the caller to error.data.pdfUrl, so that field must arrive.
+    expect(contract?.recovery).toContain('error.data.pdfUrl');
+    expect(error.data.pdfUrl).toBe('https://arxiv.org/pdf/hep-th/9901001v1');
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('the latest version is v3');
+    expect(text).toContain(contract?.recovery ?? '<missing>');
+  });
+
+  it('passes a live outage through as itself on both surfaces, with no not-found guidance (#68)', async () => {
+    mockReadContent.mockRejectedValue(
+      serviceUnavailable('arXiv API returned HTTP 503 (failed after 2 attempts)', {
+        url: 'https://export.arxiv.org/api/query?id_list=0704.0001v1&max_results=1',
+        status: 503,
+        body: '<feed/>',
+      }),
+    );
+    const result = await runToolContract(arxivReadPaper, { paper_id: '0704.0001v1' });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; message: string; data: { reason?: string; status?: number } };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.message).toBe('arXiv API returned HTTP 503 (failed after 2 attempts)');
+    expect(error.data).toMatchObject({ status: 503 });
+    expect(error.data).not.toHaveProperty('reason');
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain('arXiv API returned HTTP 503 (failed after 2 attempts)');
+    for (const contract of arxivReadPaper.errors ?? []) {
+      expect(text).not.toContain(contract.recovery);
+    }
+  });
+
+  it('passes a read that ran out of time through as a retryable Timeout on both surfaces (#69)', async () => {
+    const message =
+      "Reading arXiv paper '2401.12345' timed out after 50000ms; the request to arXiv PDF was still open.";
+    mockReadContent.mockRejectedValue(
+      timeout(message, { paperId: '2401.12345', timeoutMs: 50_000 }),
+    );
+    const result = await runToolContract(arxivReadPaper, { paper_id: '2401.12345' });
+
+    expect(result.isError).toBe(true);
+    const error = (
+      result.structuredContent as {
+        error: { code: number; message: string; data: { reason?: string; timeoutMs?: number } };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+    expect(error.message).toBe(message);
+    expect(error.data).toMatchObject({ paperId: '2401.12345', timeoutMs: 50_000 });
+    expect(error.data).not.toHaveProperty('reason');
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain(message);
+    expect(text).not.toContain('not retryable');
+    for (const contract of arxivReadPaper.errors ?? []) {
+      expect(text).not.toContain(contract.recovery);
+    }
   });
 });

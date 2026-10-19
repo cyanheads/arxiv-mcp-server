@@ -142,6 +142,26 @@ describe('paperResource', () => {
     });
   });
 
+  it('fails with version_not_served, not no_match, on a version arXiv will not serve (#53)', async () => {
+    const detail =
+      "arXiv's API answered HTTP 500 for the lookup holding this version; the latest version is v3.";
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [{ id: 'hep-th/9901001v1', reason: 'version_not_served', detail }],
+    });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await expect(
+      paperResource.handler({ paperId: 'hep-th%2F9901001v1' }, ctx),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'version_not_served', paperId: 'hep-th/9901001v1' },
+      message: `Paper 'hep-th/9901001v1' could not be served. ${detail}`,
+    });
+  });
+
   it('still fails with no_match when the ID is genuinely absent from arXiv (#35)', async () => {
     mockGetPapers.mockResolvedValue({
       papers: [],

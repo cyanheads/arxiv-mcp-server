@@ -75,18 +75,31 @@ export const ARXIV_API_RESULT_LIMIT = 10_000;
  * - `version_not_in_mirror` — the paper exists and the local mirror holds it,
  *   but at a different version, and live fallback is disabled. The ID is
  *   unreachable in this configuration, not absent from arXiv. See issue #35.
+ * - `version_not_served` — the ID pins a superseded version of an old-style
+ *   paper that arXiv's API answered HTTP 500 for; the version exists, and
+ *   `detail` names the latest one. See issue #53.
+ * - `live_lookup_failed` — the local mirror could not serve the ID and the
+ *   live lookup it fell back to failed (arXiv unavailable, timed out, or
+ *   throttled); `detail` names the failure, and a later call may serve it.
+ *   See issue #67.
  * - `invalid_id` — the input is not an arXiv identifier in any accepted
  *   spelling, so it was never looked up. See issue #41.
  */
 export const PaperNotFoundReasonSchema = z
-  .enum(['not_in_arxiv', 'version_not_in_mirror', 'invalid_id'])
+  .enum([
+    'not_in_arxiv',
+    'version_not_in_mirror',
+    'version_not_served',
+    'live_lookup_failed',
+    'invalid_id',
+  ])
   .describe('Why the paper ID could not be returned.');
 
 export type PaperNotFoundReason = z.infer<typeof PaperNotFoundReasonSchema>;
 
 /** One requested ID that returned no metadata, with the reason it could not be served. */
 export interface PaperLookupMiss {
-  /** Human-readable supplement — names the version the mirror holds, when known. */
+  /** Human-readable supplement — names the version that can be served, when known. */
   detail?: string;
   id: string;
   reason: PaperNotFoundReason;
@@ -105,6 +118,7 @@ export interface PaperLookupResult {
  *
  * - `arxiv_html` — arXiv's own LaTeXML render at `arxiv.org/html/{id}`.
  * - `ar5iv` — the ar5iv LaTeXML conversion at `ar5iv.labs.arxiv.org/html/{id}`.
+ *   ar5iv keeps one render per paper, whatever version is requested. See issue #63.
  * - `pdf_text` — text extracted from the PDF, used when neither render exists.
  *   Both HTML pipelines run LaTeXML, so a submission that breaks one usually
  *   breaks the other and the PDF is the only artifact left. See issue #23.
@@ -112,7 +126,7 @@ export interface PaperLookupResult {
 export const PaperContentSourceSchema = z
   .enum(['arxiv_html', 'ar5iv', 'pdf_text'])
   .describe(
-    'Which upstream artifact the body was read from. arxiv_html and ar5iv are HTML renders; pdf_text is text extracted from the PDF, where prose is reliable but math, tables, and heading structure are flattened.',
+    'Which upstream artifact the body was read from. arxiv_html and ar5iv are HTML renders; pdf_text is text extracted from the PDF, where prose is reliable but math, tables, and heading structure are flattened. ar5iv keeps one render per paper, so an ar5iv body can be another revision than paper_id (see revision_unconfirmed).',
   );
 
 export type PaperContentSource = z.infer<typeof PaperContentSourceSchema>;
@@ -174,6 +188,12 @@ export interface PaperContent {
   outline_omitted_levels?: number[];
   paper_id: string;
   pdf_url: string;
+  /**
+   * Set on an ar5iv body, which may be another revision than `paper_id`: ar5iv
+   * keeps one render per paper. Absent on every other body, and on an
+   * unversioned read of a paper whose only version is v1. See issue #63.
+   */
+  revision_unconfirmed?: true;
   source: PaperContentSource;
   /** Character offset of the first character in `content` within the cleaned body. */
   start: number;

@@ -48,7 +48,7 @@ const OutputSchema = partialResultSchema({
   succeededKey: 'papers',
   succeededSchema: PaperMetadataSchema,
   succeededDescription:
-    'Papers found, in request order. Fewer than requested when an ID is malformed, absent from arXiv, or past the first 10 well-formed IDs.',
+    'Papers found, in request order. Fewer than requested when an ID is malformed, absent from arXiv, a version arXiv will not serve, one whose live lookup failed behind the local mirror, or past the first 10 well-formed IDs.',
   failedKey: 'not_found',
   idKey: 'id',
   idDescription:
@@ -91,6 +91,14 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       when: 'Every requested ID pinned a version the local mirror does not hold, and live arXiv fallback is disabled.',
       recovery:
         'Request the version named in the error detail, or drop the version suffix to get the latest.',
+    },
+    {
+      reason: 'version_not_served',
+      code: JsonRpcErrorCode.NotFound,
+      when: "Every requested ID pinned a superseded version of a pre-2007 paper that arXiv's API answers HTTP 500 for. The version exists, but its metadata cannot be returned.",
+      recovery:
+        'Request the latest version each not_found detail names, or drop the version suffix; a version whose detail says to request it alone may be served that way.',
+      severity: 'notice',
     },
     {
       reason: 'rate_limited',
@@ -172,29 +180,31 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
     // With IDs still to look up, an all-miss page is a result that names them,
     // not a failure that would drop them.
     if (result.papers.length === 0 && remaining.length === 0) {
-      // A version the mirror lacks is reachable upstream, so `no_match` would
-      // tell the caller to doubt an ID that is in fact valid. Fail with the
-      // reason that names the real constraint. See issue #35.
-      if (
-        lookupMisses.length > 0 &&
-        lookupMisses.every((m) => m.reason === 'version_not_in_mirror')
-      ) {
-        throw ctx.fail(
-          'version_unavailable',
-          lookupMisses
-            .map((miss) =>
-              [`'${miss.id}' could not be served.`, miss.detail].filter(Boolean).join(' '),
-            )
-            .join(' '),
-          { ids: lookup, not_found: notFound },
-        );
-      }
+      // A version the mirror lacks (#35) or one arXiv will not serve (#53) is a
+      // real version, so `no_match` would tell the caller to doubt an ID that
+      // is in fact valid. Fail with the reason that names the real constraint.
+      const everyMiss = (reason: PaperLookupMiss['reason']) =>
+        lookupMisses.length > 0 && lookupMisses.every((m) => m.reason === reason);
+      const versionReason = everyMiss('version_not_in_mirror')
+        ? 'version_unavailable'
+        : everyMiss('version_not_served')
+          ? 'version_not_served'
+          : undefined;
+      // Every path's message carries each miss's detail and the malformed
+      // inputs, so a caller reading only the text still learns which version
+      // can be served — a `no_match` included, where such a miss sits beside
+      // IDs absent from arXiv.
       const malformed = requested.filter((entry) => !entry.id).map((entry) => `'${entry.raw}'`);
-      throw ctx.fail(
-        'no_match',
-        `No papers found for the given IDs.${malformed.length > 0 ? ` Not arXiv IDs, so never looked up: ${malformed.join(', ')}.` : ''}`,
-        { ids: lookup, not_found: notFound },
-      );
+      const message = [
+        !versionReason && 'No papers found for the given IDs.',
+        ...lookupMisses.flatMap((miss) =>
+          miss.detail ? [`'${miss.id}' could not be served. ${miss.detail}`] : [],
+        ),
+        malformed.length > 0 && `Not arXiv IDs, so never looked up: ${malformed.join(', ')}.`,
+      ]
+        .filter(Boolean)
+        .join(' ');
+      throw ctx.fail(versionReason ?? 'no_match', message, { ids: lookup, not_found: notFound });
     }
 
     ctx.log.info('Metadata lookup completed', {

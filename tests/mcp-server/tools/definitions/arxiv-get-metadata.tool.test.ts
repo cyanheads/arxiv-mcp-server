@@ -131,6 +131,56 @@ describe('arxivGetMetadata', () => {
     });
   });
 
+  it('fails with version_not_served, not no_match, when every miss is a version arXiv will not serve (#53)', async () => {
+    const detail =
+      "arXiv's API answered HTTP 500 for the lookup holding this version; the latest version is v3.";
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [{ id: 'hep-th/9901001v1', reason: 'version_not_served', detail }],
+    });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['hep-th/9901001v1', 'not an id'] });
+
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'version_not_served',
+        not_found: [
+          { id: 'hep-th/9901001v1', reason: 'version_not_served', detail },
+          expect.objectContaining({ id: 'not an id', reason: 'invalid_id' }),
+        ],
+      },
+      message: `'hep-th/9901001v1' could not be served. ${detail} Not arXiv IDs, so never looked up: 'not an id'.`,
+    });
+  });
+
+  it('fails with no_match when version_not_served misses mix with IDs absent from arXiv (#53)', async () => {
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [
+        { id: 'hep-th/9901001v1', reason: 'version_not_served', detail: 'Latest is v3.' },
+        { id: 'hep-th/9901001v4', reason: 'not_in_arxiv' },
+      ],
+    });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({
+      paper_ids: ['hep-th/9901001v1', 'hep-th/9901001v4'],
+    });
+
+    // The message still names the version that can be served, so a caller
+    // reading only the text is not told to doubt a real version.
+    await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_match' },
+      message:
+        "No papers found for the given IDs. 'hep-th/9901001v1' could not be served. Latest is v3.",
+    });
+  });
+
   it('still fails with no_match when the IDs are genuinely absent from arXiv (#35)', async () => {
     mockGetPapers.mockResolvedValue({
       papers: [],
@@ -188,6 +238,25 @@ describe('arxivGetMetadata', () => {
     expect(text).toContain('Found 1 of 3 papers');
     expect(text).toContain('9999.99999 (not_in_arxiv)');
     expect(text).toContain('1706.03762v7 (version_not_in_mirror): Mirror holds version 3.');
+  });
+
+  it('advertises version_not_served in the not_found reason enum and errors[], and renders it (#53)', () => {
+    const result = {
+      papers: [MOCK_PAPER],
+      totalSucceeded: 1,
+      not_found: [
+        { id: 'hep-th/9901001v1', reason: 'version_not_served' as const, detail: 'Latest is v3.' },
+      ],
+    };
+    const output = arxivGetMetadata.output.parse(result);
+    expect(output.not_found?.[0]?.reason).toBe('version_not_served');
+    const blocks = arxivGetMetadata.format?.(output) ?? [];
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Found 1 of 2 papers');
+    expect(text).toContain('- hep-th/9901001v1 (version_not_served): Latest is v3.');
+    const contract = arxivGetMetadata.errors?.find((e) => e.reason === 'version_not_served');
+    expect(contract).toMatchObject({ code: JsonRpcErrorCode.NotFound });
+    expect(contract).not.toHaveProperty('retryable', true);
   });
 
   it('carries remaining_ids and invalid_id entries on both surfaces (#41, #51)', async () => {
