@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.6.1](changelog/1.6.x/1.6.1.md) — 2026-10-18
+
+Moves mirror searches off the request thread, gives arxiv_read_paper one read deadline (ARXIV_READ_TIMEOUT_MS), makes the server's mirror connection query-only with one migrating writer at a time, and fixes the lookup and read paths around outages, stalled bodies, and superseded old-style versions.
+
 ## [1.6.0](changelog/1.6.x/1.6.0.md) — 2026-10-17 · ⚠️ Breaking
 
 Renames arxiv_search to arxiv_search_papers (no alias), adds a section outline to arxiv_read_paper, runs every ID input through one parser, and bounds mirror searches and refreshes. Adopts mcp-ts-core ^0.13.15.

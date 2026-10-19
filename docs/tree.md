@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-10-17 20:24:33
+Generated on: 2026-10-19 01:08:07
 
 ```text
 arxiv-mcp-server/
@@ -170,6 +170,8 @@ arxiv-mcp-server/
 │   │       │   ├── harvester.ts
 │   │       │   ├── index.ts
 │   │       │   ├── query.ts
+│   │       │   ├── reader-worker.ts
+│   │       │   ├── reader.ts
 │   │       │   ├── refresh-subprocess.ts
 │   │       │   ├── runner.ts
 │   │       │   ├── schema.sql
@@ -183,13 +185,40 @@ arxiv-mcp-server/
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── fixtures/
+│   │   ├── arxiv-api/
+│   │   │   ├── 1706.03762+astro-ph_0703001.xml
+│   │   │   ├── 1706.03762+astro-ph_0703001v1.xml
+│   │   │   ├── 1706.03762+hep-th_9901001.xml
+│   │   │   ├── 1706.03762+hep-th_9901001v3.xml
+│   │   │   ├── 1706.03762v1.xml
+│   │   │   ├── 1706.03762v1+hep-th_9901001.xml
+│   │   │   ├── astro-ph_0703001+hep-th_9901001.xml
+│   │   │   ├── hep-th_9901001.xml
+│   │   │   ├── hep-th_9901001+math_0309136.xml
+│   │   │   └── http-500.xml
 │   │   └── arxiv-html/
+│   │       ├── ar5iv-1412.6980.html.gz
+│   │       ├── ar5iv-1503.00739.html.gz
+│   │       ├── ar5iv-1507.08011.html.gz
+│   │       ├── ar5iv-1606.03749.html.gz
 │   │       ├── ar5iv-1706.03762v7.html.gz
+│   │       ├── ar5iv-1707.00406.html.gz
+│   │       ├── ar5iv-2411.15218v2-headings.html.gz
+│   │       ├── ar5iv-2608.20066.html.gz
 │   │       ├── ar5iv-hep-th_9711200v3.html.gz
 │   │       ├── ar5iv-math_9201201v1.html.gz
+│   │       ├── native-1412.6980.html.gz
 │   │       ├── native-1706.03762v7.html.gz
+│   │       ├── native-1709.01250v1.html.gz
+│   │       ├── native-2101.10578v1.html.gz
+│   │       ├── native-2102.10962v1-headings.html.gz
+│   │       ├── native-2206.14567-headings.html.gz
 │   │       ├── native-2405.03599v3-headings.html.gz
+│   │       ├── native-2411.15218v2.html.gz
+│   │       ├── native-2608.20066.html.gz
 │   │       ├── native-astro-ph_0603449v2-headings.html.gz
 │   │       └── native-math_9201201v1.html.gz
 │   ├── mcp-server/
@@ -216,6 +245,7 @@ arxiv-mcp-server/
 │           │   ├── migration.test.ts
 │           │   ├── parity.test.ts
 │           │   ├── query.test.ts
+│           │   ├── reader.test.ts
 │           │   ├── refresh-subprocess.test.ts
 │           │   ├── runner.test.ts
 │           │   └── store.test.ts
