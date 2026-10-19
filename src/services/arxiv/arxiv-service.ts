@@ -40,11 +40,14 @@ import {
 } from './date-window.js';
 import {
   expandCategoryOperands,
-  getStore,
   MIRROR_SEARCH_MATCH_CAP,
-  type MirrorStore,
-  openStore,
+  type MirrorNotReady,
+  type MirrorSearcher,
+  type MirrorSearchOutcome,
+  openReaderStore,
   type PaperRow,
+  type ReadyMirror,
+  searchInWorker,
   translateQuery,
 } from './mirror/index.js';
 import {
@@ -160,6 +163,105 @@ function isArxivTransient(err: unknown): boolean {
   return defaultIsTransient(err);
 }
 
+/**
+ * One deadline for a whole `readContent` call: the metadata lookup (its wait for
+ * the API queue included), every content rung, each retry, and the waits between
+ * them. Per-request timeouts alone cannot bound the read, since it chains the
+ * lookup and up to three content requests, retries the lookup, and replays the
+ * content chain once. Every request and wait the read makes carries `signal`, so
+ * it settles once `ARXIV_READ_TIMEOUT_MS` has passed, inside the request timeout
+ * of the client waiting on it. See #69.
+ */
+interface ReadDeadline {
+  /** The `Timeout` the read fails with once `signal` has fired; `detail` says what was pending. */
+  exceeded(detail: string): McpError;
+  /** Aborts once the read's time is up. */
+  readonly signal: AbortSignal;
+}
+
+function startReadDeadline(paperId: string, timeoutMs: number): ReadDeadline {
+  const signal = AbortSignal.timeout(timeoutMs);
+  return {
+    signal,
+    exceeded: (detail) =>
+      timeout(
+        `Reading arXiv paper '${paperId}' timed out after ${timeoutMs}ms; ${detail}.`,
+        { paperId, timeoutMs },
+        { cause: signal.reason },
+      ),
+  };
+}
+
+/** The signal a call's waits end on: the caller's, joined by the read's deadline when it has one. */
+function callSignal(ctx: Context, deadline?: ReadDeadline): AbortSignal {
+  return deadline ? AbortSignal.any([ctx.signal, deadline.signal]) : ctx.signal;
+}
+
+/** One request's signal: the call's, plus the request's own timeout. */
+function requestSignal(ctx: Context, timeoutMs: number, deadline?: ReadDeadline): AbortSignal {
+  return AbortSignal.any([callSignal(ctx, deadline), AbortSignal.timeout(timeoutMs)]);
+}
+
+/** A request as its failures describe it. */
+interface RequestSite {
+  /** Context every failure of the request carries. */
+  readonly data: Record<string, unknown>;
+  /** The host as messages name it: `${label} timed out after …`, `${label} network error`. */
+  readonly label: string;
+  readonly timeoutMs: number;
+}
+
+/**
+ * Classify a failed request: the `fetch` itself, or the read of a body that
+ * stalled or dropped after its headers arrived — both fail the same way. A
+ * caller cancellation is rethrown as the caller's own reason, and a read out of
+ * time throws its deadline's `Timeout`; both end the call. Anything else is
+ * returned for the caller to throw or hold: `Timeout` when the request's own
+ * timeout fired (never retried, per `isArxivTransient` — a hang is
+ * overwhelmingly throttling at the connection layer), `ServiceUnavailable` for a
+ * network error (retried).
+ */
+function requestFailure(
+  err: unknown,
+  ctx: Context,
+  site: RequestSite,
+  deadline?: ReadDeadline,
+): McpError {
+  if (ctx.signal.aborted) throw ctx.signal.reason;
+  if (deadline?.signal.aborted) {
+    throw deadline.exceeded(`the request to ${site.label} was still open`);
+  }
+  if (err instanceof Error && err.name === 'TimeoutError') {
+    return timeout(
+      `${site.label} timed out after ${site.timeoutMs}ms`,
+      { ...site.data, timeoutMs: site.timeoutMs },
+      { cause: err },
+    );
+  }
+  return serviceUnavailable(`${site.label} network error`, site.data, { cause: err });
+}
+
+/**
+ * The error a content host's 5xx fails its rung with: `ServiceUnavailable`, 500
+ * and 501 included, so `withRetry` replays the chain. Capturing the error body
+ * for the message is a body read too: one that ran into the request's timeout or
+ * deadline, or outlived a cancellation, fails as `requestFailure` says.
+ */
+async function serverErrorFailure(
+  response: Response,
+  service: string,
+  signal: AbortSignal,
+  ctx: Context,
+  site: RequestSite,
+  deadline: ReadDeadline,
+): Promise<McpError> {
+  const failure = await httpErrorFromResponse(response, {
+    service,
+    codeOverride: (s) => (s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined),
+  });
+  return signal.aborted ? requestFailure(signal.reason, ctx, site, deadline) : failure;
+}
+
 // ---------------------------------------------------------------------------
 // Raw XML types (fast-xml-parser output shapes)
 // ---------------------------------------------------------------------------
@@ -265,6 +367,44 @@ export function isConversionFailurePage(html: string): boolean {
     )
     .replace(/<[^<>]*>/g, '');
   return !/\S/.test(text);
+}
+
+/** Heading classes that mark document structure; theorem, proof, abstract, and contents titles do not. */
+const OUTLINE_HEADING_CLASS =
+  /\bltx_title_(?:part|chapter|section|subsection|subsubsection|paragraph|appendix|bibliography)\b/;
+/** An `<hN>` opener whose class marks document structure: a heading `buildOutline` lists. */
+const STRUCTURAL_HEADING = new RegExp(`<h[1-6]\\s[^<>]*${OUTLINE_HEADING_CLASS.source}`);
+/**
+ * LaTeXML's rendering of a `pdfpages` `\includepdf`: "See pages R of", or a
+ * bare "See", then a link to the included file. The file's pages never reach
+ * the HTML. Group 1 is the link's attributes.
+ */
+const INCLUDEPDF_PLACEHOLDER = /See (?:pages [^<>]{0,200} of )?<a\s([^<>]*)>[^<>]*<\/a>/g;
+/** The class LaTeXML gives the placeholder's link (`ltx:ref`). */
+const LTX_REF_CLASS = /\bclass="ltx_ref"/;
+
+/**
+ * Whether an HTML page is a render that holds none of the paper: its article
+ * has no structural heading (none of the headings `buildOutline` lists) and
+ * either carries an `\includepdf` placeholder or has no text at all. LaTeXML
+ * renders each included PDF as one placeholder sentence, so a paper whose
+ * source wraps PDFs comes back from both HTML rungs as HTTP 200 with those
+ * sentences, at most beside front matter, while its PDF holds the pages. Both
+ * rungs also answer 200 with an empty article, ar5iv's "No content available"
+ * page among them. A page with a structural heading is a render whatever
+ * placeholders it holds, like a thesis whose cover is an included page. See
+ * issue #57.
+ *
+ * Each scan stops at the next `<` or `>`, or after a bounded run, so the check
+ * stays linear in page length.
+ */
+export function isPlaceholderRender(html: string): boolean {
+  const article = stripHtmlHead(html);
+  if (STRUCTURAL_HEADING.test(article)) return false;
+  for (const [, attributes = ''] of article.matchAll(INCLUDEPDF_PLACEHOLDER)) {
+    if (LTX_REF_CLASS.test(attributes)) return true;
+  }
+  return !/\S/.test(article.replace(/<[^<>]*>/g, ''));
 }
 
 /**
@@ -418,11 +558,14 @@ const OUTLINE_TITLE_MAX = 120;
 /** Longest heading markup read for a title; a longer span is a heading that never closes. */
 const HEADING_SOURCE_MAX = 4000;
 
-/** A cleaned LaTeXML heading opener — `stripLatexmlNoise` leaves exactly `<hN class="…">`. */
-const HEADING_OPENER = /<h([1-6]) class="([^"<>]{1,200})">/y;
-/** Heading classes that mark document structure; theorem, proof, abstract, and contents titles do not. */
-const OUTLINE_HEADING_CLASS =
-  /\bltx_title_(?:part|chapter|section|subsection|subsubsection|paragraph|appendix|bibliography)\b/;
+/**
+ * A cleaned LaTeXML heading opener, `<hN …>`, group 2 its attributes.
+ * `stripLatexmlNoise` drops the `id` but keeps a structural class and any
+ * other attribute beside it, such as the `style` LaTeXML gives a resized
+ * heading (`<h4 class="ltx_title ltx_title_section" style="font-size:90%;">`).
+ * The attribute scan stops at the next `<` or `>`. See issue #66.
+ */
+const HEADING_OPENER = /<h([1-6])(\s[^<>]*)?>/y;
 
 const NAMED_CHARACTER_REFERENCES: Record<string, string> = {
   amp: '&',
@@ -469,8 +612,9 @@ function headingTitle(markup: string): string {
  * entries are kept and `continuesAt` is the offset of the first one left out.
  * See issue #44.
  *
- * One forward pass. Each candidate `<h` is matched against a bounded sticky
- * opener, and the closer lookup is cached — a heading's closer is the first
+ * One forward pass. Each candidate `<h` is matched against a sticky opener
+ * that stops at the next `<` or `>`, so no two candidates scan the same
+ * characters, and the closer lookup is cached — a heading's closer is the first
  * `</h` after its content, which later headings reuse until they pass it — so
  * the scan stays linear in body length.
  */
@@ -546,6 +690,44 @@ function parseVersion(id: string): number | undefined {
 }
 
 /**
+ * Whether `id` is an old-style ID (`archive/YYMMNNN`) pinned to a version. IDs
+ * reach the service in canonical form, where only an old-style ID has a slash.
+ */
+function isPinnedOldStyleId(id: string): boolean {
+  return id.includes('/') && parseVersion(id) !== undefined;
+}
+
+/** Whether `err` is arXiv's API answering HTTP 500 (and not another 5xx). */
+function isHttp500(err: unknown): boolean {
+  return err instanceof McpError && err.data?.status === 500;
+}
+
+/**
+ * Explain a pinned old-style version arXiv's API would not serve: the lookup
+ * holding it answered HTTP 500, and the unversioned request sent in its place
+ * returned `latest`. When other superseded versions shared that lookup, any of
+ * them may be the one arXiv fails on, so each is told to go alone. See issue #53.
+ */
+function describeUnservedVersion(
+  id: string,
+  latest: number,
+  sharedLookup: boolean,
+): PaperLookupMiss {
+  return {
+    id,
+    reason: 'version_not_served',
+    detail: [
+      `arXiv's API answered HTTP 500 for the lookup holding this version, so its metadata could not be returned; the latest version is v${latest}.`,
+      `Request '${stripVersion(id)}v${latest}', or the ID without a version suffix, for the latest; this version's PDF is at https://arxiv.org/pdf/${id}.`,
+      sharedLookup &&
+        `Other superseded versions shared that lookup, and arXiv serves some of them on their own. Request '${id}' alone to try it again.`,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  };
+}
+
+/**
  * Match each requested arXiv ID to a candidate record, slot-aligned with `ids`
  * (`undefined` where nothing satisfies the request).
  *
@@ -614,17 +796,14 @@ function rowToMetadata(row: PaperRow): PaperMetadata {
 }
 
 /**
- * Explain why a requested ID produced no metadata. When the live API was never
- * consulted and the mirror holds the paper at a different version, the ID is
- * unreachable in this configuration rather than absent from arXiv — say which,
- * and name the version that can be served. See issue #35.
+ * Explain why a requested ID the mirror could not serve, and the live API was
+ * never asked for, produced no metadata. When the mirror holds the paper at a
+ * different version, the ID is unreachable in this configuration rather than
+ * absent from arXiv — say which, and name the version that can be served. See
+ * issue #35.
  */
-function describeLookupMiss(
-  id: string,
-  rows: readonly PaperRow[],
-  consultedLive: boolean,
-): PaperLookupMiss {
-  if (!consultedLive && parseVersion(id) !== undefined) {
+function describeLookupMiss(id: string, rows: readonly PaperRow[]): PaperLookupMiss {
+  if (parseVersion(id) !== undefined) {
     const stored = rows.find((row) => row.id === stripVersion(id));
     if (stored) {
       return {
@@ -638,9 +817,88 @@ function describeLookupMiss(
 }
 
 /**
+ * Whether a failed live patch-up is an outage a later call can get past: arXiv
+ * unavailable (a 5xx after its retry, a network error), timed out, or
+ * throttled. A lookup arXiv rejected outright would fail the same way again.
+ */
+function isLiveOutage(err: unknown): err is McpError {
+  return (
+    err instanceof McpError &&
+    (err.code === JsonRpcErrorCode.ServiceUnavailable ||
+      err.code === JsonRpcErrorCode.Timeout ||
+      err.code === JsonRpcErrorCode.RateLimited)
+  );
+}
+
+/**
+ * Explain an ID the mirror could not serve whose live lookup failed: name the
+ * failure, say a later call may serve it, and name the version the mirror
+ * holds when it holds the paper at another one. See issue #67.
+ */
+function describeLiveLookupFailure(
+  id: string,
+  rows: readonly PaperRow[],
+  err: McpError,
+): PaperLookupMiss {
+  const stored =
+    parseVersion(id) === undefined ? undefined : rows.find((row) => row.id === stripVersion(id));
+  return {
+    id,
+    reason: 'live_lookup_failed',
+    detail: [
+      `The local mirror cannot serve this ID, and the live arXiv lookup for it failed: ${err.message}.`,
+      'The same call made again may serve it.',
+      stored &&
+        `The mirror holds version ${stored.version}: request '${stored.id}v${stored.version}' to read that one now.`,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  };
+}
+
+/**
+ * Log a mirror file a reader open cannot serve, and report an older schema no
+ * writer is migrating to `onSchemaOutdated`, the hook that starts the writer
+ * that migrates it. Shared by the request thread's open and the reader
+ * worker's own.
+ */
+function reportMirrorNotReady(
+  ctx: Context,
+  reader: MirrorNotReady,
+  onSchemaOutdated: (() => void) | undefined,
+): void {
+  ctx.log.debug('Mirror not ready; using live API', {
+    reason: reader.status,
+    ...((reader.status === 'older_schema' || reader.status === 'migrating') && {
+      schemaVersion: reader.version,
+    }),
+  });
+  if (reader.status === 'older_schema') onSchemaOutdated?.();
+}
+
+/**
+ * Log a mirror open that threw; the call goes live. Shared by the request
+ * thread's open and the reader worker's own, so neither puts the store's
+ * error in front of the caller.
+ */
+function reportMirrorOpenFailed(ctx: Context, err: unknown): void {
+  ctx.log.warning('Mirror open failed; using live API', {
+    error: err instanceof Error ? err.message : String(err),
+  });
+}
+
+/**
  * Open the mirror store lazily and verify it has usable data. Returns the store
- * when the mirror is enabled and a full harvest has ever completed; otherwise
- * returns undefined so the caller falls through to the live API.
+ * and its path when the mirror is enabled and a full harvest has ever
+ * completed; otherwise returns undefined so the caller falls through to the
+ * live API.
+ *
+ * The open is query-only and never writes (issue #55). A file it cannot serve —
+ * missing, with no recorded schema, or on an older schema version — is not
+ * ready: logged at debug, opened afresh on the next call, and never created or
+ * migrated here. An older schema with no writer migrating it is reported to
+ * `onSchemaOutdated`, the hook that starts the writer that migrates it; one a
+ * writer is migrating already (`migrating`) is not (issue #71).
  *
  * Readiness keys off the durable `completed_at` marker, NOT the live `status`.
  * The mirror's tables stay transactionally queryable during an incremental
@@ -653,11 +911,19 @@ function describeLookupMiss(
  * surfaced as `undefined` — the caller transparently falls back to live. The
  * upstream operator sees the failure via the next `mirror:verify` run.
  */
-async function tryReadyMirror(ctx: Context): Promise<{ store: MirrorStore } | undefined> {
+async function tryReadyMirror(
+  ctx: Context,
+  onSchemaOutdated: (() => void) | undefined,
+): Promise<ReadyMirror | undefined> {
   const config = getServerConfig();
   if (!config.mirrorEnabled) return;
   try {
-    const store = getStore() ?? (await openStore(config.mirrorPath));
+    const opened = await openReaderStore(config.mirrorPath);
+    if (opened.status !== 'open') {
+      reportMirrorNotReady(ctx, opened, onSchemaOutdated);
+      return;
+    }
+    const { store } = opened;
     const state = store.readHarvestState();
     if (state.completed_at == null) {
       ctx.log.debug('Mirror not ready (no completed harvest yet); using live API', {
@@ -665,11 +931,9 @@ async function tryReadyMirror(ctx: Context): Promise<{ store: MirrorStore } | un
       });
       return;
     }
-    return { store };
+    return { path: config.mirrorPath, store };
   } catch (err) {
-    ctx.log.warning('Mirror open failed; using live API', {
-      error: err instanceof Error ? err.message : String(err),
-    });
+    reportMirrorOpenFailed(ctx, err);
     return;
   }
 }
@@ -715,6 +979,22 @@ function shouldBypassForRecency(options: SearchOptions, recentDaysLive: number):
 // ArxivService
 // ---------------------------------------------------------------------------
 
+/** Hooks the server wires into the service at setup. */
+export interface ArxivServiceOptions {
+  /**
+   * Where mirror searches run: the reader worker by default (issue #58).
+   * `searchInThread` runs them on the request thread's own store, where a
+   * test can observe the store calls.
+   */
+  mirrorSearcher?: MirrorSearcher;
+  /**
+   * Called each time a mirror read finds the file on an older schema version
+   * than this build reads, with no writer migrating it — the cue to start the
+   * writer that migrates it.
+   */
+  onMirrorSchemaOutdated?: () => void;
+}
+
 export class ArxivService {
   private readonly parser: XMLParser;
   private apiQueue: Promise<void> = Promise.resolve();
@@ -732,8 +1012,10 @@ export class ArxivService {
    * next successful response. See issue #9.
    */
   private consecutiveRateLimits = 0;
+  private readonly mirrorSearcher: MirrorSearcher;
 
-  constructor() {
+  constructor(private readonly options: ArxivServiceOptions = {}) {
+    this.mirrorSearcher = options.mirrorSearcher ?? searchInWorker;
     this.parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: '@_',
@@ -775,8 +1057,8 @@ export class ArxivService {
     // free-text term is over its match cap — a query over the cap never falls
     // back to it, so the cap bounds every mirror search.
     const fromMirror = async () => {
-      const ready = await tryReadyMirror(ctx);
-      return ready && this.searchMirror(ready.store, query, searchQuery, options, ctx);
+      const ready = await tryReadyMirror(ctx, this.options.onMirrorSchemaOutdated);
+      return ready && (await this.searchMirror(ready, query, searchQuery, options, ctx));
     };
 
     // Mirror path: enabled, harvest complete, the query isn't sort-by-recent
@@ -835,7 +1117,10 @@ export class ArxivService {
       // caller's cancellation into a success nobody is waiting for.
       if (!bypassForRecency || ctx.signal.aborted) throw err;
       const mirrored = await fromMirror();
-      if (!mirrored) throw err;
+      // A mirror that matches nothing says nothing about the newest papers the
+      // bypass went live for: the live failure stands rather than reading as
+      // a query with no matches. See issue #68.
+      if (!mirrored || mirrored.total_results === 0) throw err;
       ctx.log.warning('Live API failed on recency bypass; answered from mirror', {
         error: err instanceof Error ? err.message : String(err),
       });
@@ -902,15 +1187,20 @@ export class ArxivService {
    * matches at least {@link MIRROR_SEARCH_MATCH_CAP} papers — the caller answers
    * it from the live API instead, whose total is arXiv's own exact count. Only a
    * free-text term is probed; a category- or date-only search keeps its
-   * index-backed mirror path (#19, #49).
+   * index-backed mirror path (#19, #49). `undefined` too when the reader
+   * worker's own open finds the file not ready or throws, each reported as the
+   * request thread's open reports it.
+   *
+   * The probe and the search run through the service's `MirrorSearcher`: in the
+   * reader worker unless the service was built with another (issue #58).
    */
-  private searchMirror(
-    store: MirrorStore,
+  private async searchMirror(
+    mirror: ReadyMirror,
     query: string,
     effectiveQuery: string,
     options: SearchOptions,
     ctx: Context,
-  ): SearchResult | undefined {
+  ): Promise<SearchResult | undefined> {
     const translated = translateQuery(query);
     const categoryGroups = [
       translated.categoryFilters,
@@ -926,27 +1216,22 @@ export class ArxivService {
     const ftsSortBy: 'relevance' | 'published' | 'updated' =
       sortBy === 'submitted' ? 'published' : sortBy === 'updated' ? 'updated' : 'relevance';
 
-    let papers: PaperRow[];
-    let total: number;
+    let outcome: MirrorSearchOutcome;
     try {
-      if (translated.matchExpr !== undefined && store.matchReachesCap(translated.matchExpr)) {
-        ctx.log.info('Mirror search term reaches the match cap; using live API', {
-          query,
-          matchExpr: translated.matchExpr,
-          cap: MIRROR_SEARCH_MATCH_CAP,
-        });
-        return;
-      }
-      ({ papers, total } = store.search({
-        ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
-        categoryGroups,
-        ...(published.from !== undefined && { publishedFrom: published.from }),
-        ...(published.to !== undefined && { publishedTo: published.to }),
-        limit,
-        offset,
-        sortBy: ftsSortBy,
-        sortOrder: options.sortOrder ?? 'descending',
-      }));
+      outcome = await this.mirrorSearcher(
+        mirror,
+        {
+          ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
+          categoryGroups,
+          ...(published.from !== undefined && { publishedFrom: published.from }),
+          ...(published.to !== undefined && { publishedTo: published.to }),
+          limit,
+          offset,
+          sortBy: ftsSortBy,
+          sortOrder: options.sortOrder ?? 'descending',
+        },
+        ctx.signal,
+      );
     } catch (err) {
       // Defense in depth: the translator should produce parseable FTS5 for every
       // input the lexer accepts, but a regression there would surface here as a
@@ -964,6 +1249,23 @@ export class ArxivService {
       }
       throw err;
     }
+    if (outcome.status === 'over_cap') {
+      ctx.log.info('Mirror search term reaches the match cap; using live API', {
+        query,
+        matchExpr: translated.matchExpr,
+        cap: MIRROR_SEARCH_MATCH_CAP,
+      });
+      return;
+    }
+    if (outcome.status === 'not_ready') {
+      reportMirrorNotReady(ctx, outcome.reader, this.options.onMirrorSchemaOutdated);
+      return;
+    }
+    if (outcome.status === 'open_failed') {
+      reportMirrorOpenFailed(ctx, outcome.error);
+      return;
+    }
+    const { papers, total } = outcome;
     ctx.log.info('Mirror search', {
       query,
       total,
@@ -983,7 +1285,7 @@ export class ArxivService {
 
   /** Get full metadata for one or more papers by arXiv ID. */
   async getPapers(ids: string[], ctx: Context): Promise<PaperLookupResult> {
-    const ready = await tryReadyMirror(ctx);
+    const ready = await tryReadyMirror(ctx, this.options.onMirrorSchemaOutdated);
     if (!ready) return this.fetchLivePapers(ids, ctx);
 
     const config = getServerConfig();
@@ -995,20 +1297,40 @@ export class ArxivService {
     const slots = resolveRequestedIds(ids, rows.map(rowToMetadata), (p) => p.id);
 
     const missingIndices = slots.flatMap((p, i) => (p === undefined ? [i] : []));
-    const consultedLive = missingIndices.length > 0 && config.mirrorFallbackLive;
-    if (consultedLive) {
+    // A live miss keeps the reason the live lookup gave it: the mirror's view
+    // of an ID it could not serve says nothing about why arXiv did not.
+    let liveMisses = new Map<string, PaperLookupMiss>();
+    if (missingIndices.length > 0 && config.mirrorFallbackLive) {
       const missing = missingIndices.map((i) => ids[i] ?? '');
       ctx.log.info('Mirror miss; falling back to live', { missing });
-      const live = await this.fetchLivePapers(missing, ctx);
+      let live: PaperLookupResult;
+      try {
+        live = await this.fetchLivePapers(missing, ctx);
+      } catch (err) {
+        // An outage on the live patch-up leaves the mirror's answers standing
+        // and names the IDs it left unanswered. A cancelled call, a lookup arXiv
+        // rejected, and a call the mirror answered none of still fail. See #67.
+        if (ctx.signal.aborted) throw ctx.signal.reason;
+        if (!isLiveOutage(err) || missing.length === ids.length) throw err;
+        ctx.log.warning('Live fallback failed; returning the papers the mirror served', {
+          missing,
+          error: err.message,
+        });
+        live = {
+          papers: [],
+          not_found: missing.map((id) => describeLiveLookupFailure(id, rows, err)),
+        };
+      }
       const resolved = resolveRequestedIds(missing, live.papers, (p) => p.id);
       for (const [k, slotIndex] of missingIndices.entries()) {
         slots[slotIndex] = resolved[k];
       }
+      liveMisses = new Map(live.not_found?.map((miss) => [miss.id, miss] as const));
     }
 
     const papers = slots.filter((p): p is PaperMetadata => p !== undefined);
     const notFound = ids.flatMap((id, i) =>
-      slots[i] === undefined ? [describeLookupMiss(id, rows, consultedLive)] : [],
+      slots[i] === undefined ? [liveMisses.get(id) ?? describeLookupMiss(id, rows)] : [],
     );
     return {
       papers,
@@ -1016,27 +1338,61 @@ export class ArxivService {
     };
   }
 
-  /** Live-API path for `getPapers`. Extracted so the mirror fallback can reuse it. */
-  private async fetchLivePapers(ids: string[], ctx: Context): Promise<PaperLookupResult> {
-    const config = getServerConfig();
-    const url = buildApiUrl(config.apiBaseUrl, {
-      id_list: ids.join(','),
-      max_results: String(ids.length),
-    });
+  /**
+   * Live-API path for `getPapers`. Extracted so the mirror fallback can reuse it.
+   *
+   * arXiv's API answers HTTP 500, every time, for an `id_list` holding some
+   * superseded versions of old-style IDs (`hep-th/9901001v1`), while others
+   * answer normally (`astro-ph/0703001v1`) and nothing public tells the two
+   * apart. So when the first request of a lookup holding an old-style pin
+   * answers 500, one request with those IDs unversioned takes the place of the
+   * identical retry, and each pin resolves against the latest version it
+   * returns. Every other failure keeps the one identical retry, so a lookup
+   * sends at most two requests. See issue #53.
+   *
+   * A read passes its `deadline`, which the requests and the wait between them
+   * draw on.
+   */
+  private async fetchLivePapers(
+    ids: string[],
+    ctx: Context,
+    deadline?: ReadDeadline,
+  ): Promise<PaperLookupResult> {
+    const holdsOldStylePin = ids.some(isPinnedOldStyleId);
+    let attempts = 0;
+    const replacesRetry = (err: unknown) => holdsOldStylePin && attempts === 1 && isHttp500(err);
 
-    const result = await withRetry(
-      async () => {
-        const xml = await this.fetchApi(url, ctx);
-        return this.parseAtomFeed(xml);
-      },
-      {
-        operation: 'arxivGetPapers',
-        context: ctx as unknown as RequestContext,
-        signal: ctx.signal,
-        isTransient: isArxivTransient,
-        maxRetries: 1,
-      },
-    );
+    let entries: PaperMetadata[];
+    let unversioned = false;
+    try {
+      entries = await withRetry(
+        () => {
+          attempts += 1;
+          return this.requestIdList(ids, ctx, deadline);
+        },
+        {
+          operation: 'arxivGetPapers',
+          context: ctx as unknown as RequestContext,
+          signal: callSignal(ctx, deadline),
+          isTransient: (err) => !replacesRetry(err) && isArxivTransient(err),
+          maxRetries: 1,
+        },
+      );
+    } catch (err) {
+      if (!replacesRetry(err)) throw err;
+      // A cancelled call is over: the request would only wait out the queue
+      // for its turn to be refused.
+      if (ctx.signal.aborted) throw ctx.signal.reason;
+      const latestIds = [
+        ...new Set(ids.map((id) => (isPinnedOldStyleId(id) ? stripVersion(id) : id))),
+      ];
+      ctx.log.info('arXiv answered HTTP 500 for a lookup holding old-style pinned versions', {
+        ids,
+        unversioned: latestIds,
+      });
+      entries = await this.requestIdList(latestIds, ctx, deadline);
+      unversioned = true;
+    }
 
     // Re-index by input order — arXiv returns entries in its own internal order
     // (typically submission-date desc), so a caller stitching results back to an
@@ -1044,11 +1400,33 @@ export class ArxivService {
     // The match is version-aware: arXiv honors a `vN` suffix in `id_list` and
     // returns one entry per requested version, so a batch asking for two
     // versions of one paper must keep them in their own slots. See issue #28.
-    const resolved = resolveRequestedIds(ids, result.entries, (p) => p.id);
+    const resolved = resolveRequestedIds(ids, entries, (p) => p.id);
     const ordered = resolved.filter((p): p is PaperMetadata => p !== undefined);
-    const notFound = ids.flatMap<PaperLookupMiss>((id, i) =>
-      resolved[i] === undefined ? [{ id, reason: 'not_in_arxiv' }] : [],
+
+    // After the unversioned request, an old-style pin it did not match is past
+    // the latest version (absent from arXiv) or below it (not served).
+    const latestVersion = new Map<string, number>();
+    if (unversioned) {
+      for (const p of entries) latestVersion.set(stripVersion(p.id), parseVersion(p.id) ?? 0);
+    }
+    const supersededBy = (id: string): number | undefined => {
+      const latest = latestVersion.get(stripVersion(id));
+      return isPinnedOldStyleId(id) && latest !== undefined && (parseVersion(id) ?? 0) < latest
+        ? latest
+        : undefined;
+    };
+    const unserved = new Set(
+      ids.filter((id, i) => resolved[i] === undefined && supersededBy(id) !== undefined),
     );
+    const notFound = ids.flatMap<PaperLookupMiss>((id, i) => {
+      if (resolved[i] !== undefined) return [];
+      const latest = supersededBy(id);
+      return [
+        latest === undefined
+          ? { id, reason: 'not_in_arxiv' }
+          : describeUnservedVersion(id, latest, unserved.size > 1),
+      ];
+    });
 
     return {
       papers: ordered,
@@ -1056,37 +1434,69 @@ export class ArxivService {
     };
   }
 
+  /** One `id_list` request: the entries arXiv returned, in its own order. */
+  private async requestIdList(
+    ids: readonly string[],
+    ctx: Context,
+    deadline?: ReadDeadline,
+  ): Promise<PaperMetadata[]> {
+    const url = buildApiUrl(getServerConfig().apiBaseUrl, {
+      id_list: ids.join(','),
+      max_results: String(ids.length),
+    });
+    return this.parseAtomFeed(await this.fetchApi(url, ctx, deadline)).entries;
+  }
+
   /**
    * Fetch paper metadata plus the full paper body. Tries native arXiv HTML,
-   * then ar5iv, then text extracted from the PDF.
+   * then ar5iv, then text extracted from the PDF. The whole read runs on one
+   * deadline (`ReadDeadline`).
    */
   async readContent(
     paperId: string,
     options: ReadContentOptions,
     ctx: Context,
   ): Promise<PaperContent> {
+    const deadline = startReadDeadline(paperId, getServerConfig().readTimeoutMs);
     // Metadata: prefer live API for per-version fidelity (the mirror only
-    // stores the latest version). Fall back to mirror on transient failure —
-    // latest-version metadata is better than an error.
+    // stores the latest version). When the live lookup fails, a mirror that
+    // holds the paper answers instead — latest-version metadata is better than
+    // an error.
     let paper: PaperMetadata | undefined;
+    let liveMiss: PaperLookupMiss | undefined;
     try {
-      const lookup = await this.fetchLivePapers([paperId], ctx);
+      const lookup = await this.fetchLivePapers([paperId], ctx, deadline);
       paper = lookup.papers[0];
+      liveMiss = lookup.not_found?.[0];
     } catch (err) {
-      const ready = await tryReadyMirror(ctx);
+      // A cancelled call is over: answering it from the mirror, or naming the
+      // version the mirror holds, would report something nobody is waiting for.
+      if (ctx.signal.aborted) throw ctx.signal.reason;
+      // Out of time: whatever the mirror holds, none is left to fetch its body.
+      // A wait for the API queue or a retry ends with the deadline's own reason.
+      if (deadline.signal.aborted) {
+        throw err === deadline.signal.reason
+          ? deadline.exceeded('its arXiv API lookup had not finished')
+          : err;
+      }
+      const ready = await tryReadyMirror(ctx, this.options.onMirrorSchemaOutdated);
       if (!ready) throw err;
+      const rows = ready.store.getPapersByIds([stripVersion(paperId)]);
+      const [stored] = rows;
+      // A paper the mirror does not hold says nothing about arXiv: the live
+      // failure stands, as it does with no mirror, rather than reading as an
+      // ID that does not exist. See issue #68.
+      if (!stored) throw err;
       ctx.log.warning('Live API failed for readContent metadata; falling back to mirror', {
         paperId,
         error: err instanceof Error ? err.message : String(err),
       });
-      const rows = ready.store.getPapersByIds([stripVersion(paperId)]);
-      const [stored] = rows;
       const [match] = resolveRequestedIds([paperId], rows.map(rowToMetadata), (p) => p.id);
       // A version-pinned read must not degrade to whichever version the mirror
       // happens to hold — the substituted ID would flow into the HTML fetch
       // below and return a different revision's body. Unversioned reads keep
       // degrading to the latest stored version. See issue #33.
-      if (!match && stored) {
+      if (!match) {
         throw serviceUnavailable(
           `arXiv is unavailable and version ${parseVersion(paperId)} of '${stored.id}' cannot be served locally — the mirror holds version ${stored.version} only.`,
           {
@@ -1101,6 +1511,14 @@ export class ArxivService {
       paper = match;
     }
     if (!paper) {
+      // The version exists upstream, so `no_match` would have the caller doubt
+      // a valid ID. Name the version that can be read instead. See issue #53.
+      if (liveMiss?.reason === 'version_not_served') {
+        throw notFound(
+          [`Paper '${paperId}' could not be served.`, liveMiss.detail].filter(Boolean).join(' '),
+          { paperId, pdfUrl: `https://arxiv.org/pdf/${paperId}`, reason: 'version_not_served' },
+        );
+      }
       throw notFound(
         `Paper '${paperId}' not found. Verify the ID format (e.g., '2401.12345' or '2401.12345v2').`,
         { paperId, reason: 'no_match' },
@@ -1109,13 +1527,19 @@ export class ArxivService {
 
     // Body fetch with its own retry (2s base delay for heavier pages).
     // Same fail-fast-on-rate-limit policy as API calls — see isArxivTransient.
-    const { content, source, url } = await withRetry(() => this.fetchBody(paper, ctx), {
+    // The replay and the backoff before it draw on the deadline's time left; a
+    // backoff the deadline cuts short ends with the deadline's own reason.
+    const { content, source, url } = await withRetry(() => this.fetchBody(paper, ctx, deadline), {
       operation: 'arxivFetchBody',
       context: ctx as unknown as RequestContext,
-      signal: ctx.signal,
+      signal: callSignal(ctx, deadline),
       isTransient: isArxivTransient,
       maxRetries: 1,
       baseDelayMs: 2000,
+    }).catch((err: unknown) => {
+      throw err === deadline.signal.reason
+        ? deadline.exceeded('it was waiting to retry its content requests')
+        : err;
     });
 
     // HTML sources: cut to the article (dropping <head>, site chrome, and the
@@ -1146,6 +1570,12 @@ export class ArxivService {
         : isHtmlSource
           ? buildOutline(cleaned)
           : { entries: [], omittedLevels: [] };
+    // ar5iv keeps one render per paper and serves it for any version, and its
+    // page names no revision. Its body is the requested revision for certain
+    // only when the paper has one: an unversioned read whose latest is v1.
+    // See issue #63.
+    const revisionUnconfirmed =
+      source === 'ar5iv' && !(parseVersion(paperId) === undefined && parseVersion(paper.id) === 1);
 
     return {
       paper_id: paper.id,
@@ -1163,6 +1593,7 @@ export class ArxivService {
         ? { outline_omitted_levels: outline.omittedLevels }
         : {}),
       ...(outline?.continuesAt !== undefined ? { outline_continues_at: outline.continuesAt } : {}),
+      ...(revisionUnconfirmed ? { revision_unconfirmed: true } : {}),
     };
   }
 
@@ -1170,33 +1601,23 @@ export class ArxivService {
   // Private — API fetching with rate limiting
   // -------------------------------------------------------------------------
 
-  private fetchApi(url: string, ctx: Context): Promise<string> {
-    return this.enqueueApiCall(ctx.signal, async () => {
+  private fetchApi(url: string, ctx: Context, deadline?: ReadDeadline): Promise<string> {
+    return this.enqueueApiCall(callSignal(ctx, deadline), async () => {
       const config = getServerConfig();
-      const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.apiTimeoutMs)]);
+      const site = { label: 'arXiv API', timeoutMs: config.apiTimeoutMs, data: { url } };
 
       let response: Response;
+      let text: string;
       try {
         response = await fetch(url, {
-          signal,
+          signal: requestSignal(ctx, config.apiTimeoutMs, deadline),
           headers: { 'user-agent': USER_AGENT, accept: 'application/atom+xml, application/xml' },
         });
+        // The request's timeout covers the body, which can stall after the headers.
+        text = await response.text();
       } catch (err) {
-        if (ctx.signal.aborted) throw err;
-        // AbortSignal.timeout fires with a DOMException named TimeoutError.
-        // Classify as Timeout (non-retryable per isArxivTransient) — a 15s hang
-        // is overwhelmingly throttling at the connection layer, not a blip.
-        if (err instanceof Error && err.name === 'TimeoutError') {
-          throw timeout(
-            `arXiv API timed out after ${config.apiTimeoutMs}ms`,
-            { url, timeoutMs: config.apiTimeoutMs },
-            { cause: err },
-          );
-        }
-        throw serviceUnavailable('arXiv API network error', { url }, { cause: err });
+        throw requestFailure(err, ctx, site, deadline);
       }
-
-      const text = await response.text();
       const contentType = response.headers.get('content-type') ?? '';
 
       // Status classification runs first so a non-XML error page — a proxy's
@@ -1312,8 +1733,9 @@ export class ArxivService {
 
   /**
    * Serializes API requests with a delay between each to respect arXiv's
-   * 3-second crawl policy. Skips queued requests whose `signal` aborted before
-   * their turn — a cancelled request shouldn't consume a 3s slot. Honors any
+   * 3-second crawl policy. A queued request whose `signal` aborts — cancelled,
+   * or its read out of time — fails at once rather than at its turn, and its
+   * turn is skipped: a cancelled request shouldn't consume a 3s slot. Honors any
    * server-side cooldown set by `applyCooldown` so a `Retry-After` from arXiv
    * propagates to every subsequent queued caller, not just the one that hit
    * the rate-limit.
@@ -1321,7 +1743,11 @@ export class ArxivService {
   private enqueueApiCall<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
     const config = getServerConfig();
     return new Promise<T>((resolve, reject) => {
+      const abandon = () => reject(signal.reason);
+      if (signal.aborted) abandon();
+      else signal.addEventListener('abort', abandon, { once: true });
       this.apiQueue = this.apiQueue.then(async () => {
+        signal.removeEventListener('abort', abandon);
         if (signal.aborted) {
           reject(signal.reason);
           return;
@@ -1369,62 +1795,64 @@ export class ArxivService {
    *
    * `url` is the URL that served the body — `response.url`, which follows any
    * redirect — and is the base relative links in an HTML body resolve against.
+   *
+   * Each rung's request timeout covers its body as well as its headers, and
+   * every request carries the read's `deadline`. A rung fails the same way
+   * whether its host hangs before the headers or stalls after them. See #70.
    */
   private async fetchBody(
     paper: PaperMetadata,
     ctx: Context,
+    deadline: ReadDeadline,
   ): Promise<{ content: string; source: PaperContentSource; url: string }> {
     const config = getServerConfig();
     const paperId = paper.id;
-    // Pass the paperId through verbatim — both arxiv.org/html and ar5iv honor a
-    // version suffix when present (`/html/2401.12345v1` serves v1; bare ID serves
-    // latest). Stripping unconditionally discarded the caller's intent when they
-    // asked for a specific version. See issue #10.
+    const timeoutMs = config.contentTimeoutMs;
+    // The versioned ID reaches both HTML rungs as given. arxiv.org/html honors
+    // the suffix (`/html/2401.12345v1` serves v1), so stripping it would serve
+    // another revision (#10). ar5iv keeps one render per paper and serves it
+    // whatever the suffix, so its body can be another revision than `paperId`;
+    // `readContent` flags it `revision_unconfirmed` (#63).
 
-    // Try native arXiv HTML first
+    /**
+     * Native arXiv HTML first. A 200 that holds none of the paper (no structural
+     * heading, and an `\includepdf` placeholder or no text: `isPlaceholderRender`)
+     * is no render, so the chain moves on as it does for a 404. See #57.
+     */
     {
-      const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
+      const site = { label: 'arxiv.org HTML', timeoutMs, data: { paperId } };
+      const signal = requestSignal(ctx, timeoutMs, deadline);
       const url = `https://arxiv.org/html/${paperId}`;
       let response: Response;
+      let content: string | undefined;
       try {
         response = await fetch(url, {
           signal,
           headers: { 'user-agent': USER_AGENT, accept: 'text/html' },
         });
+        if (response.ok) content = await response.text();
       } catch (err) {
-        if (ctx.signal.aborted) throw err;
-        if (err instanceof Error && err.name === 'TimeoutError') {
-          throw timeout(
-            `arxiv.org HTML timed out after ${config.contentTimeoutMs}ms`,
-            { paperId, timeoutMs: config.contentTimeoutMs },
-            { cause: err },
-          );
+        throw requestFailure(err, ctx, site, deadline);
+      }
+      if (content !== undefined) {
+        if (!isPlaceholderRender(content)) {
+          return { content, source: 'arxiv_html', url: response.url || url };
         }
-        throw serviceUnavailable('arxiv.org HTML network error', { paperId }, { cause: err });
-      }
-      if (response.ok) {
-        return {
-          content: await response.text(),
-          source: 'arxiv_html',
-          url: response.url || url,
-        };
-      }
-      if (response.status >= 500) {
-        // Override 500/501 to ServiceUnavailable so withRetry retries them.
-        throw await httpErrorFromResponse(response, {
-          service: 'arxiv.org/html',
-          codeOverride: (s) =>
-            s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
+        ctx.log.debug('arxiv.org/html served a page with none of the paper; trying ar5iv', {
+          paperId,
         });
+      } else if (response.status >= 500) {
+        throw await serverErrorFailure(response, 'arxiv.org/html', signal, ctx, site, deadline);
       }
-      // 404 or other 4xx → fall through to ar5iv
+      // A placeholder page, a 404, or another 4xx → fall through to ar5iv
     }
 
     /**
      * Fallback to ar5iv — don't follow redirects (307 = paper not converted).
-     * A 200 carrying only the converter's fatal-error notice is no render
-     * either (`isConversionFailurePage`); arxiv.org/html answers the same
-     * failure with a 404, so the first rung needs no such check. See #54.
+     * A 200 is no render either when it holds none of the paper: only the
+     * converter's fatal-error notice (`isConversionFailurePage`, #54; arxiv.org/html
+     * answers that failure with a 404), or the placeholders and empty articles
+     * `isPlaceholderRender` catches on the first rung (#57).
      *
      * A failure of this rung never ends the chain. ar5iv is a third-party
      * LaTeXML conversion service; whether it is up says nothing about whether
@@ -1432,48 +1860,39 @@ export class ArxivService {
      * is held and re-raised only when the PDF rung also comes up empty — so a
      * caller the PDF can serve is served, and one it can't still gets ar5iv's
      * retryable error and the whole-chain replay `withRetry` gives it. See #38.
+     * A body that stalls or drops is a failure of this rung like any other, and
+     * is held the same way; a cancellation or the read's deadline still ends it.
      */
     let ar5ivFailure: McpError | undefined;
     {
-      const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
+      const site = { label: 'ar5iv', timeoutMs, data: { paperId } };
+      const signal = requestSignal(ctx, timeoutMs, deadline);
       const url = `https://ar5iv.labs.arxiv.org/html/${paperId}`;
       let response: Response | undefined;
+      let content: string | undefined;
       try {
         response = await fetch(url, {
           signal,
           redirect: 'manual',
           headers: { 'user-agent': USER_AGENT, accept: 'text/html' },
         });
+        if (response.ok) content = await response.text();
       } catch (err) {
-        if (ctx.signal.aborted) throw err;
-        ar5ivFailure =
-          err instanceof Error && err.name === 'TimeoutError'
-            ? timeout(
-                `ar5iv timed out after ${config.contentTimeoutMs}ms`,
-                { paperId, timeoutMs: config.contentTimeoutMs },
-                { cause: err },
-              )
-            : serviceUnavailable('ar5iv network error', { paperId }, { cause: err });
+        ar5ivFailure = requestFailure(err, ctx, site, deadline);
       }
-      if (response?.ok) {
-        const content = await response.text();
-        if (!isConversionFailurePage(content)) {
-          return { content, source: 'ar5iv', url: response.url || url };
+      if (content !== undefined) {
+        if (!isConversionFailurePage(content) && !isPlaceholderRender(content)) {
+          return { content, source: 'ar5iv', url: response?.url || url };
         }
-        ctx.log.debug('ar5iv served a conversion-failure page; trying the PDF', { paperId });
+        ctx.log.debug('ar5iv served a page with none of the paper; trying the PDF', { paperId });
+      } else if (response !== undefined && response.status >= 500) {
+        ar5ivFailure = await serverErrorFailure(response, 'ar5iv', signal, ctx, site, deadline);
       }
-      if (response !== undefined && response.status >= 500) {
-        ar5ivFailure = await httpErrorFromResponse(response, {
-          service: 'ar5iv',
-          codeOverride: (s) =>
-            s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
-        });
-      }
-      // 3xx, 4xx, or a 200 conversion-failure page → not converted. On to the PDF.
+      // 3xx, 4xx, or a 200 holding none of the paper → no render. On to the PDF.
     }
 
     // Last rung: the PDF, extracted to plain text.
-    const pdfText = await this.fetchPdfText(paper, ctx);
+    const pdfText = await this.fetchPdfText(paper, ctx, deadline);
     if (pdfText !== undefined && pdfText.trim() !== '') {
       return { content: pdfText, source: 'pdf_text', url: paper.pdf_url };
     }
@@ -1514,35 +1933,34 @@ export class ArxivService {
    * tables, and heading structure flatten into the reading order the PDF
    * encodes.
    */
-  private async fetchPdfText(paper: PaperMetadata, ctx: Context): Promise<string | undefined> {
+  private async fetchPdfText(
+    paper: PaperMetadata,
+    ctx: Context,
+    deadline: ReadDeadline,
+  ): Promise<string | undefined> {
     const config = getServerConfig();
-    const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(config.contentTimeoutMs)]);
+    const site = {
+      label: 'arXiv PDF',
+      timeoutMs: config.contentTimeoutMs,
+      data: { paperId: paper.id },
+    };
+    const signal = requestSignal(ctx, config.contentTimeoutMs, deadline);
 
     let response: Response;
+    let bytes: Uint8Array | undefined;
     try {
       response = await fetch(paper.pdf_url, {
         signal,
         headers: { 'user-agent': USER_AGENT, accept: 'application/pdf' },
       });
+      if (response.ok) bytes = new Uint8Array(await response.arrayBuffer());
     } catch (err) {
-      if (ctx.signal.aborted) throw err;
-      if (err instanceof Error && err.name === 'TimeoutError') {
-        throw timeout(
-          `arXiv PDF timed out after ${config.contentTimeoutMs}ms`,
-          { paperId: paper.id, timeoutMs: config.contentTimeoutMs },
-          { cause: err },
-        );
-      }
-      throw serviceUnavailable('arXiv PDF network error', { paperId: paper.id }, { cause: err });
+      throw requestFailure(err, ctx, site, deadline);
     }
 
-    if (!response.ok) {
+    if (bytes === undefined) {
       if (response.status >= 500) {
-        throw await httpErrorFromResponse(response, {
-          service: 'arxiv.org/pdf',
-          codeOverride: (s) =>
-            s >= 500 && s < 600 ? JsonRpcErrorCode.ServiceUnavailable : undefined,
-        });
+        throw await serverErrorFailure(response, 'arxiv.org/pdf', signal, ctx, site, deadline);
       }
       if (response.status === 429) {
         const retryAfter = response.headers.get('retry-after');
@@ -1562,7 +1980,6 @@ export class ArxivService {
       return;
     }
 
-    const bytes = new Uint8Array(await response.arrayBuffer());
     const { text } = await pdfParser.extractText(
       bytes,
       { mergePages: true },
@@ -1636,8 +2053,8 @@ export class ArxivService {
 
 let _service: ArxivService | undefined;
 
-export function initArxivService(): void {
-  _service = new ArxivService();
+export function initArxivService(options?: ArxivServiceOptions): void {
+  _service = new ArxivService(options);
 }
 
 export function getArxivService(): ArxivService {

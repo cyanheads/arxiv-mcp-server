@@ -8,6 +8,7 @@
  * @module mcp-server/id-input-boundary.test
  */
 
+import { readFileSync } from 'node:fs';
 import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
@@ -23,6 +24,7 @@ vi.mock('@/config/server-config.js', () => ({
     requestDelayMs: 0,
     contentTimeoutMs: 5000,
     apiTimeoutMs: 5000,
+    readTimeoutMs: 50_000,
     mirrorEnabled: false,
     mirrorPath: '',
     mirrorFallbackLive: true,
@@ -35,12 +37,10 @@ vi.stubGlobal('fetch', mockFetch);
 
 beforeEach(() => {
   mockFetch.mockReset();
-  mockFetch.mockResolvedValue(
-    new Response('<feed></feed>', {
-      status: 200,
-      headers: { 'content-type': 'application/atom+xml' },
-    }),
-  );
+  // A request no test mocked is refused rather than answered.
+  mockFetch.mockImplementation(async (url) => {
+    throw new Error(`Unmocked request: ${url}`);
+  });
   initArxivService();
 });
 
@@ -596,5 +596,139 @@ describe('arxiv_get_metadata looks up the first 10 well-formed IDs and names the
       ['bad one', 'invalid_id'],
       ['2401.00003', 'not_in_arxiv'],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Superseded old-style versions arXiv answers HTTP 500 for (#53)
+// ---------------------------------------------------------------------------
+
+/** A captured arXiv API response from `tests/fixtures/arxiv-api/`. */
+function capturedFeed(name: string): string {
+  return readFileSync(new URL(`../fixtures/arxiv-api/${name}.xml`, import.meta.url), 'utf8');
+}
+
+/**
+ * Answer the way arXiv does for `hep-th/9901001` (latest v3): HTTP 500 with its
+ * internal-error feed for an `id_list` holding `v1`, otherwise the response
+ * captured for that list. Anything else is refused, the paper's HTML and PDF
+ * included. `onFailure` runs as the 500 is served.
+ */
+function serveSupersededVersion(onFailure?: () => void): void {
+  mockFetch.mockImplementation(async (request) => {
+    const url = new URL(String(request));
+    if (url.hostname !== 'export.arxiv.org') throw new Error(`Unexpected request: ${url}`);
+    const idList = url.searchParams.get('id_list') ?? '';
+    if (idList.split(',').includes('hep-th/9901001v1')) {
+      onFailure?.();
+      return new Response(capturedFeed('http-500'), {
+        status: 500,
+        headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
+      });
+    }
+    return new Response(capturedFeed(idList.replaceAll('/', '_').replaceAll(',', '+')), {
+      headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
+    });
+  });
+}
+
+describe('a superseded old-style version arXiv answers HTTP 500 for resolves per ID (#53)', () => {
+  it('arxiv_get_metadata returns the rest of the batch and names the latest version', async () => {
+    serveSupersededVersion();
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762', 'hep-th/9901001v1'],
+    });
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    expect(output.papers.map((paper) => paper.id)).toEqual(['1706.03762v7']);
+    expect(output.not_found).toEqual([
+      {
+        id: 'hep-th/9901001v1',
+        reason: 'version_not_served',
+        detail: expect.stringContaining('the latest version is v3'),
+      },
+    ]);
+    const text = textOf(result);
+    expect(text).toContain('Found 1 of 2 papers.');
+    expect(text).toContain('arXiv:1706.03762v7 |');
+    expect(text).toContain(
+      `- hep-th/9901001v1 (version_not_served): ${output.not_found?.[0]?.detail}`,
+    );
+    expect(idLists()).toEqual(['1706.03762,hep-th/9901001v1', '1706.03762,hep-th/9901001']);
+  });
+
+  it('arxiv_get_metadata names the latest version in the text when such a pin misses beside an ID absent from arXiv', async () => {
+    serveSupersededVersion();
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['hep-th/9901001v1', 'hep-th/9901001v4'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_match' },
+    });
+    const text = textOf(result);
+    expect(text).toContain('No papers found for the given IDs.');
+    expect(text).toContain("'hep-th/9901001v1' could not be served.");
+    expect(text).toContain('the latest version is v3');
+    expect(text).toContain('https://arxiv.org/pdf/hep-th/9901001v1');
+    expect(idLists()).toEqual(['hep-th/9901001v1,hep-th/9901001v4', 'hep-th/9901001']);
+  });
+
+  it('a lone pin fails version_not_served on all three surfaces, never no_match or a 500', async () => {
+    serveSupersededVersion();
+
+    const metadata = await runToolContract(arxivGetMetadata, { paper_ids: ['hep-th/9901001v1'] });
+    expect(metadata.isError).toBe(true);
+    const metadataError = errorOf(metadata) as { code: number; data: Record<string, unknown> };
+    expect(metadataError.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(metadataError.data.reason).toBe('version_not_served');
+    expect(metadataError.data.retryable).not.toBe(true);
+    expect(textOf(metadata)).toContain('the latest version is v3');
+    expect(textOf(metadata)).toContain('https://arxiv.org/pdf/hep-th/9901001v1');
+    expect(textOf(metadata)).toContain('(reason version_not_served)');
+
+    const read = await runToolContract(arxivReadPaper, { paper_id: 'hep-th/9901001v1' });
+    expect(read.isError).toBe(true);
+    expect(errorOf(read)).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'version_not_served', pdfUrl: 'https://arxiv.org/pdf/hep-th/9901001v1' },
+    });
+    expect(textOf(read)).toContain('the latest version is v3');
+    expect(textOf(read)).toContain('https://arxiv.org/pdf/hep-th/9901001v1');
+
+    await expect(readResource('hep-th%2F9901001v1')).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'version_not_served' },
+      message: expect.stringMatching(
+        /the latest version is v3.*https:\/\/arxiv\.org\/pdf\/hep-th\/9901001v1/,
+      ),
+    });
+
+    // Two API requests per surface, and no body fetch for the version not served.
+    expect(idLists()).toEqual(Array(3).fill(['hep-th/9901001v1', 'hep-th/9901001']).flat());
+    expect(mockFetch).toHaveBeenCalledTimes(6);
+  });
+
+  it('arxiv_get_metadata reports a call cancelled at the 500 as cancelled on both surfaces', async () => {
+    const controller = new AbortController();
+    serveSupersededVersion(() =>
+      controller.abort(new DOMException('The client cancelled the call.', 'AbortError')),
+    );
+    const result = await runToolContract(
+      arxivGetMetadata,
+      { paper_ids: ['1706.03762', 'hep-th/9901001v1'] },
+      { context: { signal: controller.signal } },
+    );
+
+    expect(result.isError).toBe(true);
+    const error = errorOf(result) as { code: number; message: string };
+    expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(error.message).toBe('The client cancelled the call.');
+    expect(textOf(result)).toContain('The client cancelled the call.');
+    expect(textOf(result)).not.toContain('1706.03762v7');
+    expect(idLists()).toEqual(['1706.03762,hep-th/9901001v1']);
   });
 });

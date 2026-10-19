@@ -66,7 +66,9 @@ export type ProgressCallback = (info: {
  * carries the position inside its datestamp. Otherwise a refresh starts at
  * `from=last_datestamp` (OAI `from` is inclusive, so the boundary day is
  * re-read), and an init with no checkpoint harvests from the beginning. A
- * rejected token falls back to the datestamp checkpoint inside the harvester.
+ * rejected token falls back to the datestamp checkpoint inside the harvester,
+ * once per checkpoint: a second rejection before the checkpoint advances fails
+ * the run (issue #59).
  *
  * Before the first page it ensures the write-path index on
  * `paper_categories(paper_id)` (issue #50).
@@ -74,8 +76,11 @@ export type ProgressCallback = (info: {
  * Persists `harvest_state` after every page; `complete` (with `completed_at`)
  * is written only when the list drains. With `deadline`, the run stops after a
  * whole page once one worst-case page cycle no longer fits before it, leaving
- * the same checkpoint an interrupted run leaves (issue #39). A cancelled
- * `ctx.signal` always ends the run as a failure, never as a deadline stop.
+ * the same checkpoint an interrupted run leaves (issue #39). An `init` run
+ * waits out an upstream outage and re-sends the same request
+ * (`HarvesterOptions.waitOutOutages`, issue #61); a refresh fails once a page
+ * exhausts its retries. A cancelled `ctx.signal` always ends the run as a
+ * failure, never as a deadline stop, and ends an outage wait at once.
  *
  * @param options.deadline - Epoch ms the run must have ended by.
  */
@@ -92,6 +97,7 @@ export async function runHarvest(
     baseUrl: config.mirrorOaiBaseUrl,
     requestDelayMs: config.mirrorOaiRequestDelayMs,
     requestTimeoutMs: config.apiTimeoutMs,
+    waitOutOutages: options.mode === 'init',
   };
 
   const interrupted = existing.status === 'in_progress' || existing.status === 'error';
@@ -184,24 +190,6 @@ export async function runHarvest(
       error_message: message,
     });
     throw err;
-  }
-}
-
-/** Convenience accessor for callers that only need the harvest status. */
-export async function readHarvestStatus(): Promise<{
-  status: 'pending' | 'in_progress' | 'complete' | 'error' | 'unavailable';
-  totalRecords?: number;
-}> {
-  const config = getServerConfig();
-  try {
-    const store = await openStore(config.mirrorPath);
-    const state = store.readHarvestState();
-    return {
-      status: state.status,
-      ...(state.total_records !== undefined && { totalRecords: state.total_records }),
-    };
-  } catch {
-    return { status: 'unavailable' };
   }
 }
 

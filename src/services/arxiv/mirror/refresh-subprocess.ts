@@ -12,7 +12,9 @@
  *
  * Dual role:
  *   - Imported by `src/index.ts` for {@link runRefreshSubprocess} — the parent
- *     spawn helper the in-process HTTP cron calls.
+ *     spawn helper the in-process HTTP cron calls — and for
+ *     {@link schemaUpgradeTrigger}, which starts one run at once when the
+ *     server's reader finds the mirror on an older schema.
  *   - Run directly (`<runtime> dist/services/arxiv/mirror/refresh-subprocess.js`)
  *     as the child entry point — the bottom guard runs one refresh and exits.
  *     This is what {@link runRefreshSubprocess} spawns.
@@ -23,7 +25,9 @@
  * page in hand, checkpoints, reports `drained` or `partial` on its last stdout
  * line, and exits 0. The next run resumes from that checkpoint. The parent's
  * SIGTERM at the budget, and SIGKILL after {@link SIGKILL_GRACE_MS}, remain
- * only as the backstop for a child that overruns its deadline.
+ * only as the backstop for a child that overruns its deadline. A child whose
+ * writer open finds another writer migrating the file reports `skipped` and
+ * exits 0 having changed nothing (issue #71).
  *
  * @module services/arxiv/mirror/refresh-subprocess
  */
@@ -33,6 +37,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getServerConfig } from '@/config/server-config.js';
 import { type HarvestResult, type MirrorLogger, runHarvest } from './runner.js';
+import { isMigrationConflict } from './store.js';
 
 type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error';
 
@@ -45,14 +50,13 @@ export type RefreshCounts = Omit<HarvestResult, 'drained'>;
 /**
  * How one scheduled refresh ended without failing: the OAI list `drained`,
  * the run `partial`ly applied it and stopped at its deadline, or the tick was
- * `skipped` because a refresh was already running.
+ * `skipped` — a refresh was already running in this process, or the child
+ * found another writer migrating the mirror file and changed nothing.
  */
 export type RefreshOutcome =
   | { outcome: 'skipped' }
   | ({ outcome: 'drained' } & RefreshCounts)
   | ({ outcome: 'partial' } & RefreshCounts);
-
-type FinishedOutcome = Exclude<RefreshOutcome, { outcome: 'skipped' }>;
 
 /** `msg` of the child's final stdout line, which carries its {@link RefreshOutcome}. */
 const OUTCOME_MSG = 'Mirror refresh outcome';
@@ -72,7 +76,9 @@ let activeChild: ChildProcess | undefined;
  * outcome once it exits 0: `drained` (logged at info) or `partial` — stopped at
  * its deadline with a checkpoint the next run resumes from (logged at notice).
  * Resolves `skipped`, with a warning and no spawn, when a refresh is already
- * running.
+ * running, and `skipped` (logged at info) when the child found another writer
+ * migrating the mirror file: that writer finishes the upgrade, so the tick is
+ * no failure (issue #71).
  *
  * Rejects on spawn failure, a child `error` event, a non-zero exit, a timeout
  * kill, or an exit 0 that reported no outcome, so a harvest that never finished
@@ -123,7 +129,7 @@ export function runRefreshSubprocess(opts: {
     // The child emits one JSON object per stdout line; re-log at the matching
     // level so harvest detail flows through the server's structured logger.
     // Its final line carries the outcome and is kept rather than relayed.
-    let reported: FinishedOutcome | undefined;
+    let reported: RefreshOutcome | undefined;
     forwardLines(child.stdout, (line) => {
       const outcome = parseOutcomeLine(line);
       if (outcome) reported = outcome;
@@ -146,7 +152,7 @@ export function runRefreshSubprocess(opts: {
 
     // A failed spawn can emit both `error` and `close`; the first one decides.
     let settled = false;
-    const settle = (result: FinishedOutcome | Error) => {
+    const settle = (result: RefreshOutcome | Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(sigterm);
@@ -189,14 +195,42 @@ export function runRefreshSubprocess(opts: {
   });
 }
 
-/** Log a finished refresh: info when the list drained, notice when it stopped at its deadline. */
-function logOutcome(log: MirrorLogger, { outcome, ...counts }: FinishedOutcome): void {
+/**
+ * A trigger for the server's reader to call when it finds the mirror on an
+ * older schema version (issue #55). The first call made while no refresh is
+ * running starts one refresh child, whose writer open migrates the file, so
+ * the mirror serves again without waiting for the next cron tick. Every later
+ * call does nothing: a run that fails is left to the cron, and a run skipped
+ * because another writer is migrating the file leaves the upgrade to that
+ * writer. The reader makes no call at all while a writer is migrating the file
+ * (issue #71). The run's outcome is logged by {@link runRefreshSubprocess}.
+ */
+export function schemaUpgradeTrigger(opts: { timeoutMs: number; log: MirrorLogger }): () => void {
+  let started = false;
+  return () => {
+    if (started || activeChild) return;
+    started = true;
+    opts.log.notice?.('Mirror file has an older schema; starting a refresh to migrate it');
+    runRefreshSubprocess(opts).catch(() => undefined);
+  };
+}
+
+/**
+ * Log a refresh the child reported: info when the list drained or another
+ * writer's migration skipped it, notice when it stopped at its deadline.
+ */
+function logOutcome(log: MirrorLogger, reported: RefreshOutcome): void {
+  if (reported.outcome === 'skipped') {
+    log.info?.('Mirror refresh skipped: another writer is migrating the mirror file');
+    return;
+  }
+  const { outcome, ...counts } = reported;
   if (outcome === 'drained') log.info?.('Mirror refresh drained', counts);
   else log.notice?.('Mirror refresh stopped at its deadline; the next run resumes', counts);
 }
 
 /** The outcome carried by the child's final stdout line, or `undefined` for any other line. */
-function parseOutcomeLine(line: string): FinishedOutcome | undefined {
+function parseOutcomeLine(line: string): RefreshOutcome | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
@@ -205,8 +239,10 @@ function parseOutcomeLine(line: string): FinishedOutcome | undefined {
   }
   if (typeof parsed !== 'object' || parsed === null) return;
   const { level: _level, msg, ...rest } = parsed as Record<string, unknown>;
-  if (msg !== OUTCOME_MSG || (rest.outcome !== 'drained' && rest.outcome !== 'partial')) return;
-  return rest as FinishedOutcome;
+  if (msg !== OUTCOME_MSG) return;
+  if (rest.outcome === 'skipped') return { outcome: 'skipped' };
+  if (rest.outcome !== 'drained' && rest.outcome !== 'partial') return;
+  return rest as RefreshOutcome;
 }
 
 /** Forward a child stream's complete lines to `sink`, holding a partial tail across chunks. */
@@ -270,16 +306,24 @@ function isLogLevel(value: unknown): value is LogLevel {
 
 /**
  * Run one incremental refresh that stops by `deadline` (epoch ms) and report
- * how it ended. Exported for tests; the entry guard below wires signals and the
- * deadline, then calls this.
+ * how it ended. A writer open that finds another writer migrating the file
+ * (`isMigrationConflict`) is logged at notice and reported `skipped`: the run
+ * changed nothing, and that writer finishes the upgrade. Exported for tests;
+ * the entry guard below wires signals and the deadline, then calls this.
  */
 export async function runRefreshChild(
   log: MirrorLogger,
   signal: AbortSignal,
   deadline: number,
-): Promise<FinishedOutcome> {
-  const { drained, ...counts } = await runHarvest({ log, signal }, { mode: 'refresh', deadline });
-  return { outcome: drained ? 'drained' : 'partial', ...counts };
+): Promise<RefreshOutcome> {
+  try {
+    const { drained, ...counts } = await runHarvest({ log, signal }, { mode: 'refresh', deadline });
+    return { outcome: drained ? 'drained' : 'partial', ...counts };
+  } catch (err) {
+    if (!isMigrationConflict(err)) throw err;
+    log.notice?.(err.message, err.data);
+    return { outcome: 'skipped' };
+  }
 }
 
 /** One JSON object per line on stdout, for the parent to relay; `done` runs once it is written. */

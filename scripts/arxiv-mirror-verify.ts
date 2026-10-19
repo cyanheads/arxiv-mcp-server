@@ -6,11 +6,18 @@
  * Usage:
  *   bun run mirror:verify
  *
+ * Exit status:
+ *   0   the file is on the current schema and passes both checks
+ *   1   a check or the schema migration failed
+ *   75  another writer is migrating the mirror file's schema; nothing changed,
+ *       verify again once it finishes (the message names its pid)
+ *
  * @module scripts/arxiv-mirror-verify
  */
 
 import { getServerConfig } from '@/config/server-config.js';
 import { openStore } from '@/services/arxiv/mirror/index.js';
+import { exitIfMirrorBusy } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const config = getServerConfig();
@@ -37,6 +44,7 @@ async function main(): Promise<void> {
     }
     console.log('Mirror OK');
   } catch (err) {
+    exitIfMirrorBusy('Verify', err);
     console.error('Verify failed:', err instanceof Error ? err.message : err);
     process.exit(1);
   }

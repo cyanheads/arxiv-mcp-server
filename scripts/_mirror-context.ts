@@ -2,9 +2,30 @@
  * @fileoverview Minimal Context-shaped helper for mirror scripts (init/refresh).
  * Scripts run outside the MCP request pipeline; they don't have a real Context.
  * This helper exposes the `log` + `signal` surface that the harvest runner
- * consumes, wired to console output and a SIGINT-driven AbortController.
+ * consumes, wired to console output and a SIGINT-driven AbortController, and
+ * the exit every mirror script takes when another writer is migrating the file.
  * @module scripts/_mirror-context
  */
+
+import { isMigrationConflict } from '@/services/arxiv/mirror/index.js';
+
+/**
+ * Exit status of a mirror script that found another writer migrating the
+ * mirror file (sysexits `EX_TEMPFAIL`): the run changed nothing, and the same
+ * command succeeds once that migration finishes (issue #71).
+ */
+export const EXIT_MIRROR_BUSY = 75;
+
+/**
+ * Exit with {@link EXIT_MIRROR_BUSY} and the store's explanation — which writer
+ * holds the migration, since when, and when its claim lapses — when `err` says
+ * another writer owns the file's migration. Returns for any other error.
+ */
+export function exitIfMirrorBusy(label: string, err: unknown): void {
+  if (!isMigrationConflict(err)) return;
+  console.error(`\n${label} did not run: ${err.message}`);
+  process.exit(EXIT_MIRROR_BUSY);
+}
 
 type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error';
 

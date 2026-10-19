@@ -8,11 +8,17 @@
  * Usage:
  *   bun run mirror:refresh
  *
+ * Exit status:
+ *   0   the refresh drained
+ *   1   the refresh failed or was interrupted
+ *   75  another writer is migrating the mirror file's schema; nothing changed,
+ *       run again once it finishes (the message names its pid)
+ *
  * @module scripts/arxiv-mirror-refresh
  */
 
 import { runHarvest } from '@/services/arxiv/mirror/index.js';
-import { makeScriptContext } from './_mirror-context.js';
+import { exitIfMirrorBusy, makeScriptContext } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const ctx = makeScriptContext('mirror:refresh');
@@ -26,6 +32,7 @@ async function main(): Promise<void> {
       `Refresh complete: ${result.recordsApplied} records, ${result.tombstonesApplied} tombstones, ${result.pagesFetched} pages in ${elapsedSec}s`,
     );
   } catch (err) {
+    exitIfMirrorBusy('Refresh', err);
     console.error('Refresh failed:', err instanceof Error ? err.message : err);
     process.exit(1);
   }

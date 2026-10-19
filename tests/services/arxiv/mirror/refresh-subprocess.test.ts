@@ -5,8 +5,9 @@
  * runner are mocked so the supervisor's wiring (spawn args, log forwarding,
  * outcome resolution, exit handling, timeout escalation, concurrency guard) is
  * exercised without a real process; the last block spawns real child
- * processes against a loopback OAI endpoint to pin exit codes and the
- * deadline stop end to end.
+ * processes against a loopback OAI endpoint to pin exit codes, the deadline
+ * stop, the failure of a stalled token recovery (#59), and the skip on a file
+ * another writer is migrating (#71) end to end.
  * @module services/arxiv/mirror/refresh-subprocess.test
  */
 
@@ -20,14 +21,17 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { conflict } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { worstCasePageFetchMs } from '@/services/arxiv/mirror/harvester.js';
 import {
   type RefreshOutcome,
   runRefreshChild,
   runRefreshSubprocess,
+  schemaUpgradeTrigger,
 } from '@/services/arxiv/mirror/refresh-subprocess.js';
 import { runHarvest } from '@/services/arxiv/mirror/runner.js';
+import { MirrorStore } from '@/services/arxiv/mirror/store.js';
 
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }));
 vi.mock('@/services/arxiv/mirror/runner.js', () => ({ runHarvest: vi.fn() }));
@@ -293,6 +297,35 @@ describe('runRefreshSubprocess', () => {
     await done1;
   });
 
+  it('resolves skipped, without failing the tick, when the child found another writer migrating the file (#71)', async () => {
+    const child = makeFakeChild();
+    spawnMock.mockReturnValue(child as unknown as ChildProcess);
+    const log = makeLog();
+
+    const done = runRefreshSubprocess({ timeoutMs: 1000, log });
+    child.stdout.emit(
+      'data',
+      `${JSON.stringify({ level: 'info', msg: 'Mirror refresh outcome', outcome: 'skipped' })}\n`,
+    );
+    child.exitCode = 0;
+    child.emit('close', 0, null);
+
+    await expect(done).resolves.toEqual({ outcome: 'skipped' });
+    expect(log.info).toHaveBeenCalledWith(
+      'Mirror refresh skipped: another writer is migrating the mirror file',
+    );
+    expect(log.error).not.toHaveBeenCalled();
+    expect(log.warning).not.toHaveBeenCalled();
+
+    // The guard is released: the next tick spawns.
+    const next = makeFakeChild();
+    spawnMock.mockReturnValue(next as unknown as ChildProcess);
+    const again = runRefreshSubprocess({ timeoutMs: 1000, log });
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    finish(next);
+    await again;
+  });
+
   it('escalates SIGTERM then SIGKILL when the child overruns the timeout', async () => {
     vi.useFakeTimers();
     const child = makeFakeChild();
@@ -356,6 +389,77 @@ describe('runRefreshSubprocess', () => {
   });
 });
 
+// Issue #55 — the server's reader never migrates; where the cron runs, an
+// older schema starts one refresh child at once instead.
+describe('schemaUpgradeTrigger', () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+  });
+  afterEach(() => {
+    for (const child of fakeChildren.splice(0)) finish(child);
+  });
+
+  /** Let the supervisor's settle callbacks run. */
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  it('starts one refresh child, and none while it runs or after it has ended', async () => {
+    const child = makeFakeChild();
+    spawnMock.mockReturnValue(child as unknown as ChildProcess);
+    const log = makeLog();
+    const trigger = schemaUpgradeTrigger({ timeoutMs: 1000, log });
+
+    trigger();
+    trigger();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(log.notice).toHaveBeenCalledWith(
+      'Mirror file has an older schema; starting a refresh to migrate it',
+    );
+
+    finish(child);
+    await settle();
+    trigger();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(log.info).toHaveBeenCalledWith('Mirror refresh drained', expect.any(Object));
+  });
+
+  it('starts none while a cron refresh runs, then one once it has ended', async () => {
+    const cronChild = makeFakeChild();
+    spawnMock.mockReturnValue(cronChild as unknown as ChildProcess);
+    const log = makeLog();
+    const cronTick = runRefreshSubprocess({ timeoutMs: 1000, log });
+    const trigger = schemaUpgradeTrigger({ timeoutMs: 1000, log });
+
+    trigger();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(log.warning).not.toHaveBeenCalled();
+
+    cronChild.emit('close', 1, null);
+    await expect(cronTick).rejects.toThrow();
+    const upgradeChild = makeFakeChild();
+    spawnMock.mockReturnValue(upgradeChild as unknown as ChildProcess);
+    trigger();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs a failed run and leaves the retry to the cron', async () => {
+    const child = makeFakeChild();
+    spawnMock.mockReturnValue(child as unknown as ChildProcess);
+    const log = makeLog();
+    const trigger = schemaUpgradeTrigger({ timeoutMs: 1000, log });
+
+    trigger();
+    child.emit('close', 1, null);
+    await settle();
+
+    expect(log.error).toHaveBeenCalledWith('Mirror refresh subprocess exited non-zero', {
+      code: 1,
+      signal: null,
+    });
+    trigger();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('runRefreshChild', () => {
   beforeEach(() => {
     runHarvestMock.mockReset();
@@ -386,6 +490,27 @@ describe('runRefreshChild', () => {
     const log = makeLog();
     await expect(runRefreshChild(log, new AbortController().signal, 0)).rejects.toThrow(
       'OAI unreachable',
+    );
+  });
+
+  it('reports skipped, logging who holds the file, when another writer is migrating it (#71)', async () => {
+    const data = { reason: 'migration_in_progress', holderPid: 4242 };
+    runHarvestMock.mockRejectedValue(conflict('Mirror file is being migrated by pid 4242', data));
+    const log = makeLog();
+
+    const outcome = await runRefreshChild(log, new AbortController().signal, 0);
+
+    expect(outcome).toEqual({ outcome: 'skipped' });
+    expect(log.notice).toHaveBeenCalledWith(
+      'Mirror file is being migrated by pid 4242',
+      expect.objectContaining(data),
+    );
+  });
+
+  it('still fails on any other conflict', async () => {
+    runHarvestMock.mockRejectedValue(conflict('something else', { reason: 'other' }));
+    await expect(runRefreshChild(makeLog(), new AbortController().signal, 0)).rejects.toThrow(
+      'something else',
     );
   });
 });
@@ -420,6 +545,7 @@ describe('refresh child process (real)', () => {
     `<record><header><identifier>oai:arXiv.org:${id}</identifier><datestamp>2026-06-04</datestamp></header><metadata><arXivRaw><id>${id}</id><title>Paper ${id}</title><authors>A</authors><categories>cs.LG</categories><abstract>X</abstract><version version="v1"><date>Mon, 1 Jun 2026 00:00:00 GMT</date></version></arXivRaw></metadata></record>`;
   const pageBody = (n: number, last: boolean) =>
     `<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><ListRecords>${record(`2606.${String(n).padStart(5, '0')}`)}${last ? '' : `<resumptionToken>tok-${n}</resumptionToken>`}</ListRecords></OAI-PMH>`;
+  const BAD_TOKEN_BODY = `<?xml version="1.0" encoding="UTF-8"?><OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><error code="badResumptionToken">rejected</error></OAI-PMH>`;
   /** Endless list: every page answers after `delayMs` with a token for the next. */
   const endless =
     (delayMs: number) =>
@@ -599,6 +725,82 @@ describe('refresh child process (real)', () => {
     );
     expect(next).toMatchObject({ outcome: 'drained', pagesFetched: 1 });
   }, 30_000);
+
+  it('exits 1 when token recovery stalls, so runRefreshSubprocess rejects instead of resolving partial (#59)', async () => {
+    // A budget the stalled loop would otherwise fill and end as partial. The
+    // stall must land before the reserve check trips, so the slack also covers
+    // a child slow to start or answered slowly under load.
+    const budget = RESERVE_MS + 5000;
+    vi.stubEnv('ARXIV_MIRROR_REFRESH_TIMEOUT_MS', String(budget));
+    // Every token is rejected; every other request answers one page of the same day.
+    respond = (n, res) => {
+      const tokenRequest = requests.at(-1)?.searchParams.has('resumptionToken');
+      res.end(tokenRequest ? BAD_TOKEN_BODY : pageBody(n, false));
+    };
+    const log = makeLog();
+
+    await expect(runRefreshSubprocess({ timeoutMs: budget, log })).rejects.toThrow(
+      /exited with code 1/,
+    );
+
+    expect(
+      requests.map((u) => u.searchParams.get('resumptionToken') ?? u.searchParams.get('from')),
+    ).toEqual([null, 'tok-1', '2026-06-04', 'tok-1']);
+    expect(log.error).toHaveBeenCalledWith('Mirror refresh failed', {
+      error: expect.stringMatching(/'tok-1' .*2026-06-04.*no progress/),
+    });
+    expect(log.notice).not.toHaveBeenCalled();
+    expect(harvestState().status).toBe('error');
+  }, 20_000);
+
+  it('exits 0 and reports skipped, sending no request, on a file another writer is migrating (#71)', async () => {
+    vi.stubEnv('ARXIV_MIRROR_REFRESH_TIMEOUT_MS', '7200000');
+    respond = (n, res) => res.end(pageBody(n, true));
+    const store = await MirrorStore.open(dbPath);
+    store.writeHarvestState({
+      status: 'complete',
+      last_datestamp: '2026-06-03',
+      completed_at: 'c',
+    });
+    store.close();
+    const now = new Date().toISOString();
+    const db = new Database(dbPath);
+    db.run('DELETE FROM schema_version');
+    db.run(
+      `INSERT INTO schema_version(version, applied_at) VALUES (2, '2025-06-01T00:00:00.000Z')`,
+    );
+    db.run(
+      `INSERT INTO migration_lease(id, holder, pid, started_at, renewed_at)
+       VALUES (1, 'another-writer', 4242, ?, ?)`,
+      [now, now],
+    );
+    db.close();
+
+    const { code, lines } = await runChild();
+
+    expect(code).toBe(0);
+    expect(lines.at(-1)).toEqual({
+      level: 'info',
+      msg: 'Mirror refresh outcome',
+      outcome: 'skipped',
+    });
+    expect(lines.at(-2)).toMatchObject({
+      level: 'notice',
+      reason: 'migration_in_progress',
+      holderPid: 4242,
+      msg: expect.stringMatching(/by another writer \(pid 4242,.*changed nothing/),
+    });
+    expect(requests).toEqual([]);
+    expect(harvestState()).toMatchObject({ status: 'complete', last_datestamp: '2026-06-03' });
+
+    // Through the supervisor the tick resolves skipped, with no failure logged.
+    const log = makeLog();
+    await expect(runRefreshSubprocess({ timeoutMs: 7_200_000, log })).resolves.toEqual({
+      outcome: 'skipped',
+    });
+    expect(log.error).not.toHaveBeenCalled();
+    expect(requests).toEqual([]);
+  }, 20_000);
 
   it('rejects after SIGTERM at the budget when the child overruns it (#31, #39)', async () => {
     // A budget shorter than one page: the child cannot stop itself in time.

@@ -1,8 +1,15 @@
 /**
- * @fileoverview Mirror SQLite schema as a TypeScript constant. Inlined (vs.
+ * @fileoverview Mirror SQLite schema as TypeScript constants. Inlined (vs.
  * a separate `.sql` file) so it ships in the compiled `dist/` without an
  * extra copy step. The companion `schema.sql` is kept under source control
  * for easier review and external tooling.
+ *
+ * The SQL constants hold one statement per entry, and the store runs them one
+ * at a time (issue #64): `bun:sqlite`'s multi-statement `exec` drops the error
+ * of every statement but the last, so a failed step would otherwise pass
+ * unseen. Only writers run them — the server's connection never does (issue
+ * #55) — and a writer runs the schema inside one write transaction, so a
+ * file is created whole or not at all (issue #71).
  *
  * v2 changes (issues #18 + #19):
  *   - `papers.published`, `papers.updated`, `papers.latest_version` are ISO
@@ -34,8 +41,8 @@ export const MIRROR_SCHEMA_VERSION = 3;
  * has to be added to all three of them — a column missing from a trigger leaves
  * the index silently diverging from `papers` on the next write.
  */
-export const MIRROR_FTS_SQL = `
-CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
+export const MIRROR_FTS_STATEMENTS: readonly string[] = [
+  `CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
   title,
   authors,
   abstract,
@@ -44,37 +51,68 @@ CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
   content='papers',
   content_rowid='rowid',
   tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
-);
-
-CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
+)`,
+  `CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
   INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
   VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
-END;
-
-CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
+END`,
+  `CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
   INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
   VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
-END;
-
-CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
+END`,
+  `CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
   INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
   VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
   INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
   VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
-END;
-`;
+END`,
+];
 
-export const MIRROR_SCHEMA_SQL = `
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
+/**
+ * Drops the FTS index and its triggers so the v3 migration can recreate them
+ * from {@link MIRROR_FTS_STATEMENTS}. Triggers go first: a v2 trigger firing
+ * against a v3 index would leave the index diverging from `papers`.
+ */
+export const MIRROR_FTS_DROP_STATEMENTS: readonly string[] = [
+  'DROP TRIGGER IF EXISTS papers_ai',
+  'DROP TRIGGER IF EXISTS papers_ad',
+  'DROP TRIGGER IF EXISTS papers_au',
+  'DROP TABLE IF EXISTS papers_fts',
+];
 
-CREATE TABLE IF NOT EXISTS schema_version (
+/**
+ * Connection settings a writer applies before its schema transaction: SQLite
+ * refuses a change into WAL inside a transaction and ignores `foreign_keys`
+ * there.
+ */
+export const MIRROR_PRAGMA_STATEMENTS: readonly string[] = [
+  'PRAGMA journal_mode = WAL',
+  'PRAGMA synchronous = NORMAL',
+  'PRAGMA foreign_keys = ON',
+];
+
+/**
+ * The full schema a writer applies on every open, in order, inside one write
+ * transaction (issue #71). Each entry is idempotent.
+ */
+export const MIRROR_SCHEMA_STATEMENTS: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
   applied_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS papers (
+)`,
+  // The writer migrating the file (issue #71): one row while a migration runs,
+  // none otherwise. A writer claims it in the transaction that finds the file
+  // on an older version, renews it with every migration batch, and drops it in
+  // the transaction that records the new version. Outside the schema version:
+  // a file without the table holds no claim.
+  `CREATE TABLE IF NOT EXISTS migration_lease (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  holder TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  started_at TEXT NOT NULL,
+  renewed_at TEXT NOT NULL
+)`,
+  `CREATE TABLE IF NOT EXISTS papers (
   id TEXT PRIMARY KEY NOT NULL,
   version TEXT NOT NULL,
   title TEXT NOT NULL,
@@ -88,33 +126,27 @@ CREATE TABLE IF NOT EXISTS papers (
   comment TEXT,
   journal_ref TEXT,
   doi TEXT
-);
-
-CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_category);
-CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published);
-CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated);
-
-${MIRROR_FTS_SQL}
-
--- Junction table: one row per (paper, category) pair, with the paper's ISO
--- updated value denormalized in. Enables index-backed category filtering
--- without a full-table scan or LIKE queries on the space-joined categories
--- column.
-CREATE TABLE IF NOT EXISTS paper_categories (
+)`,
+  'CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_category)',
+  'CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published)',
+  'CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated)',
+  ...MIRROR_FTS_STATEMENTS,
+  // Junction table: one row per (paper, category) pair, with the paper's ISO
+  // updated value denormalized in. Enables index-backed category filtering
+  // without a full-table scan or LIKE queries on the space-joined categories
+  // column.
+  `CREATE TABLE IF NOT EXISTS paper_categories (
   category TEXT NOT NULL,
   paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
   updated TEXT NOT NULL,
   PRIMARY KEY (category, paper_id)
-);
-
--- Composite (category, updated): the leading column drives COUNT(*) and the
--- IN(...) membership lookups; the trailing column lets a single-category
--- browse page in updated order straight off the index -- no sort, no papers
--- scan, fast for common and rare categories alike (issue #19).
-CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx
-  ON paper_categories(category, updated);
-
-CREATE TABLE IF NOT EXISTS harvest_state (
+)`,
+  // Composite (category, updated): the leading column drives COUNT(*) and the
+  // IN(...) membership lookups; the trailing column lets a single-category
+  // browse page in updated order straight off the index — no sort, no papers
+  // scan, fast for common and rare categories alike (issue #19).
+  'CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx ON paper_categories(category, updated)',
+  `CREATE TABLE IF NOT EXISTS harvest_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   status TEXT NOT NULL,
   last_datestamp TEXT,
@@ -123,10 +155,9 @@ CREATE TABLE IF NOT EXISTS harvest_state (
   completed_at TEXT,
   total_records INTEGER,
   error_message TEXT
-);
-
-INSERT OR IGNORE INTO harvest_state(id, status) VALUES (1, 'pending');
-`;
+)`,
+  `INSERT OR IGNORE INTO harvest_state(id, status) VALUES (1, 'pending')`,
+];
 
 /**
  * Write-path index on `paper_categories(paper_id)` (issue #50). Every record
@@ -134,14 +165,13 @@ INSERT OR IGNORE INTO harvest_state(id, status) VALUES (1, 'pending');
  * `ON DELETE CASCADE` looks them up the same way; neither existing index leads
  * with `paper_id`, so without this one each lookup scans the whole junction.
  *
- * Kept out of {@link MIRROR_SCHEMA_SQL} on purpose: `MirrorStore.open` runs that
- * DDL on every open, including the server's lazy first open on the request
- * event loop, and building this index over a full-corpus junction takes
- * seconds. The harvest runner — the only writer — ensures it before its first
- * page instead (`MirrorStore.ensureWriteIndex`). Reads never filter the
- * junction by `paper_id`, so a file without it serves identically, and the
- * schema version does not change.
+ * Kept out of {@link MIRROR_SCHEMA_STATEMENTS} on purpose: only the harvest
+ * looks junction rows up by `paper_id`, and building this index over a
+ * full-corpus junction takes seconds, which no other open should pay. The
+ * harvest runner ensures it before its first page instead
+ * (`MirrorStore.ensureWriteIndex`). Reads never filter the junction by
+ * `paper_id`, so a file without it serves identically, and the schema version
+ * does not change.
  */
-export const MIRROR_WRITE_INDEX_SQL = `
-CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx ON paper_categories(paper_id);
-`;
+export const MIRROR_WRITE_INDEX_SQL =
+  'CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx ON paper_categories(paper_id)';

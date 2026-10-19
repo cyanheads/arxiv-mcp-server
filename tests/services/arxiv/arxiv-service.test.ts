@@ -17,6 +17,7 @@ import {
   getArxivService,
   initArxivService,
   isConversionFailurePage,
+  isPlaceholderRender,
   resolveRelativeUrls,
   stripHtmlHead,
   stripLatexmlNoise,
@@ -29,6 +30,7 @@ vi.mock('@/config/server-config.js', () => ({
     requestDelayMs: 0,
     contentTimeoutMs: 5000,
     apiTimeoutMs: 5000,
+    readTimeoutMs: 50_000,
   }),
 }));
 
@@ -119,7 +121,8 @@ function servedPage(html: string, url: string): Response {
 /**
  * A captured arXiv HTML page from `tests/fixtures/arxiv-html/` (gzipped). The
  * `-headings` captures keep every heading of the article but none of its
- * paragraphs; the rest keep the whole article and the site footer after it.
+ * paragraphs other than `\includepdf` placeholders; the rest keep the whole
+ * article and the site footer after it.
  */
 function fixturePage(name: string): string {
   const path = new URL(`../../fixtures/arxiv-html/${name}.html.gz`, import.meta.url);
@@ -214,6 +217,10 @@ function pdfResponse(text: string): Response {
 
 beforeEach(() => {
   mockFetch.mockReset();
+  // A request no test mocked is refused rather than answered with `undefined`.
+  mockFetch.mockImplementation(async (url) => {
+    throw new Error(`Unmocked request: ${url}`);
+  });
   initArxivService();
 });
 
@@ -1156,6 +1163,223 @@ describe('ArxivService.getPapers', () => {
 });
 
 // ---------------------------------------------------------------------------
+// getPapers() — superseded old-style versions arXiv answers HTTP 500 for (#53)
+// ---------------------------------------------------------------------------
+
+/**
+ * Versions arXiv's API answers HTTP 500 for: an `id_list` holding either fails
+ * whole. Other superseded old-style versions answer normally
+ * (`astro-ph/0703001v1`), and nothing public tells the two groups apart.
+ */
+const VERSIONS_ARXIV_FAILS = new Set(['hep-th/9901001v1', 'hep-th/9901001v2']);
+
+/** A captured arXiv API response from `tests/fixtures/arxiv-api/`. */
+function capturedFeed(name: string): string {
+  return readFileSync(new URL(`../../fixtures/arxiv-api/${name}.xml`, import.meta.url), 'utf8');
+}
+
+/** arXiv's HTTP 500 response: an Atom feed whose one entry is its internal-error notice. */
+function http500(): Response {
+  return new Response(capturedFeed('http-500'), {
+    status: 500,
+    headers: { 'content-type': 'application/atom+xml; charset=UTF-8' },
+  });
+}
+
+/**
+ * Answer `id_list` lookups the way arXiv does: HTTP 500 for a list holding a
+ * version in {@link VERSIONS_ARXIV_FAILS}, otherwise the response captured for
+ * that list (`tests/fixtures/arxiv-api/`, named for it with `/` → `_` and
+ * `,` → `+`). A list nothing was captured for, or any other host, is refused.
+ */
+function serveCapturedLookups(): void {
+  mockFetch.mockImplementation(async (request) => {
+    const url = new URL(String(request));
+    if (url.hostname !== 'export.arxiv.org') throw new Error(`Unexpected request: ${url}`);
+    const idList = url.searchParams.get('id_list') ?? '';
+    if (idList.split(',').some((id) => VERSIONS_ARXIV_FAILS.has(id))) return http500();
+    return atomResponse(capturedFeed(idList.replaceAll('/', '_').replaceAll(',', '+')));
+  });
+}
+
+/** The `id_list` of every arXiv API request made so far, in order. */
+function idLists(): string[] {
+  return mockFetch.mock.calls.map(
+    ([request]) => new URL(String(request)).searchParams.get('id_list') ?? '',
+  );
+}
+
+describe('ArxivService.getPapers — superseded old-style versions arXiv answers HTTP 500 for (#53)', () => {
+  it('serves the rest of the batch from one unversioned request in place of the identical retry', async () => {
+    serveCapturedLookups();
+    const result = await getArxivService().getPapers(
+      ['1706.03762', 'hep-th/9901001v1'],
+      createMockContext(),
+    );
+
+    expect(idLists()).toEqual(['1706.03762,hep-th/9901001v1', '1706.03762,hep-th/9901001']);
+    expect(result.papers.map((p) => p.id)).toEqual(['1706.03762v7']);
+    expect(result.not_found).toEqual([
+      { id: 'hep-th/9901001v1', reason: 'version_not_served', detail: expect.any(String) },
+    ]);
+    const detail = result.not_found?.[0]?.detail ?? '';
+    expect(detail).toContain('HTTP 500');
+    expect(detail).toContain('the latest version is v3');
+    expect(detail).toContain("'hep-th/9901001v3'");
+    expect(detail).toContain('https://arxiv.org/pdf/hep-th/9901001v1');
+    // One superseded version in the failed request: nothing to request alone.
+    expect(detail).not.toContain('alone');
+  });
+
+  it('serves a pin at the latest version and reports a pin past it as not_in_arxiv', async () => {
+    serveCapturedLookups();
+    const result = await getArxivService().getPapers(
+      ['hep-th/9901001v1', 'math/0309136v1', 'hep-th/9901001v4'],
+      createMockContext(),
+    );
+
+    // The base each pin names, once.
+    expect(idLists()).toEqual([
+      'hep-th/9901001v1,math/0309136v1,hep-th/9901001v4',
+      'hep-th/9901001,math/0309136',
+    ]);
+    expect(result.papers.map((p) => p.id)).toEqual(['math/0309136v1']);
+    expect(result.not_found).toEqual([
+      {
+        id: 'hep-th/9901001v1',
+        reason: 'version_not_served',
+        detail: expect.stringContaining('the latest version is v3'),
+      },
+      { id: 'hep-th/9901001v4', reason: 'not_in_arxiv' },
+    ]);
+  });
+
+  it('tells each of two superseded versions in the failed request to request it alone', async () => {
+    // arXiv serves astro-ph/0703001v1 on its own; which of the two failed the
+    // shared request is not knowable from the 500.
+    serveCapturedLookups();
+    const result = await getArxivService().getPapers(
+      ['astro-ph/0703001v1', 'hep-th/9901001v1'],
+      createMockContext(),
+    );
+
+    expect(idLists()).toEqual([
+      'astro-ph/0703001v1,hep-th/9901001v1',
+      'astro-ph/0703001,hep-th/9901001',
+    ]);
+    expect(result.papers).toEqual([]);
+    expect(result.not_found?.map((miss) => [miss.id, miss.reason])).toEqual([
+      ['astro-ph/0703001v1', 'version_not_served'],
+      ['hep-th/9901001v1', 'version_not_served'],
+    ]);
+    const [astro, hep] = result.not_found ?? [];
+    expect(astro?.detail).toContain('the latest version is v4');
+    expect(astro?.detail).toContain("'astro-ph/0703001v4'");
+    expect(hep?.detail).toContain('the latest version is v3');
+    for (const miss of result.not_found ?? []) {
+      expect(miss.detail).toContain(`Request '${miss.id}' alone`);
+    }
+  });
+
+  it('reports a lone superseded version as version_not_served, never as the 500', async () => {
+    serveCapturedLookups();
+    const result = await getArxivService().getPapers(['hep-th/9901001v1'], createMockContext());
+
+    expect(idLists()).toEqual(['hep-th/9901001v1', 'hep-th/9901001']);
+    expect(result.papers).toEqual([]);
+    expect(result.not_found).toEqual([
+      {
+        id: 'hep-th/9901001v1',
+        reason: 'version_not_served',
+        detail: expect.stringContaining('https://arxiv.org/pdf/hep-th/9901001v1'),
+      },
+    ]);
+  });
+
+  it('asks for a base once however many slots name it, and fills every slot', async () => {
+    serveCapturedLookups();
+    const result = await getArxivService().getPapers(
+      ['hep-th/9901001', 'hep-th/9901001v1', 'hep-th/9901001v3', 'hep-th/9901001v1'],
+      createMockContext(),
+    );
+
+    expect(idLists()).toEqual([
+      'hep-th/9901001,hep-th/9901001v1,hep-th/9901001v3,hep-th/9901001v1',
+      'hep-th/9901001',
+    ]);
+    expect(result.papers.map((p) => p.id)).toEqual(['hep-th/9901001v3', 'hep-th/9901001v3']);
+    expect(result.not_found?.map((miss) => miss.reason)).toEqual([
+      'version_not_served',
+      'version_not_served',
+    ]);
+    // The same version twice is one version, so neither slot is told to go alone.
+    expect(result.not_found?.[0]?.detail).not.toContain('alone');
+  });
+
+  it('keeps a new-style pin pinned in the unversioned request', async () => {
+    serveCapturedLookups();
+    const result = await getArxivService().getPapers(
+      ['1706.03762v1', 'hep-th/9901001v1'],
+      createMockContext(),
+    );
+
+    expect(idLists()).toEqual(['1706.03762v1,hep-th/9901001v1', '1706.03762v1,hep-th/9901001']);
+    expect(result.papers.map((p) => p.id)).toEqual(['1706.03762v1']);
+    expect(result.not_found?.map((miss) => miss.reason)).toEqual(['version_not_served']);
+  });
+
+  it('after a transient 500, reports a servable pin as not served this time and serves it on the next call', async () => {
+    // arXiv serves astro-ph/0703001v1; this lookup's 500 is a one-off.
+    serveCapturedLookups();
+    mockFetch.mockImplementationOnce(async () => http500());
+    const ids = ['1706.03762', 'astro-ph/0703001v1'];
+
+    const first = await getArxivService().getPapers(ids, createMockContext());
+    expect(first.papers.map((p) => p.id)).toEqual(['1706.03762v7']);
+    expect(first.not_found).toEqual([
+      {
+        id: 'astro-ph/0703001v1',
+        reason: 'version_not_served',
+        detail: expect.stringContaining('the latest version is v4'),
+      },
+    ]);
+    // The 500 says nothing about the next request, so the detail claims nothing past this one.
+    expect(first.not_found?.[0]?.detail).not.toContain('cannot');
+
+    const second = await getArxivService().getPapers(ids, createMockContext());
+    expect(second.papers.map((p) => p.id)).toEqual(['1706.03762v7', 'astro-ph/0703001v1']);
+    expect(second.not_found).toBeUndefined();
+    expect(idLists()).toEqual([
+      '1706.03762,astro-ph/0703001v1',
+      '1706.03762,astro-ph/0703001',
+      '1706.03762,astro-ph/0703001v1',
+    ]);
+  });
+
+  const servedInOneRequest: [ids: string[], served: string[]][] = [
+    [
+      ['1706.03762', 'hep-th/9901001v3'],
+      ['1706.03762v7', 'hep-th/9901001v3'],
+    ],
+    [
+      ['1706.03762', 'astro-ph/0703001v1'],
+      ['1706.03762v7', 'astro-ph/0703001v1'],
+    ],
+    [['1706.03762v1'], ['1706.03762v1']],
+  ];
+  for (const [ids, served] of servedInOneRequest) {
+    it(`serves ${JSON.stringify(ids)} in one request`, async () => {
+      serveCapturedLookups();
+      const result = await getArxivService().getPapers(ids, createMockContext());
+
+      expect(idLists()).toEqual([ids.join(',')]);
+      expect(result.papers.map((p) => p.id)).toEqual(served);
+      expect(result.not_found).toBeUndefined();
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // readContent()
 // ---------------------------------------------------------------------------
 
@@ -1546,6 +1770,75 @@ describe('ArxivService.readContent', () => {
     expect(result.content).toContain('served from the PDF');
   });
 
+  // -------------------------------------------------------------------------
+  // A body that drops after its headers fails its rung as a dropped connection
+  // does (issue #70)
+  // -------------------------------------------------------------------------
+
+  /** A 200 whose body sends `head` and then drops, as a connection reset mid-body does. */
+  function droppedBody(contentType: string, head: string): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(head));
+        controller.error(new TypeError('terminated'));
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'content-type': contentType } });
+  }
+
+  it('falls through an ar5iv body that drops mid-read to the PDF', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(droppedBody('text/html', '<html><body><article>'))
+      .mockResolvedValueOnce(pdfResponse('served from the PDF'));
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('served from the PDF');
+    expect(mockFetch.mock.calls.map(([url]) => new URL(String(url)).hostname)).toEqual([
+      'export.arxiv.org',
+      'arxiv.org',
+      'ar5iv.labs.arxiv.org',
+      'arxiv.org',
+    ]);
+  });
+
+  it('reports a dropped arxiv.org/html body as a network error and replays the chain once', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(droppedBody('text/html', '<html><body>'))
+      .mockResolvedValueOnce(droppedBody('text/html', '<html><body>'));
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'arxiv.org HTML network error (failed after 2 attempts)',
+      data: { paperId: '2401.12345v1' },
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  }, 30_000);
+
+  it('reports a dropped PDF body as a network error, not as an absent PDF', async () => {
+    const attempt = (): Response[] => [
+      new Response('Not Found', { status: 404 }),
+      new Response('', { status: 307 }),
+      droppedBody('application/pdf', '%PDF-1.4\n'),
+    ];
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+    for (const response of [...attempt(), ...attempt()]) mockFetch.mockResolvedValueOnce(response);
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'arXiv PDF network error (failed after 2 attempts)',
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(7);
+  }, 30_000);
+
   it('reports the ar5iv outage, not pdf_extraction_failed, when the PDF has no text layer', async () => {
     // ar5iv never answered whether a render exists, so the permanent "no text
     // layer — go OCR it" verdict would foreclose a retry that could still
@@ -1648,6 +1941,311 @@ describe('ArxivService.readContent', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'pdf_extraction_failed' },
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Pages that hold none of the paper fall through to the next rung (issue #57)
+  // -------------------------------------------------------------------------
+
+  /** One rung's answer: a fixture page, an inline page, an HTTP status, or a PDF's text. */
+  type RungAnswer =
+    | { fixture: string }
+    | { html: string }
+    | { status: number }
+    | { pdfText: string };
+
+  /**
+   * Answer the arXiv API with `atomFor(versionedId)` and each content rung with
+   * its answer, routed by host and path; any other request is refused. Returns
+   * the content URLs requested, in order.
+   */
+  function serveRungs(
+    versionedId: string,
+    rungs: { native: RungAnswer; ar5iv?: RungAnswer; pdf?: RungAnswer },
+  ): string[] {
+    const requested: string[] = [];
+    mockFetch.mockImplementation(async (request) => {
+      const url = new URL(String(request));
+      if (url.hostname === 'export.arxiv.org') return atomResponse(atomFor(versionedId));
+      requested.push(url.href);
+      const answer =
+        url.hostname === 'ar5iv.labs.arxiv.org'
+          ? rungs.ar5iv
+          : url.hostname !== 'arxiv.org'
+            ? undefined
+            : url.pathname.startsWith('/html/')
+              ? rungs.native
+              : url.pathname.startsWith('/pdf/')
+                ? rungs.pdf
+                : undefined;
+      if (!answer) throw new Error(`Unexpected request: ${url}`);
+      if ('status' in answer) return new Response('', { status: answer.status });
+      if ('pdfText' in answer) return pdfResponse(answer.pdfText);
+      return servedPage('fixture' in answer ? fixturePage(answer.fixture) : answer.html, url.href);
+    });
+    return requested;
+  }
+
+  /** The three content URLs a read that reaches the PDF requests for `id`. */
+  const wholeChain = (id: string) => [
+    `https://arxiv.org/html/${id}`,
+    `https://ar5iv.labs.arxiv.org/html/${id}`,
+    `https://arxiv.org/pdf/${id}`,
+  ];
+
+  /** LaTeXML's rendering of `\includepdf[pages=-]{supplement.pdf}`. */
+  const PLACEHOLDER_PARAGRAPH =
+    '<div class="ltx_para"><p class="ltx_p">See pages - of <a href="https://supplement.pdf" title="" class="ltx_ref">supplement.pdf</a></p></div>';
+
+  it.each([
+    ['native-1706.03762v7', 'arxiv_html'],
+    ['native-math_9201201v1', 'arxiv_html'],
+    ['native-2405.03599v3-headings', 'arxiv_html'],
+    ['native-astro-ph_0603449v2-headings', 'arxiv_html'],
+    ['native-2102.10962v1-headings', 'arxiv_html'],
+    ['native-2206.14567-headings', 'arxiv_html'],
+    ['ar5iv-1706.03762v7', 'ar5iv'],
+    ['ar5iv-math_9201201v1', 'ar5iv'],
+    ['ar5iv-2411.15218v2-headings', 'ar5iv'],
+  ] as const)('serves the captured render %s from the rung it came from', async (name, rung) => {
+    const requested = serveRungs(
+      '2401.12345v1',
+      rung === 'arxiv_html'
+        ? { native: { fixture: name } }
+        : { native: { status: 404 }, ar5iv: { fixture: name } },
+    );
+
+    const result = await getArxivService().readContent('2401.12345v1', {}, createMockContext());
+
+    expect(result.source).toBe(rung);
+    expect(requested).toEqual(wholeChain('2401.12345v1').slice(0, rung === 'arxiv_html' ? 1 : 2));
+  });
+
+  it('reads 1412.6980 from its PDF when both HTML rungs serve only its \\includepdf placeholder', async () => {
+    const requested = serveRungs('1412.6980v9', {
+      native: { fixture: 'native-1412.6980' },
+      ar5iv: { fixture: 'ar5iv-1412.6980' },
+      pdf: { pdfText: 'ADAM: A METHOD FOR STOCHASTIC OPTIMIZATION' },
+    });
+
+    const result = await getArxivService().readContent('1412.6980', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('ADAM: A METHOD FOR STOCHASTIC OPTIMIZATION');
+    expect(result.content).not.toContain('See pages');
+    expect(requested).toEqual(wholeChain('1412.6980v9'));
+  });
+
+  it('reads 2608.20066 from its PDF rather than the front matter both HTML rungs keep beside nine placeholders', async () => {
+    const requested = serveRungs('2608.20066v1', {
+      native: { fixture: 'native-2608.20066' },
+      ar5iv: { fixture: 'ar5iv-2608.20066' },
+      pdf: { pdfText: 'Part IX Exceptional-History Descent' },
+    });
+
+    const result = await getArxivService().readContent('2608.20066', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('Part IX Exceptional-History Descent');
+    expect(result.content).not.toContain('Global Abstract');
+    expect(requested).toEqual(wholeChain('2608.20066v1'));
+  });
+
+  it.each(['1709.01250v1', '2101.10578v1'])(
+    'moves past the arxiv.org/html placeholder page of %s',
+    async (id) => {
+      const requested = serveRungs(id, {
+        native: { fixture: `native-${id}` },
+        ar5iv: { status: 307 },
+        pdf: { pdfText: 'included paper text' },
+      });
+
+      const result = await getArxivService().readContent(id, {}, createMockContext());
+
+      expect(result.source).toBe('pdf_text');
+      expect(result.content).toContain('included paper text');
+      expect(requested).toEqual(wholeChain(id));
+    },
+  );
+
+  it.each(['1507.08011', '1606.03749', '1707.00406'])(
+    'moves past the ar5iv placeholder page of %s to the PDF',
+    async (id) => {
+      const requested = serveRungs(`${id}v1`, {
+        native: { status: 404 },
+        ar5iv: { fixture: `ar5iv-${id}` },
+        pdf: { pdfText: 'included paper text' },
+      });
+
+      const result = await getArxivService().readContent(id, {}, createMockContext());
+
+      expect(result.source).toBe('pdf_text');
+      expect(requested).toEqual(wholeChain(`${id}v1`));
+    },
+  );
+
+  it('moves past the empty article of ar5iv\'s "No content available" page to the PDF (1503.00739)', async () => {
+    const requested = serveRungs('1503.00739v1', {
+      native: { status: 404 },
+      ar5iv: { fixture: 'ar5iv-1503.00739' },
+      pdf: { pdfText: 'paper text from the PDF' },
+    });
+
+    const result = await getArxivService().readContent('1503.00739', {}, createMockContext());
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('paper text from the PDF');
+    expect(requested).toEqual(wholeChain('1503.00739v1'));
+  });
+
+  it('moves past an arxiv.org/html article with no text to ar5iv (2411.15218v2)', async () => {
+    const requested = serveRungs('2411.15218v2', {
+      native: { fixture: 'native-2411.15218v2' },
+      ar5iv: { fixture: 'ar5iv-2411.15218v2-headings' },
+    });
+
+    const result = await getArxivService().readContent('2411.15218v2', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.content).toContain('Suspected Undeclared Use of Artificial Intelligence');
+    expect(result.outline?.length).toBeGreaterThan(0);
+    expect(requested).toEqual(wholeChain('2411.15218v2').slice(0, 2));
+  });
+
+  it('serves a thesis whose cover pages are included PDFs from arxiv.org/html (2102.10962v1)', async () => {
+    const requested = serveRungs('2102.10962v1', {
+      native: { fixture: 'native-2102.10962v1-headings' },
+    });
+
+    const result = await getArxivService().readContent('2102.10962v1', {}, createMockContext());
+
+    expect(result.source).toBe('arxiv_html');
+    expect(result.content).toContain('COVER-THESIS-DPG-VOOR.pdf');
+    expect(result.content).toContain('Research Outline and Questions');
+    expect(requested).toEqual(['https://arxiv.org/html/2102.10962v1']);
+  });
+
+  it('serves a sectioned render with a placeholder paragraph added before </article>', async () => {
+    const native = fixturePage('native-1706.03762v7');
+    const end = native.lastIndexOf('</article>');
+    const requested = serveRungs('1706.03762v7', {
+      native: { html: `${native.slice(0, end)}${PLACEHOLDER_PARAGRAPH}${native.slice(end)}` },
+    });
+
+    const result = await getArxivService().readContent(
+      '1706.03762v7',
+      { maxCharacters: null },
+      createMockContext(),
+    );
+
+    expect(result.source).toBe('arxiv_html');
+    expect(result.content).toContain('supplement.pdf');
+    expect(requested).toEqual(['https://arxiv.org/html/1706.03762v7']);
+  });
+
+  it('reports content_unavailable when both HTML rungs serve placeholders and there is no PDF', async () => {
+    serveRungs('1412.6980v9', {
+      native: { fixture: 'native-1412.6980' },
+      ar5iv: { fixture: 'ar5iv-1412.6980' },
+      pdf: { status: 404 },
+    });
+
+    await expect(
+      getArxivService().readContent('1412.6980', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'content_unavailable', pdfUrl: 'https://arxiv.org/pdf/1412.6980v9' },
+    });
+  });
+
+  it('reports pdf_extraction_failed when both HTML rungs serve placeholders and the PDF has no text', async () => {
+    serveRungs('1412.6980v9', {
+      native: { fixture: 'native-1412.6980' },
+      ar5iv: { fixture: 'ar5iv-1412.6980' },
+      pdf: { pdfText: '' },
+    });
+
+    await expect(
+      getArxivService().readContent('1412.6980', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'pdf_extraction_failed' },
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ar5iv keeps one render per paper, so its body names no revision (issue #63)
+  // -------------------------------------------------------------------------
+
+  const AR5IV_RENDER =
+    '<article class="ltx_document"><section class="ltx_section"><h2 class="ltx_title ltx_title_section">1 Introduction</h2><p class="ltx_p">Body.</p></section></article>';
+
+  /** Read `requested` with metadata naming `servedId`, native 404, and ar5iv serving its render. */
+  async function readFromAr5iv(requested: string, servedId: string) {
+    const urls = serveRungs(servedId, { native: { status: 404 }, ar5iv: { html: AR5IV_RENDER } });
+    const result = await getArxivService().readContent(requested, {}, createMockContext());
+    return { result, urls };
+  }
+
+  it('flags an ar5iv body read for a pinned later version', async () => {
+    const { result } = await readFromAr5iv('2501.00100v2', '2501.00100v2');
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.revision_unconfirmed).toBe(true);
+  });
+
+  it('flags an ar5iv body for an unversioned read of a revised paper', async () => {
+    const { result } = await readFromAr5iv('2411.15218', '2411.15218v2');
+
+    expect(result.paper_id).toBe('2411.15218v2');
+    expect(result.revision_unconfirmed).toBe(true);
+  });
+
+  it('flags an ar5iv body read for a pinned v1', async () => {
+    const { result } = await readFromAr5iv('1601.00002v1', '1601.00002v1');
+
+    expect(result.revision_unconfirmed).toBe(true);
+  });
+
+  it('leaves the flag off an unversioned ar5iv read of a paper whose only version is v1', async () => {
+    const { result } = await readFromAr5iv('1601.00002', '1601.00002v1');
+
+    expect(result.source).toBe('ar5iv');
+    expect(result).not.toHaveProperty('revision_unconfirmed');
+  });
+
+  it('leaves the flag off a pre-2007 paper read unversioned at its only version', async () => {
+    const { result } = await readFromAr5iv('hep-th/9711200', 'hep-th/9711200v1');
+
+    expect(result).not.toHaveProperty('revision_unconfirmed');
+  });
+
+  it('never flags an arxiv_html or pdf_text body', async () => {
+    serveRungs('2501.00100v2', { native: { html: AR5IV_RENDER } });
+    const native = await getArxivService().readContent('2501.00100v2', {}, createMockContext());
+    serveRungs('2501.00100v2', {
+      native: { status: 404 },
+      ar5iv: { status: 307 },
+      pdf: { pdfText: 'pdf body' },
+    });
+    const pdf = await getArxivService().readContent('2501.00100v2', {}, createMockContext());
+
+    expect(native.source).toBe('arxiv_html');
+    expect(native).not.toHaveProperty('revision_unconfirmed');
+    expect(pdf.source).toBe('pdf_text');
+    expect(pdf).not.toHaveProperty('revision_unconfirmed');
+  });
+
+  it('sends the same requests and serves the same body whether or not the flag is set', async () => {
+    const unflagged = await readFromAr5iv('1601.00002', '1601.00002v1');
+    const flagged = await readFromAr5iv('1601.00002v1', '1601.00002v1');
+
+    expect(unflagged.urls).toEqual(wholeChain('1601.00002v1').slice(0, 2));
+    expect(flagged.urls).toEqual(unflagged.urls);
+    expect(flagged.result.content).toBe(unflagged.result.content);
+    expect(flagged.result.content).toBe(
+      '<article><section class="ltx_section"><h2 class="ltx_title ltx_title_section">1 Introduction</h2><p>Body.</p></section></article>',
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -1994,12 +2592,14 @@ describe('ArxivService.readContent', () => {
   it('resolves against the requested URL when the response carries none', async () => {
     mockFetch
       .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
-      .mockResolvedValueOnce(htmlResponse('<article><img src="2401.12345v1/x1.png"></article>'));
+      .mockResolvedValueOnce(
+        htmlResponse('<article>Figure 1. <img src="2401.12345v1/x1.png"></article>'),
+      );
 
     const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
 
     expect(result.content).toBe(
-      '<article><img src="https://arxiv.org/html/2401.12345v1/x1.png"></article>',
+      '<article>Figure 1. <img src="https://arxiv.org/html/2401.12345v1/x1.png"></article>',
     );
   });
 
@@ -2076,6 +2676,34 @@ describe('ArxivService.readContent', () => {
       expect(classOf(entry)).toMatch(/ltx_title_(section|subsection|subsubsection|bibliography)\b/);
     }
   });
+
+  it.each([
+    ['2102.10962v1', 'native-2102.10962v1-headings', 188, '1.1 Research Outline and Questions'],
+    ['2206.14567', 'native-2206.14567-headings', 187, '1 Motivation'],
+  ] as const)(
+    'outlines every structural heading of %s, the styled ones included (#66)',
+    async (id, fixture, count, styledTitle) => {
+      const result = await readFixture(id, fixture, 'arxiv_html');
+      const outline = result.outline ?? [];
+      const structuralOpeners = [
+        ...result.content.matchAll(
+          /<h[1-6]\s[^<>]*\bltx_title_(?:part|chapter|section|subsection|subsubsection|paragraph|appendix|bibliography)\b[^<>]*>/g,
+        ),
+      ].map((match) => match.index);
+
+      expect(outline).toHaveLength(count);
+      expect(outline.map((entry) => entry.start)).toEqual(structuralOpeners);
+      for (const entry of outline) {
+        expect(result.content.startsWith(`<h${entry.level + 1}`, entry.start), entry.title).toBe(
+          true,
+        );
+      }
+      const styled = outline.find((entry) => entry.title === styledTitle);
+      expect(result.content.slice(styled?.start ?? 0)).toMatch(
+        /^<h\d class="[^"]*\bltx_title_section\b[^"]*" style="font-size:\d+%;">/,
+      );
+    },
+  );
 
   it('cuts a single-level outline over 200 entries and says where it continues', async () => {
     const sections = Array.from(
@@ -2250,6 +2878,23 @@ describe('HTML cleaning passes', { timeout: 30_000 }, () => {
     expectLinear('<h2 class="ltx_title ltx_title_section ', buildOutline);
   });
 
+  it('keeps the outline heading scan linear on openers with attributes beside the class (#66)', () => {
+    expectLinear('<h2 style="', buildOutline);
+    expectLinear('<h4 class="ltx_title ltx_title_section" style="font-size:90%; ', buildOutline);
+    expectLinear(' style="x"', (s) =>
+      buildOutline(`<h2 class="ltx_title ltx_title_section"${s}>x</h2>`),
+    );
+  });
+
+  it('keeps the outline heading scan linear on one long line and on line breaks throughout (#66)', () => {
+    expectLinear('§1 x', (s) =>
+      buildOutline(`<h2 class="ltx_title ltx_title_section" style="${s}\ny">x</h2>`),
+    );
+    expectLinear('  \r\n', (s) =>
+      buildOutline(`<h2 class="ltx_title ltx_title_section"${s}>x</h2>`),
+    );
+  });
+
   it('keeps relative-URL resolution linear in page length', () => {
     const base = 'https://arxiv.org/html/2401.12345v1';
     expectLinear('<a', (s) => resolveRelativeUrls(s, base));
@@ -2365,6 +3010,136 @@ describe('isConversionFailurePage', { timeout: 30_000 }, () => {
     expectLinear(`${NOTICE} `, (s) =>
       isConversionFailurePage(`<article><span class="ltx_ERROR">${s}</article>`),
     );
+  });
+});
+
+describe('isPlaceholderRender', { timeout: 30_000 }, () => {
+  /** LaTeXML's rendering of `\includepdf[pages=-]{supplement.pdf}`. */
+  const PLACEHOLDER =
+    '<div class="ltx_para"><p class="ltx_p">See pages - of <a href="supplement.pdf" title="" class="ltx_ref">supplement.pdf</a></p></div>';
+
+  it('recognizes every captured placeholder page on both rungs', () => {
+    for (const name of [
+      'native-1412.6980',
+      'native-1709.01250v1',
+      'native-2101.10578v1',
+      'native-2608.20066',
+      'ar5iv-1412.6980',
+      'ar5iv-1507.08011',
+      'ar5iv-1606.03749',
+      'ar5iv-1707.00406',
+      'ar5iv-2608.20066',
+    ]) {
+      expect(isPlaceholderRender(fixturePage(name)), name).toBe(true);
+    }
+  });
+
+  it('recognizes an article with no text', () => {
+    expect(isPlaceholderRender(fixturePage('native-2411.15218v2'))).toBe(true);
+    expect(isPlaceholderRender(fixturePage('ar5iv-1503.00739'))).toBe(true);
+    expect(
+      isPlaceholderRender(
+        '<article class="ltx_document">\n<div class="ltx_pagination ltx_role_newpage"></div>\n</article>',
+      ),
+    ).toBe(true);
+    expect(isPlaceholderRender('<article></article>')).toBe(true);
+  });
+
+  it('recognizes the placeholder with a pages key and without one', () => {
+    expect(isPlaceholderRender(`<article><p>Front matter.</p>${PLACEHOLDER}</article>`)).toBe(true);
+    expect(
+      isPlaceholderRender(
+        '<article><p>Front matter.</p><p>See <a href="part1.pdf" title="" class="ltx_ref">part1.pdf</a></p></article>',
+      ),
+    ).toBe(true);
+  });
+
+  it('passes every captured render, and the conversion-failure page its own check covers', () => {
+    for (const name of [
+      'ar5iv-1706.03762v7',
+      'ar5iv-2411.15218v2-headings',
+      'ar5iv-hep-th_9711200v3',
+      'ar5iv-math_9201201v1',
+      'native-1706.03762v7',
+      'native-2102.10962v1-headings',
+      'native-2206.14567-headings',
+      'native-2405.03599v3-headings',
+      'native-astro-ph_0603449v2-headings',
+      'native-math_9201201v1',
+    ]) {
+      expect(isPlaceholderRender(fixturePage(name)), name).toBe(false);
+    }
+  });
+
+  it('passes a page with a structural heading whatever placeholders it holds', () => {
+    const native = fixturePage('native-1706.03762v7');
+    const end = native.lastIndexOf('</article>');
+    expect(isPlaceholderRender(`${native.slice(0, end)}${PLACEHOLDER}${native.slice(end)}`)).toBe(
+      false,
+    );
+    expect(
+      isPlaceholderRender(
+        `<article>${PLACEHOLDER}<h4 class="ltx_title ltx_title_section" style="font-size:144%;">1 Intro</h4></article>`,
+      ),
+    ).toBe(false);
+    // An attribute before the class: a heading buildOutline lists all the same.
+    const leadingAttribute = '<h5 lang="en" class="ltx_title ltx_title_subsection">1.1 Scope</h5>';
+    expect(buildOutline(leadingAttribute).entries).toHaveLength(1);
+    expect(isPlaceholderRender(`<article>${PLACEHOLDER}${leadingAttribute}</article>`)).toBe(false);
+  });
+
+  it('counts only an <hN> heading the outline lists as structural', () => {
+    for (const heading of [
+      '<h1 class="ltx_title ltx_title_document">Title</h1>',
+      '<h6 class="ltx_title ltx_title_contents">Contents</h6>',
+      '<h6 class="ltx_title ltx_title_abstract">Abstract</h6>',
+      '<span class="ltx_title_section">1 Intro</span>',
+    ]) {
+      expect(isPlaceholderRender(`<article>${heading}${PLACEHOLDER}</article>`), heading).toBe(
+        true,
+      );
+    }
+  });
+
+  it('passes heading-free text whose links are not the placeholder', () => {
+    for (const article of [
+      '<article><p>A note with no sections.</p></article>',
+      '<article><p>See <a href="https://x.org" class="ltx_url">https://x.org</a>.</p></article>',
+      '<article><p>See <a href="https://github.com/x/y" title="" class="ltx_ref ltx_href">github.com/x/y</a>.</p></article>',
+      '<article><p>See <a href="#S2" title="" class="ltx_ref"><span class="ltx_text ltx_ref_tag">2</span></a>.</p></article>',
+    ]) {
+      expect(isPlaceholderRender(article), article).toBe(false);
+    }
+  });
+
+  it('keeps the check linear in page length', () => {
+    const page = (s: string) => isPlaceholderRender(`<article>${s}</article>`);
+    expectLinear('See pages ', page);
+    expectLinear('See <a ', page);
+    expectLinear('<a', page);
+    expectLinear('See pages 1 of <a class="ltx_ref" ', page);
+    expectLinear('See <a class="ltx_ref">x', page);
+    expectLinear('class="ltx_ref" ', (s) => page(`See <a ${s}`));
+    expectLinear('<h2 class="ltx_title ', page);
+    expectLinear('ltx_title_ ', (s) => page(`<h2 ${s}`));
+  });
+
+  it('keeps the check linear on one long line and on line breaks throughout', () => {
+    expectLinear('§1 x', (s) => isPlaceholderRender(`<article>${s}\ny</article>`));
+    expectLinear('  \r\n', (s) => isPlaceholderRender(`<article>${s}</article>`));
+  });
+
+  it('keeps the check linear on an unclosed article, nested link openers, unclosed headings, and one late closer', () => {
+    const page = (s: string) => isPlaceholderRender(`<article>${s}</article>`);
+    expectLinear('<a', (s) => isPlaceholderRender(`<article>${s}`));
+    expectLinear('<a<a<a', (s) => page(`See ${s}`));
+    expectLinear('See <a<a ', page);
+    expectLinear('<h2', page);
+    expectLinear('<h3 style="', page);
+    expectLinear('See pages ', (s) => page(`${s}</a>`));
+    expectLinear('See pages \n', page);
+    expectLinear('x', (s) => page(`${'See pages '.repeat(20)}of <a ${s}`));
+    expectLinear(`${'See pages '.repeat(20)}of <a x`, page);
   });
 });
 
@@ -2493,6 +3268,18 @@ describe('buildOutline', () => {
       heading(3, 'Last');
 
     expect(buildOutline(body).entries.map((e) => e.title)).toEqual(['Closed', 'Last']);
+  });
+
+  it('outlines a heading whatever attributes sit beside its class (#66)', () => {
+    const body =
+      '<h4 class="ltx_title ltx_title_section" style="font-size:90%;"><span>1 </span>Motivation</h4>' +
+      '<p>x</p><h5 lang="en" class="ltx_title ltx_title_subsection">1.1 Scope</h5>' +
+      '<h6 class="ltx_title ltx_title_theorem" style="font-size:90%;">Theorem 1</h6>';
+
+    expect(buildOutline(body).entries).toEqual([
+      { level: 3, title: '1 Motivation', start: 0 },
+      { level: 4, title: '1.1 Scope', start: body.indexOf('<h5') },
+    ]);
   });
 
   it('keeps headings whose collapsed TeX holds < and >', () => {

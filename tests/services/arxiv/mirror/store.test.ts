@@ -1,16 +1,30 @@
 /**
  * @fileoverview Tests for the MirrorStore — schema migration, batch upsert
- * idempotency, FTS5 round-trip via `search()`, category filter matching, and
- * harvest-state read/write.
+ * idempotency, FTS5 round-trip via `search()`, category filter matching,
+ * harvest-state read/write, the server's query-only open (#55), and the
+ * better-sqlite3 driver, which the last block runs under Node.
  * @module services/arxiv/mirror/store.test
  */
 
-import { mkdtemp, rm } from 'node:fs/promises';
+import { Database } from 'bun:sqlite';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, fstatSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { delimiter, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { categorySubtree } from '@/services/arxiv/categories.js';
 import { translateQuery } from '@/services/arxiv/mirror/query.js';
+import {
+  MIRROR_FTS_DROP_STATEMENTS,
+  MIRROR_FTS_STATEMENTS,
+  MIRROR_PRAGMA_STATEMENTS,
+  MIRROR_SCHEMA_STATEMENTS,
+  MIRROR_SCHEMA_VERSION,
+  MIRROR_WRITE_INDEX_SQL,
+} from '@/services/arxiv/mirror/schema.js';
 import { MirrorStore, rawToRow } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
 
@@ -25,6 +39,126 @@ const mkRecord = (overrides: Partial<ArxivRawRecord> = {}): ArxivRawRecord => ({
   versions: [{ version: 'v1', date: '2024-01-22T00:00:00Z' }],
   ...overrides,
 });
+
+/** The SQLite error code a driver error carries (`SQLITE_BUSY`, `SQLITE_READONLY`, …). */
+function sqliteCode(fn: () => unknown): string | undefined {
+  try {
+    fn();
+  } catch (err) {
+    return (err as { code?: string }).code;
+  }
+  return;
+}
+
+/** Hold `path`'s write lock from a second connection in this process until `release()`. */
+function holdWriteLock(path: string): { release: () => void } {
+  const holder = new Database(path);
+  holder.run('BEGIN IMMEDIATE');
+  return {
+    release: () => {
+      holder.run('COMMIT');
+      holder.close();
+    },
+  };
+}
+
+/**
+ * Hold `path`'s write lock from a separate process, resolving once it holds it.
+ * The process keeps the lock until `letGo(ms)` is called, then lets go `ms`
+ * later; `releasedAt` settles with the epoch ms it read just before letting go.
+ * `letGo` signals through a file, written synchronously, because a busy wait
+ * sleeps this thread: only another process can release the lock while this one
+ * waits, and only a signal sent before the wait starts reaches it. A process
+ * that never sees the signal (a test that failed and removed its directory)
+ * exits after 15 s.
+ */
+async function holdWriteLockElsewhere(
+  path: string,
+): Promise<{ letGo: (ms: number) => void; releasedAt: Promise<number> }> {
+  const goPath = `${path}.go`;
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      `const { Database } = require('bun:sqlite');
+       const { existsSync, readFileSync } = require('node:fs');
+       const db = new Database(process.env.LOCK_PATH);
+       db.run('BEGIN IMMEDIATE');
+       console.log('LOCKED');
+       const giveUp = setTimeout(() => process.exit(3), 15000);
+       const poll = setInterval(() => {
+         if (!existsSync(process.env.GO_PATH)) return;
+         clearInterval(poll);
+         clearTimeout(giveUp);
+         setTimeout(() => {
+           const at = Date.now();
+           db.run('COMMIT');
+           db.close();
+           console.log('RELEASED ' + at);
+         }, Number(readFileSync(process.env.GO_PATH, 'utf8')));
+       }, 5);`,
+    ],
+    {
+      env: { ...process.env, LOCK_PATH: path, GO_PATH: goPath },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    },
+  );
+  let out = '';
+  const exited = new Promise<string>((resolve, reject) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    child.once('error', reject);
+    child.once('close', (code) =>
+      code === 0 ? resolve(out) : reject(new Error(`lock holder exited ${code}`)),
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.stdout?.on('data', () => {
+      if (out.includes('LOCKED')) resolve();
+    });
+    exited.catch(reject);
+  });
+  const releasedAt = exited.then((text) => {
+    const at = /RELEASED (\d+)/.exec(text)?.[1];
+    if (at === undefined) throw new Error(`lock holder never released: ${text}`);
+    return Number(at);
+  });
+  // A test that fails before awaiting it has its own failure to report.
+  releasedAt.catch(() => undefined);
+  return { letGo: (ms) => writeFileSync(goPath, String(ms)), releasedAt };
+}
+
+/**
+ * How many of this process's file descriptors are open on `path`'s file. A
+ * connection holds one for as long as SQLite keeps the file open, so a
+ * connection that was closed but kept alive holds it still.
+ */
+function fdsOpenOn(path: string): number {
+  const { dev, ino } = statSync(path);
+  let open = 0;
+  for (const entry of readdirSync('/dev/fd')) {
+    try {
+      const fd = fstatSync(Number(entry));
+      if (fd.dev === dev && fd.ino === ino) open += 1;
+    } catch {
+      // The descriptor the listing itself used is closed by the time it is checked.
+    }
+  }
+  return open;
+}
+
+/** Names of the schema objects of `type` that `path` holds, read on a separate connection. */
+function schemaNames(path: string, type: 'table' | 'trigger'): string[] {
+  const db = new Database(path, { readonly: true });
+  const rows = db.query(`SELECT name FROM sqlite_master WHERE type = ?`).all(type) as {
+    name: string;
+  }[];
+  db.close();
+  return rows.map((r) => r.name).sort();
+}
+const tableNames = (path: string) => schemaNames(path, 'table');
+const triggerNames = (path: string) => schemaNames(path, 'trigger');
 
 describe('MirrorStore', () => {
   let dir: string;
@@ -483,6 +617,99 @@ describe('MirrorStore', () => {
       store.applyBatch([], [{ paper_id: 'x' }]);
       expect(count('math.AP')).toBe(0);
     });
+
+    // Issue #64 — the index build must surface a held write lock, never report
+    // success without the index.
+    it('waits out a write lock another process holds briefly, then builds the index', async () => {
+      const holder = await holdWriteLockElsewhere(dbPath);
+      const calledAt = Date.now();
+      holder.letGo(250);
+      store.ensureWriteIndex();
+      const returnedAt = Date.now();
+      const releasedAt = await holder.releasedAt;
+
+      // The lock was still held when the call began, and the call returned only
+      // once the other process had let go of it.
+      expect(releasedAt).toBeGreaterThan(calledAt);
+      expect(returnedAt).toBeGreaterThanOrEqual(releasedAt);
+      expect(await junctionIndexes()).toContain('paper_categories_paper_id_idx');
+    });
+
+    it('fails, without the index, when the write lock outlasts the 5 s busy wait', async () => {
+      const lock = holdWriteLock(dbPath);
+      const started = performance.now();
+      const code = sqliteCode(() => store.ensureWriteIndex());
+      const waitedMs = performance.now() - started;
+      lock.release();
+
+      expect(code).toBe('SQLITE_BUSY');
+      expect(waitedMs).toBeGreaterThanOrEqual(4_900);
+      expect(await junctionIndexes()).not.toContain('paper_categories_paper_id_idx');
+    }, 15_000);
+  });
+
+  // Issue #64 — the mirror's SQL runs one statement at a time on both drivers,
+  // so a failure stops the run and surfaces instead of being skipped.
+  describe('statement execution (#64)', () => {
+    it('holds one statement per entry, so no statement hides behind another', () => {
+      // bun:sqlite's prepare compiles a string's first statement and drops the
+      // rest silently; its text is what the statement reports back.
+      const db = new Database(':memory:');
+      for (const sql of [
+        ...MIRROR_PRAGMA_STATEMENTS,
+        ...MIRROR_SCHEMA_STATEMENTS,
+        MIRROR_WRITE_INDEX_SQL,
+        ...MIRROR_FTS_DROP_STATEMENTS,
+        ...MIRROR_FTS_STATEMENTS,
+      ]) {
+        const stmt = db.prepare(sql);
+        expect(stmt.toString().trim()).toBe(sql.trim());
+        stmt.run();
+        stmt.finalize();
+      }
+      db.close();
+    });
+
+    it('stops at the first schema statement that fails as it runs, and runs none after it', async () => {
+      // A table holding the name of an FTS5 shadow table makes the index's
+      // CREATE VIRTUAL TABLE fail when it runs, not when it compiles.
+      const brokenPath = join(dir, 'broken.db');
+      const raw = new Database(brokenPath);
+      raw.run('CREATE TABLE papers_fts_data (id INTEGER PRIMARY KEY, block BLOB)');
+      raw.close();
+
+      const prepared = vi.spyOn(Database.prototype, 'prepare');
+      const failure = await MirrorStore.open(brokenPath).catch((err: unknown) => err);
+      const ran = prepared.mock.calls
+        .map(([sql]) => String(sql))
+        .filter((sql) => MIRROR_SCHEMA_STATEMENTS.includes(sql));
+      prepared.mockRestore();
+
+      expect(failure).toBeInstanceOf(McpError);
+      expect(String((failure as McpError).cause)).toMatch(/papers_fts_data/);
+      // Nothing after the index ran: no sync triggers, no junction, no harvest state.
+      const failedAt = MIRROR_SCHEMA_STATEMENTS.indexOf(MIRROR_FTS_STATEMENTS[0] as string);
+      expect(ran).toEqual(MIRROR_SCHEMA_STATEMENTS.slice(0, failedAt + 1));
+      // …and the schema runs in one transaction (#71), so what ran before it is
+      // rolled back too: the file holds only what it held before the open.
+      expect(tableNames(brokenPath)).toEqual(['papers_fts_data']);
+      expect(triggerNames(brokenPath)).toEqual([]);
+    });
+
+    it('releases the file when the open fails', async () => {
+      const brokenPath = join(dir, 'not-a-database.db');
+      await writeFile(brokenPath, 'x'.repeat(4096));
+      // The count sees a connection that holds the file.
+      const live = new Database(brokenPath);
+      expect(fdsOpenOn(brokenPath)).toBe(1);
+      live.close();
+
+      await expect(MirrorStore.open(brokenPath)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.DatabaseError,
+      });
+
+      expect(fdsOpenOn(brokenPath)).toBe(0);
+    });
   });
 
   // Issue #49 — a search with an FTS term is driven from the FTS index: the
@@ -796,6 +1023,319 @@ describe('MirrorStore.matchReachesCap (#49)', () => {
     expect(run([]).total).toBe(49_999);
     expect(run([['cs.LG']]).total).toBe(49_999);
     expect(run([['cs.LG']]).papers).toHaveLength(2);
+  });
+});
+
+// Issue #55 — the server's connection is query-only: it never creates,
+// seeds, or migrates the file, and a file it cannot serve reads as not ready.
+describe('MirrorStore.openReader (#55)', () => {
+  let dir: string;
+  let dbPath: string;
+
+  /** A current-schema mirror holding one paper and a completed harvest. */
+  async function seedCurrent(): Promise<void> {
+    const writer = await MirrorStore.open(dbPath);
+    writer.applyBatch([mkRecord({ paper_id: '2401.00001', title: 'Protein folding' })], []);
+    writer.writeHarvestState({
+      status: 'complete',
+      completed_at: '2024-02-01T00:00:00.000Z',
+      total_records: 1,
+    });
+    writer.close();
+  }
+
+  const searchIds = (store: MirrorStore): string[] =>
+    store
+      .search({
+        matchExpr: '"protein"',
+        limit: 10,
+        offset: 0,
+        sortBy: 'relevance',
+        sortOrder: 'descending',
+      })
+      .papers.map((p) => p.id);
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-mirror-reader-test-'));
+    dbPath = join(dir, 'mirror.db');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('serves a current-schema file at once while another connection holds the write lock', async () => {
+    await seedCurrent();
+    const lock = holdWriteLock(dbPath);
+    try {
+      const started = performance.now();
+      const opened = await MirrorStore.openReader(dbPath);
+      const elapsedMs = performance.now() - started;
+
+      expect(opened.status).toBe('open');
+      if (opened.status !== 'open') return;
+      expect(searchIds(opened.store)).toEqual(['2401.00001']);
+      expect(opened.store.readHarvestState().completed_at).toBe('2024-02-01T00:00:00.000Z');
+      expect(elapsedMs).toBeLessThan(1_000);
+      opened.store.close();
+    } finally {
+      lock.release();
+    }
+  });
+
+  it('refuses every write on its connection with SQLITE_READONLY', async () => {
+    await seedCurrent();
+    const opened = await MirrorStore.openReader(dbPath);
+    if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+    const { store } = opened;
+
+    expect(sqliteCode(() => store.writeHarvestState({ status: 'error' }))).toBe('SQLITE_READONLY');
+    expect(sqliteCode(() => store.applyBatch([mkRecord({ paper_id: '2401.00002' })], []))).toBe(
+      'SQLITE_READONLY',
+    );
+    expect(sqliteCode(() => store.ensureWriteIndex())).toBe('SQLITE_READONLY');
+    expect(store.readHarvestState().status).toBe('complete');
+    expect(store.countPapers()).toBe(1);
+    store.close();
+  });
+
+  it('leaves a missing harvest_state row missing rather than seeding it', async () => {
+    await seedCurrent();
+    const raw = new Database(dbPath);
+    raw.run('DELETE FROM harvest_state');
+    raw.close();
+
+    const opened = await MirrorStore.openReader(dbPath);
+    if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+    expect(opened.store.readHarvestState()).toEqual({ status: 'pending' });
+    opened.store.close();
+
+    const check = new Database(dbPath, { readonly: true });
+    expect(check.query('SELECT COUNT(*) AS n FROM harvest_state').get()).toEqual({ n: 0 });
+    check.close();
+  });
+
+  it('reads a missing file as not ready and creates neither it nor its directory', async () => {
+    const absentPath = join(dir, 'absent', 'mirror.db');
+
+    expect(await MirrorStore.openReader(absentPath)).toEqual({ status: 'missing_file' });
+    expect(existsSync(join(dir, 'absent'))).toBe(false);
+  });
+
+  it('reads a file with no mirror schema as not ready and leaves it untouched', async () => {
+    await writeFile(dbPath, '');
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'missing_schema' });
+    expect(statSync(dbPath).size).toBe(0);
+
+    // A writer creating the file records its version last: no row yet is no schema yet.
+    const raw = new Database(dbPath);
+    raw.run('CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
+    raw.close();
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'missing_schema' });
+    expect(tableNames(dbPath)).toEqual(['schema_version']);
+  });
+
+  it('releases the file on a not-ready open and on a failed one', async () => {
+    await writeFile(dbPath, '');
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'missing_schema' });
+    expect(fdsOpenOn(dbPath)).toBe(0);
+
+    const brokenPath = join(dir, 'not-a-database.db');
+    await writeFile(brokenPath, 'x'.repeat(4096));
+    await expect(MirrorStore.openReader(brokenPath)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.DatabaseError,
+    });
+    expect(fdsOpenOn(brokenPath)).toBe(0);
+  });
+});
+
+// The suite runs on Bun, so the store's better-sqlite3 driver, the one a server
+// started with `node` uses, runs only here: the store bundled for Node and
+// driven by a `node` child, which reports what each open did.
+describe('MirrorStore under Node (better-sqlite3)', () => {
+  const STORE_SOURCE = fileURLToPath(
+    new URL('../../../../src/services/arxiv/mirror/store.ts', import.meta.url),
+  );
+  // Inside the project's node_modules, so the bundle's package imports resolve.
+  const CACHE_ROOT = fileURLToPath(new URL('../../../../node_modules/.cache/', import.meta.url));
+
+  /**
+   * The first `node` on PATH that is Node.js. `bun run` puts a `node` that runs
+   * Bun first on the PATH of the scripts it starts, this suite included, and
+   * that shim is shared by every Bun install of the same revision, so it can
+   * point at a Bun other than the one running this suite: each candidate is
+   * asked which runtime it is.
+   */
+  function realNode(): string {
+    for (const entry of (process.env.PATH ?? '').split(delimiter)) {
+      const candidate = join(entry, 'node');
+      if (!existsSync(candidate)) continue;
+      const probe = spawnSync(candidate, ['-p', 'process.versions.bun ?? process.release.name'], {
+        encoding: 'utf8',
+      });
+      if (probe.status === 0 && probe.stdout.trim() === 'node') return candidate;
+    }
+    throw new Error('No Node.js on PATH: the better-sqlite3 tests need a `node` binary');
+  }
+
+  /** Each scenario's outcome, as the `node` child reports it. */
+  interface NodeReport {
+    created: { exists: boolean; version: number };
+    failedOpens: {
+      afterReader: number;
+      afterWriter: number;
+      control: number;
+      reader: { cause?: string; code: number } | null;
+      writer: { cause?: string; code: number } | null;
+    };
+    locked: {
+      completedAt?: string;
+      ids?: string[];
+      status: string;
+      write?: string | null;
+    };
+    runtime: string;
+  }
+
+  const SCRIPT = `
+    import { createRequire } from 'node:module';
+    import { existsSync, fstatSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    const { MirrorStore } = await import(process.env.STORE_BUNDLE);
+    const Database = createRequire(process.env.STORE_BUNDLE)('better-sqlite3');
+    const dir = process.env.WORK_DIR;
+    const fdsOpenOn = (path) => {
+      const { dev, ino } = statSync(path);
+      let open = 0;
+      for (const entry of readdirSync('/dev/fd')) {
+        try {
+          const fd = fstatSync(Number(entry));
+          if (fd.dev === dev && fd.ino === ino) open += 1;
+        } catch {}
+      }
+      return open;
+    };
+    const codeOf = (fn) => { try { fn(); return null; } catch (err) { return err.code; } };
+    const failure = (promise) =>
+      promise.then(() => null, (err) => ({ code: err.code, cause: err.cause?.code }));
+    const report = { runtime: process.versions.bun ? 'bun' : process.release.name };
+
+    const path = join(dir, 'new', 'mirror.db');
+    const writer = await MirrorStore.open(path);
+    writer.applyBatch([{
+      paper_id: '2401.00001', identifier: 'oai:arXiv.org:2401.00001', datestamp: '2024-01-22',
+      title: 'Protein folding', authors: 'A. Author', abstract: 'X', categories: 'cs.LG',
+      versions: [{ version: 'v1', date: '2024-01-22T00:00:00Z' }],
+    }], []);
+    writer.writeHarvestState({
+      status: 'complete', completed_at: '2024-02-01T00:00:00.000Z', total_records: 1,
+    });
+    report.created = { exists: existsSync(path), version: writer.schemaVersion().current };
+    writer.close();
+
+    const holder = new Database(path);
+    holder.prepare('BEGIN IMMEDIATE').run();
+    const opened = await MirrorStore.openReader(path).catch((err) => ({
+      status: 'failed', code: err.code, cause: err.cause?.code,
+    }));
+    if (opened.status === 'open') {
+      const { store } = opened;
+      report.locked = {
+        status: 'open',
+        ids: store.search({
+          matchExpr: '"protein"', limit: 10, offset: 0, sortBy: 'relevance', sortOrder: 'descending',
+        }).papers.map((p) => p.id),
+        completedAt: store.readHarvestState().completed_at,
+        write: codeOf(() => store.writeHarvestState({ status: 'error' })),
+      };
+      store.close();
+    } else {
+      report.locked = opened;
+    }
+    holder.prepare('COMMIT').run();
+    holder.close();
+
+    const broken = join(dir, 'not-a-database.db');
+    writeFileSync(broken, 'x'.repeat(4096));
+    const live = new Database(broken);
+    const control = fdsOpenOn(broken);
+    live.close();
+    const writerFailure = await failure(MirrorStore.open(broken));
+    const afterWriter = fdsOpenOn(broken);
+    const readerFailure = await failure(MirrorStore.openReader(broken));
+    report.failedOpens = {
+      control, writer: writerFailure, afterWriter, reader: readerFailure,
+      afterReader: fdsOpenOn(broken),
+    };
+
+    console.log(JSON.stringify(report));
+  `;
+
+  let bundleDir: string;
+  let workDir: string;
+  let report: NodeReport;
+
+  beforeAll(async () => {
+    await mkdir(CACHE_ROOT, { recursive: true });
+    bundleDir = await mkdtemp(join(CACHE_ROOT, 'arxiv-store-node-'));
+    workDir = await mkdtemp(join(tmpdir(), 'arxiv-mirror-node-test-'));
+    const built = await Bun.build({
+      entrypoints: [STORE_SOURCE],
+      outdir: bundleDir,
+      target: 'node',
+      format: 'esm',
+      packages: 'external',
+    });
+    if (!built.success) throw new AggregateError(built.logs, 'Bundling the store for Node failed');
+
+    const child = spawn(realNode(), ['--input-type=module', '-e', SCRIPT], {
+      env: { ...process.env, STORE_BUNDLE: join(bundleDir, 'store.js'), WORK_DIR: workDir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', resolve);
+    });
+    const line = stdout.trim().split('\n').at(-1);
+    if (code !== 0 || !line) throw new Error(`node exited ${code}: ${stderr}`);
+    report = JSON.parse(line) as NodeReport;
+    if (report.runtime !== 'node') throw new Error(`the store ran on ${report.runtime}, not Node`);
+  }, 30_000);
+
+  afterAll(async () => {
+    await rm(bundleDir, { recursive: true, force: true });
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it('creates a missing file, and its directory, at the current schema', () => {
+    expect(report.created).toEqual({ exists: true, version: MIRROR_SCHEMA_VERSION });
+  });
+
+  it('serves a current file while another connection holds the write lock, refusing every write', () => {
+    expect(report.locked).toEqual({
+      status: 'open',
+      ids: ['2401.00001'],
+      completedAt: '2024-02-01T00:00:00.000Z',
+      write: 'SQLITE_READONLY',
+    });
+  });
+
+  it('releases the file after a failed writer open and a failed reader open', () => {
+    expect(report.failedOpens).toEqual({
+      control: 1,
+      writer: { code: JsonRpcErrorCode.DatabaseError, cause: 'SQLITE_NOTADB' },
+      afterWriter: 0,
+      reader: { code: JsonRpcErrorCode.DatabaseError, cause: 'SQLITE_NOTADB' },
+      afterReader: 0,
+    });
   });
 });
 

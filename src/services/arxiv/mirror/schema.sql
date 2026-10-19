@@ -1,6 +1,9 @@
 -- arxiv-mcp-server OAI-PMH mirror schema v3 (issues #18 + #19 + #37)
--- Review copy of schema.ts, which MirrorStore.open executes (all but the
--- write-path index at the end of the paper_categories section).
+-- Review copy of schema.ts, which the writers' MirrorStore.open executes one
+-- statement at a time (all but the write-path index at the end of the
+-- paper_categories section): the PRAGMAs first, then everything after them in
+-- one write transaction (issue #71). The server's query-only connection runs
+-- none of it.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -9,6 +12,21 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
   applied_at TEXT NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- migration_lease — the writer migrating the file (issue #71). One row while a
+-- migration runs, none otherwise: claimed in the transaction that finds the
+-- file on an older version, checked and renewed by every migration batch, and
+-- dropped with the new version. A lease unrenewed for 5 minutes has lapsed.
+-- Outside the schema version.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS migration_lease (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  holder TEXT NOT NULL,                           -- random per claim
+  pid INTEGER NOT NULL,
+  started_at TEXT NOT NULL,                       -- ISO 8601
+  renewed_at TEXT NOT NULL                        -- ISO 8601
 );
 
 -- ---------------------------------------------------------------------------
@@ -97,10 +115,9 @@ CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx
 -- Write-path index (issue #50): each record write deletes the paper's junction
 -- rows by paper_id, and a tombstone's ON DELETE CASCADE looks them up the same
 -- way. Built by the harvest runner before its first page
--- (MirrorStore.ensureWriteIndex), never by MirrorStore.open: over a
--- full-corpus junction the build takes seconds, and open also runs on the
--- server's request event loop. Reads never filter by paper_id. Not part of the
--- schema version.
+-- (MirrorStore.ensureWriteIndex), never by MirrorStore.open: only the harvest
+-- looks junction rows up by paper_id, and over a full-corpus junction the build
+-- takes seconds. Reads never filter by paper_id. Not part of the schema version.
 CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx
   ON paper_categories(paper_id);
 

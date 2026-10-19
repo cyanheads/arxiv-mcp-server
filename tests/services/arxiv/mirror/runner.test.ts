@@ -1,16 +1,25 @@
 /**
  * @fileoverview Tests for the mirror harvest runner — where a run starts
  * (saved resumption token vs. `from=last_datestamp`), what it persists as it
- * goes, the write-path index it ensures before the first page (#50), and the
- * deadline that stops it after a whole page (#39). Drives the real
- * `MirrorStore` on a temp file; only `fetch` (the OAI endpoint) is stubbed.
+ * goes, the write-path index it ensures before the first page (#50), the
+ * deadline that stops it after a whole page (#39), the stalled token recovery
+ * that fails a run (#59), the outage wait only `init` runs (#61), and the run
+ * on a file another writer is migrating (#71). Drives the real `MirrorStore` on
+ * a temp file; only `fetch` (the OAI endpoint) is stubbed, except in the
+ * real-process blocks, which run the mirror scripts against a loopback OAI
+ * endpoint.
  * @module services/arxiv/mirror/runner.test
  */
 
 import { Database } from 'bun:sqlite';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer, type Server, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { worstCasePageFetchMs } from '@/services/arxiv/mirror/harvester.js';
 import { runHarvest } from '@/services/arxiv/mirror/runner.js';
@@ -25,8 +34,18 @@ const config = {
 
 vi.mock('@/config/server-config.js', () => ({ getServerConfig: () => config }));
 
-const mockFetch = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>();
+/** Rejects any call a test has not stubbed; each `mockReset` restores this. */
+const mockFetch = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(async (url) => {
+  throw new Error(`unmocked fetch: ${url}`);
+});
 vi.stubGlobal('fetch', mockFetch);
+
+/** A request's URL when it goes to the stubbed OAI host; a request to any other host throws. */
+function oaiUrl(url: string): URL {
+  const parsed = new URL(url);
+  if (parsed.hostname !== 'oai.test') throw new Error(`unmocked fetch: ${url}`);
+  return parsed;
+}
 
 // ---------------------------------------------------------------------------
 // OAI response builders
@@ -58,7 +77,7 @@ let requests: URL[];
 function serve(...bodies: (string | { body: string; status: number })[]): void {
   mockFetch.mockImplementation(async (url, init) => {
     init?.signal?.throwIfAborted();
-    requests.push(new URL(url));
+    requests.push(oaiUrl(url));
     const next = bodies.shift();
     if (next === undefined) throw new Error(`unexpected fetch: ${url}`);
     const { body, status } = typeof next === 'string' ? { body: next, status: 200 } : next;
@@ -456,6 +475,423 @@ describe('runHarvest', () => {
       const state = store.readHarvestState();
       expect(state.status).toBe('error');
       expect(state.resumption_token).toBe('tok-1');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Token-recovery guard (#59)
+  // -------------------------------------------------------------------------
+
+  describe('token-recovery guard (#59)', () => {
+    it('fails a refresh whose token recovery makes no progress, leaving an error checkpoint', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-04',
+        completed_at: 'c',
+      });
+      // Every token is rejected; every from= page stays on 2026-06-04. A 400
+      // past eight requests ends a harvest that keeps looping.
+      let issued = 0;
+      mockFetch.mockImplementation(async (url) => {
+        const u = oaiUrl(url);
+        requests.push(u);
+        if (requests.length > 8) return new Response('stop', { status: 400 });
+        if (tokenOf(u)) return new Response(BAD_TOKEN, { status: 200 });
+        issued += 1;
+        return new Response(listRecords([record('2606.00001', '2026-06-04')], `t${issued}`));
+      });
+
+      await expect(runHarvest(makeCtx(), { mode: 'refresh' })).rejects.toMatchObject({
+        data: { reason: 'token_recovery_stalled', resumptionToken: 't2', from: '2026-06-04' },
+      });
+
+      expect(requests.map((u) => tokenOf(u) ?? fromOf(u))).toEqual([
+        '2026-06-04',
+        't1',
+        '2026-06-04',
+        't2',
+      ]);
+      const state = store.readHarvestState();
+      expect(state.status).toBe('error');
+      expect(state.last_datestamp).toBe('2026-06-04');
+      expect(state.error_message).toMatch(/'t2'.*2026-06-04/);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Init outage wait (#61)
+  // -------------------------------------------------------------------------
+
+  describe('init outage wait (#61)', () => {
+    const WAIT_MSG = 'arXiv OAI-PMH unavailable; waiting, then re-sending the same request';
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Page 1 carries `tok-1`; `tok-1` answers 503 `failures` times, then a terminal page. */
+    function outageAfterFirstPage(failures: number, retryAfter?: string): void {
+      let calls = 0;
+      mockFetch.mockImplementation(async (url, init) => {
+        init?.signal?.throwIfAborted();
+        const u = oaiUrl(url);
+        requests.push(u);
+        if (!tokenOf(u)) {
+          return new Response(listRecords([record('2606.00001', '2026-06-01')], 'tok-1'));
+        }
+        calls += 1;
+        if (calls <= failures) {
+          return new Response('down', {
+            status: 503,
+            ...(retryAfter && { headers: { 'retry-after': retryAfter } }),
+          });
+        }
+        return new Response(listRecords([record('2606.00002', '2026-06-02')]));
+      });
+    }
+
+    it('waits out an outage in init, re-sends the same token, drains, and writes complete', async () => {
+      // Opened before the clock is faked, so the run's open resolves at once.
+      const store = await openStore(config.mirrorPath);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      outageAfterFirstPage(3);
+      const ctx = makeCtx();
+
+      const run = runHarvest(ctx, { mode: 'init' });
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      const result = await run;
+
+      expect(requests.map(tokenOf)).toEqual([null, 'tok-1', 'tok-1', 'tok-1', 'tok-1']);
+      expect(result).toMatchObject({ drained: true, pagesFetched: 2, lastDatestamp: '2026-06-02' });
+      expect(store.readHarvestState()).toMatchObject({ status: 'complete', total_records: 2 });
+      expect(ctx.log.warning).toHaveBeenCalledWith(WAIT_MSG, {
+        error: expect.stringMatching(/HTTP 503.*\(failed after 3 attempts\)$/),
+        request: { resumptionToken: 'tok-1' },
+        waitMs: 60_000,
+      });
+    });
+
+    it('still fails a refresh after the page retries, with no wait', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-05-31',
+        completed_at: 'c',
+      });
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      outageAfterFirstPage(3);
+      const ctx = makeCtx();
+
+      const run = runHarvest(ctx, { mode: 'refresh' }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(3_600_000);
+
+      expect(await run).toMatchObject({
+        message: expect.stringMatching(/HTTP 503.*\(failed after 3 attempts\)$/),
+      });
+      expect(requests.map(tokenOf)).toEqual([null, 'tok-1', 'tok-1', 'tok-1']);
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'error',
+        resumption_token: 'tok-1',
+      });
+      expect(ctx.log.warning).not.toHaveBeenCalled();
+    });
+
+    it('writes the transport cause and host into error_message when a refresh fails', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-05-31',
+        completed_at: 'c',
+      });
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      // The token request fails to resolve the host, as Node's fetch reports it.
+      mockFetch.mockImplementation(async (url) => {
+        const u = oaiUrl(url);
+        requests.push(u);
+        if (!tokenOf(u)) {
+          return new Response(listRecords([record('2606.00001', '2026-06-01')], 'tok-1'));
+        }
+        throw new TypeError('fetch failed', {
+          cause: Object.assign(new Error('getaddrinfo ENOTFOUND oai.test'), { code: 'ENOTFOUND' }),
+        });
+      });
+
+      const run = runHarvest(makeCtx(), { mode: 'refresh' }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      await run;
+
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'error',
+        resumption_token: 'tok-1',
+        error_message:
+          'arXiv OAI-PMH network error reaching oai.test: getaddrinfo ENOTFOUND oai.test (failed after 3 attempts)',
+      });
+    });
+
+    it('ends a wait at once on a cancelled signal, leaving the checkpoint the next init resumes from', async () => {
+      // Opened before the clock is faked, so the run's open resolves at once.
+      const store = await openStore(config.mirrorPath);
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      // One 503 asking for 120 s: the run is in a 120 s wait when the signal fires.
+      outageAfterFirstPage(1, '120');
+      const controller = new AbortController();
+      const ctx = makeCtx(controller.signal);
+
+      const run = runHarvest(ctx, { mode: 'init' }).catch((e: unknown) => e);
+      await vi.waitFor(() =>
+        expect(ctx.log.warning).toHaveBeenCalledWith(
+          WAIT_MSG,
+          expect.objectContaining({ waitMs: 120_000 }),
+        ),
+      );
+      const clock = Date.now();
+      controller.abort(new Error('Aborted by SIGINT'));
+
+      // Settles with no further advance of the clock.
+      expect(await run).toMatchObject({ message: 'Aborted by SIGINT' });
+      expect(Date.now()).toBe(clock);
+      expect(requests.map(tokenOf)).toEqual([null, 'tok-1']);
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'error',
+        resumption_token: 'tok-1',
+        last_datestamp: '2026-06-01',
+        error_message: 'Aborted by SIGINT',
+      });
+
+      vi.useRealTimers();
+      requests = [];
+      serve(listRecords([record('2606.00002', '2026-06-02')]));
+      const next = await runHarvest(makeCtx(), { mode: 'init' });
+
+      expect(requests.map(tokenOf)).toEqual(['tok-1']);
+      expect(next.drained).toBe(true);
+      expect(store.readHarvestState().status).toBe('complete');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // mirror:init as a real process (#61)
+  // -------------------------------------------------------------------------
+
+  describe('mirror:init script (real process)', () => {
+    const SCRIPT = fileURLToPath(
+      new URL('../../../../scripts/arxiv-mirror-init.ts', import.meta.url),
+    );
+    let server: Server;
+    let baseUrl: string;
+    let served: URL[];
+    /** How the endpoint answers each request. */
+    let respond: (url: URL, res: ServerResponse) => void;
+    /** Children started in the current test, with a promise for each one's `close`. */
+    let started: { child: ChildProcess; closed: Promise<void> }[];
+
+    beforeEach(async () => {
+      served = [];
+      started = [];
+      server = createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+        served.push(url);
+        respond(url, res);
+      });
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/oai`;
+    });
+
+    afterEach(async () => {
+      for (const { child } of started) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+      await Promise.all(started.map((s) => s.closed));
+      server.closeAllConnections();
+      await new Promise<void>((r) => server.close(() => r()));
+    });
+
+    /** Run the init script; `onStderr` sees each stderr chunk with the child's handle. */
+    function runInit(onStderr?: (text: string, child: ChildProcess) => void) {
+      return new Promise<{ code: number | null; stderr: string; stdout: string }>((resolve) => {
+        const child = spawn(process.execPath, [SCRIPT], {
+          env: {
+            ...process.env,
+            ARXIV_MIRROR_PATH: config.mirrorPath,
+            ARXIV_MIRROR_OAI_BASE_URL: baseUrl,
+            ARXIV_MIRROR_OAI_REQUEST_DELAY_MS: '0',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        started.push({ child, closed: new Promise((r) => child.once('close', () => r())) });
+        let stdout = '';
+        let stderr = '';
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
+        child.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString();
+          onStderr?.(stderr, child);
+        });
+        child.on('close', (code) => resolve({ code, stderr, stdout }));
+      });
+    }
+
+    it('exits 1 at once on SIGTERM during an outage wait, and the next run resumes from the saved token', async () => {
+      const firstPage = listRecords([record('2606.00001', '2026-06-01')], 'tok-1');
+      respond = (url, res) => {
+        if (!url.searchParams.has('resumptionToken')) {
+          res.end(firstPage);
+          return;
+        }
+        res.writeHead(503, { 'retry-after': '120' });
+        res.end('down');
+      };
+      let signalledAt = 0;
+
+      const first = await runInit((stderr, child) => {
+        if (!signalledAt && stderr.includes('arXiv OAI-PMH unavailable; waiting')) {
+          signalledAt = performance.now();
+          child.kill('SIGTERM');
+        }
+      });
+
+      expect(signalledAt).toBeGreaterThan(0);
+      expect(performance.now() - signalledAt).toBeLessThan(5000);
+      expect(first.code).toBe(1);
+      expect(first.stderr).toContain('"waitMs":120000');
+      expect(first.stderr).toContain('Received SIGTERM; aborting harvest');
+      expect(first.stderr).toContain('Harvest failed: Aborted by SIGTERM');
+      expect(served.map((u) => u.searchParams.get('resumptionToken'))).toEqual([null, 'tok-1']);
+      const state = (await openStore(config.mirrorPath)).readHarvestState();
+      expect(state).toMatchObject({
+        status: 'error',
+        resumption_token: 'tok-1',
+        last_datestamp: '2026-06-01',
+      });
+      resetStore();
+
+      const resumeAt = served.length;
+      respond = (_url, res) => res.end(listRecords([record('2606.00002', '2026-06-02')]));
+      const second = await runInit();
+
+      expect(second.code).toBe(0);
+      expect(second.stdout).toContain('Harvest complete');
+      expect(served[resumeAt]?.searchParams.get('resumptionToken')).toBe('tok-1');
+      expect((await openStore(config.mirrorPath)).readHarvestState().status).toBe('complete');
+    }, 30_000);
+  });
+
+  // -------------------------------------------------------------------------
+  // A file another writer is migrating (#71)
+  // -------------------------------------------------------------------------
+
+  describe('a file another writer is migrating (#71)', () => {
+    /** Leave the mirror on schema v2, a completed harvest, and another writer's live migration lease. */
+    async function migratingElsewhere(): Promise<void> {
+      const store = await MirrorStore.open(config.mirrorPath);
+      store.writeHarvestState({
+        status: 'complete',
+        last_datestamp: '2026-06-03',
+        completed_at: '2026-06-04T00:00:00.000Z',
+      });
+      store.close();
+      const now = new Date().toISOString();
+      const db = new Database(config.mirrorPath);
+      db.run('DELETE FROM schema_version');
+      db.run(
+        `INSERT INTO schema_version(version, applied_at) VALUES (2, '2025-06-01T00:00:00.000Z')`,
+      );
+      db.run(
+        `INSERT INTO migration_lease(id, holder, pid, started_at, renewed_at)
+         VALUES (1, 'another-writer', 4242, ?, ?)`,
+        [now, now],
+      );
+      db.close();
+    }
+
+    function fileState() {
+      const db = new Database(config.mirrorPath, { readonly: true });
+      const state = db
+        .query('SELECT status, last_datestamp, resumption_token FROM harvest_state')
+        .get();
+      const version = db.query('SELECT version FROM schema_version').get();
+      const leases = db.query('SELECT holder FROM migration_lease').all();
+      db.close();
+      return { state, version, leases };
+    }
+
+    const UNCHANGED = {
+      state: { status: 'complete', last_datestamp: '2026-06-03', resumption_token: null },
+      version: { version: 2 },
+      leases: [{ holder: 'another-writer' }],
+    };
+
+    it('fails the run before any request, leaving the checkpoint as it was', async () => {
+      await migratingElsewhere();
+      serve();
+
+      await expect(runHarvest(makeCtx(), { mode: 'refresh' })).rejects.toMatchObject({
+        code: JsonRpcErrorCode.Conflict,
+        data: { reason: 'migration_in_progress', holderPid: 4242 },
+      });
+      expect(requests).toEqual([]);
+      expect(fileState()).toEqual(UNCHANGED);
+    });
+
+    describe('mirror scripts (real process)', () => {
+      let server: Server;
+      let served: URL[];
+
+      beforeEach(async () => {
+        served = [];
+        server = createServer((req, res) => {
+          served.push(new URL(req.url ?? '/', 'http://127.0.0.1'));
+          res.statusCode = 500;
+          res.end();
+        });
+        await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      });
+
+      afterEach(async () => {
+        server.closeAllConnections();
+        await new Promise<void>((r) => server.close(() => r()));
+      });
+
+      function runScript(name: string) {
+        const script = fileURLToPath(new URL(`../../../../scripts/${name}`, import.meta.url));
+        return new Promise<{ code: number | null; stderr: string }>((resolve) => {
+          const child = spawn(process.execPath, [script], {
+            env: {
+              ...process.env,
+              ARXIV_MIRROR_PATH: config.mirrorPath,
+              ARXIV_MIRROR_OAI_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/oai`,
+              ARXIV_MIRROR_OAI_REQUEST_DELAY_MS: '0',
+            },
+            stdio: ['ignore', 'ignore', 'pipe'],
+          });
+          let stderr = '';
+          child.stderr?.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString();
+          });
+          child.on('close', (code) => resolve({ code, stderr }));
+        });
+      }
+
+      it.each([
+        ['arxiv-mirror-init.ts', 'Harvest'],
+        ['arxiv-mirror-refresh.ts', 'Refresh'],
+        ['arxiv-mirror-verify.ts', 'Verify'],
+      ])(
+        '%s exits 75 naming the migrating writer, and changes nothing',
+        async (name, label) => {
+          await migratingElsewhere();
+
+          const { code, stderr } = await runScript(name);
+
+          expect(code).toBe(75);
+          expect(stderr).toContain(
+            `${label} did not run: Mirror file ${config.mirrorPath} is being migrated from schema v2 to v3 by another writer (pid 4242,`,
+          );
+          expect(stderr).toContain('Run it again once that migration finishes.');
+          expect(served).toEqual([]);
+          expect(fileState()).toEqual(UNCHANGED);
+        },
+        30_000,
+      );
     });
   });
 });

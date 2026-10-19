@@ -12,18 +12,33 @@
  *   - `papers_fts` gains `comment` and `journal_ref`, backing the `co:` and
  *     `jr:` query prefixes.
  *
- * `MirrorStore.open` runs the in-place migrations an existing DB still needs,
- * in order, before returning the handle.
+ * Writers own the file (issue #55). `MirrorStore.open` is the writers' open
+ * (`runHarvest`, `mirror:verify`): it creates the file, applies the schema, and
+ * runs the in-place migrations an existing DB still needs, in order, before
+ * returning the handle. `MirrorStore.openReader` is the server's: its
+ * connection is query-only, and a file it cannot serve is reported as not
+ * ready rather than created or migrated. Every SQL string runs one statement
+ * at a time (issue #64).
+ *
+ * One writer migrates (issue #71). A writer creates the file and decides
+ * whether to migrate it inside one write transaction, re-reading the version
+ * under the lock; a migration runs under a lease the writer claims in that
+ * transaction and every batch checks and renews. A second writer that opens
+ * meanwhile fails with a `conflict` and changes nothing.
  * @module services/arxiv/mirror/store
  */
 
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { dirname, resolve as resolvePath } from 'node:path';
-import { databaseError } from '@cyanheads/mcp-ts-core/errors';
+import { conflict, databaseError, JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { runtimeCaps } from '@cyanheads/mcp-ts-core/utils';
 import {
-  MIRROR_FTS_SQL,
-  MIRROR_SCHEMA_SQL,
+  MIRROR_FTS_DROP_STATEMENTS,
+  MIRROR_FTS_STATEMENTS,
+  MIRROR_PRAGMA_STATEMENTS,
+  MIRROR_SCHEMA_STATEMENTS,
   MIRROR_SCHEMA_VERSION,
   MIRROR_WRITE_INDEX_SQL,
 } from './schema.js';
@@ -46,62 +61,111 @@ interface Statement<TRow = unknown> {
   run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
 }
 
-interface SqliteHandle {
+/** The driver calls the store makes — the intersection of `bun:sqlite` and `better-sqlite3`. */
+interface Driver {
   close(): void;
-  exec(sql: string): void;
   prepare<TRow = unknown>(sql: string): Statement<TRow>;
+  /**
+   * Run `fn` in a write transaction begun with `BEGIN IMMEDIATE`, committed when
+   * it returns and rolled back when it throws. Every transaction here writes,
+   * so it takes the write lock up front — waiting out another writer's for the
+   * busy timeout — and a read inside it is never overtaken by another commit.
+   */
   transaction<T>(fn: () => T): T;
 }
 
-async function openSqliteHandle(path: string): Promise<SqliteHandle> {
-  if (runtimeCaps.isBun) {
-    const { Database } = await import('bun:sqlite');
-    const db = new Database(path, { create: true });
-    return {
-      close: () => {
-        db.close();
-      },
-      exec: (sql) => {
-        db.exec(sql);
-      },
-      prepare: <TRow>(sql: string) => {
-        const stmt = db.prepare(sql);
-        return {
-          all: (...params: unknown[]) => stmt.all(...(params as never[])) as TRow[],
-          get: (...params: unknown[]) => stmt.get(...(params as never[])) as TRow | undefined,
-          run: (...params: unknown[]) => {
-            const r = stmt.run(...(params as never[]));
-            return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
-          },
-        };
-      },
-      transaction: <T>(fn: () => T): T => {
-        const tx = db.transaction(fn);
-        return tx() as T;
-      },
-    };
-  }
+interface SqliteHandle extends Driver {
+  /**
+   * Run each statement on its own, in order, through `prepare().run()`; the
+   * first failure throws and the statements after it never run, on both
+   * drivers (issue #64). Never a driver `exec`: `bun:sqlite`'s reports only
+   * the last statement of a string and runs on past an earlier failure.
+   */
+  exec(statements: readonly string[]): void;
+}
+
+/**
+ * How long a writer connection waits out another writer's lock before failing
+ * with `SQLITE_BUSY`: better-sqlite3's default, set on both drivers. The
+ * server's query-only connection waits for nothing.
+ */
+const WRITER_BUSY_TIMEOUT_MS = 5_000;
+
+/**
+ * How long a migration lease holds without a renewal (issue #71). Its holder
+ * renews it as each migration transaction commits, so a running migration's
+ * lease ages by at most one transaction: the longest is the drop of the old
+ * index, tens of seconds on a full corpus, and the TTL stays well clear of it
+ * so a lease is never read as lapsed while its holder works. One left older
+ * than this belongs to a writer that died or stalled, and the next writer takes
+ * the migration over. A stalled holder that resumes finds the lease gone at its
+ * next transaction and stops, so the value bounds how long a dead writer blocks
+ * the file, never whether two writers can rebuild the index together.
+ */
+const MIGRATION_LEASE_TTL_MS = 5 * 60_000;
+
+/**
+ * Open a connection to `path`. A `writer` creates the file when it is missing;
+ * a `reader` requires it to exist and creates nothing.
+ */
+async function openSqliteHandle(path: string, mode: 'reader' | 'writer'): Promise<SqliteHandle> {
+  const driver = runtimeCaps.isBun
+    ? await openBunDriver(path, mode)
+    : await openBetterSqlite3Driver(path, mode);
+  return {
+    ...driver,
+    exec: (statements) => {
+      for (const sql of statements) driver.prepare(sql).run();
+    },
+  };
+}
+
+async function openBunDriver(path: string, mode: 'reader' | 'writer'): Promise<Driver> {
+  const { Database } = await import('bun:sqlite');
+  const db = new Database(path, { readwrite: true, create: mode === 'writer' });
+  return {
+    // `close(true)` finalizes the statements still alive with the connection,
+    // so the file is released now; `close()` would hold it until each
+    // statement is garbage-collected.
+    close: () => {
+      db.close(true);
+    },
+    prepare: <TRow>(sql: string) => {
+      const stmt = db.prepare(sql);
+      return {
+        all: (...params: unknown[]) => stmt.all(...(params as never[])) as TRow[],
+        // bun:sqlite answers no row with `null`; better-sqlite3 with `undefined`.
+        get: (...params: unknown[]) =>
+          (stmt.get(...(params as never[])) ?? undefined) as TRow | undefined,
+        run: (...params: unknown[]) => {
+          const r = stmt.run(...(params as never[]));
+          return { changes: r.changes, lastInsertRowid: r.lastInsertRowid };
+        },
+      };
+    },
+    transaction: <T>(fn: () => T): T => db.transaction(fn).immediate(),
+  };
+}
+
+async function openBetterSqlite3Driver(path: string, mode: 'reader' | 'writer'): Promise<Driver> {
   const mod = (await import('better-sqlite3')) as unknown as {
     default: new (
       path: string,
+      options: { fileMustExist: boolean },
     ) => {
       close: () => unknown;
-      exec: (sql: string) => unknown;
       prepare: (sql: string) => {
         all: (...p: unknown[]) => unknown[];
         get: (...p: unknown[]) => unknown;
         run: (...p: unknown[]) => { changes: number; lastInsertRowid: number | bigint };
       };
-      transaction: <T>(fn: () => T) => () => T;
+      transaction: <T>(fn: () => T) => { immediate: () => T };
     };
   };
-  const db = new mod.default(path);
+  const db = new mod.default(path, { fileMustExist: mode === 'reader' });
   return {
     close: () => {
       db.close();
-    },
-    exec: (sql) => {
-      db.exec(sql);
     },
     prepare: <TRow>(sql: string) => {
       const stmt = db.prepare(sql);
@@ -111,45 +175,99 @@ async function openSqliteHandle(path: string): Promise<SqliteHandle> {
         run: (...params: unknown[]) => stmt.run(...params),
       };
     },
-    transaction: <T>(fn: () => T): T => db.transaction(fn)(),
+    transaction: <T>(fn: () => T): T => db.transaction(fn).immediate(),
   };
 }
 
 /**
+ * What {@link MirrorStore.openReader} found at a path: an open store, or why the
+ * file cannot be served yet. No status but `open` leaves a connection behind.
+ *
+ * - `missing_file` — nothing at the path.
+ * - `missing_schema` — no recorded schema version: not a mirror, or one a
+ *   writer has not finished creating.
+ * - `migrating` — on an older version, with a writer migrating it now.
+ * - `older_schema` — written by an older build, with no writer migrating it; a
+ *   writer that opens it migrates it.
+ */
+export type MirrorReaderOpen =
+  | { status: 'open'; store: MirrorStore }
+  | { status: 'missing_file' }
+  | { status: 'missing_schema' }
+  | { status: 'migrating'; version: number }
+  | { status: 'older_schema'; version: number };
+
+/**
  * Mirror data store. Wraps a SQLite handle with arXiv-specific reads and writes.
- * Open once per process via {@link openStore}; share the handle across readers.
+ * Writers open it through {@link openStore}; the server reads through
+ * {@link openReaderStore}, whose connection refuses every write.
  */
 export class MirrorStore {
   private constructor(private readonly db: SqliteHandle) {}
 
-  /** Open or create the store at `path`. Applies schema + runs v1→v2 migration when needed. */
+  /**
+   * The writers' open (`runHarvest`, `mirror:verify`): open or create the store
+   * at `path`, apply the schema, and run each migration the file still needs
+   * (v1→v2, v2→v3) before returning. A failed open closes its connection.
+   *
+   * One writer migrates a file (issue #71). The schema is applied in one write
+   * transaction that also re-reads the version under the lock: a file this
+   * writer creates records the current version in that same commit, and a file
+   * on an older version is claimed for this writer there, under a migration
+   * lease. While another writer holds a live lease the open changes nothing and
+   * throws a `conflict` with `reason: 'migration_in_progress'`; a writer whose
+   * lease was taken over mid-migration throws one with
+   * `reason: 'migration_lease_lost'` (see {@link isMigrationConflict}).
+   */
   static async open(path: string): Promise<MirrorStore> {
     await mkdir(dirname(resolvePath(path)), { recursive: true });
+    let db: SqliteHandle | undefined;
     try {
-      const db = await openSqliteHandle(path);
-      // Always run the idempotent DDL first so new tables/indexes exist before
-      // reading schema_version on any path (fresh DB or upgrade).
-      db.exec(MIRROR_SCHEMA_SQL);
-      const stored = db
-        .prepare<{ version: number }>(
-          `SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`,
-        )
-        .get();
-      const storedVersion = stored?.version ?? 0;
-      // Each step's version is written only after it returns, so an interrupted
-      // upgrade resumes at the step it died in on the next open.
-      if (storedVersion < 2) {
-        migrateToV2(db);
-        writeSchemaVersion(db, 2);
-      }
-      if (storedVersion < 3) {
-        migrateToV3(db);
-        writeSchemaVersion(db, 3);
-      }
+      db = await openSqliteHandle(path, 'writer');
+      db.exec([`PRAGMA busy_timeout = ${WRITER_BUSY_TIMEOUT_MS}`, ...MIRROR_PRAGMA_STATEMENTS]);
+      const claimed = applySchema(db, path);
+      if (claimed) migrate(db, path, claimed);
       return new MirrorStore(db);
     } catch (err) {
+      db?.close();
+      if (isMigrationConflict(err)) throw err;
       throw databaseError(`Failed to open mirror store at ${path}`, { path }, { cause: err });
     }
+  }
+
+  /**
+   * The server's open: a query-only connection to the store at `path` that
+   * never writes — no schema, seed, or migration, `query_only` refusing every
+   * write, and no busy timeout, since a WAL reader never waits on the writer.
+   * A file at the current schema version (or a later one) opens; any other
+   * comes back as its {@link MirrorReaderOpen} status, with its connection
+   * closed and nothing created. A failed open closes its connection too. Each
+   * call opens a connection of its own, on whichever thread calls it. Only an
+   * older file costs a read of the migration lease, to tell `migrating` from
+   * `older_schema` (issue #71).
+   */
+  static async openReader(path: string): Promise<MirrorReaderOpen> {
+    if (!existsSync(path)) return { status: 'missing_file' };
+    let db: SqliteHandle | undefined;
+    let version: number | undefined;
+    let lease: MigrationLease | undefined;
+    try {
+      db = await openSqliteHandle(path, 'reader');
+      db.exec(['PRAGMA busy_timeout = 0', 'PRAGMA query_only = ON']);
+      version = readSchemaVersion(db);
+      if (version !== undefined && version >= MIRROR_SCHEMA_VERSION) {
+        return { status: 'open', store: new MirrorStore(db) };
+      }
+      if (version !== undefined) lease = readLease(db);
+    } catch (err) {
+      db?.close();
+      throw databaseError(`Failed to open mirror store at ${path}`, { path }, { cause: err });
+    }
+    db.close();
+    if (version === undefined) return { status: 'missing_schema' };
+    return lease && leaseIsLive(lease)
+      ? { status: 'migrating', version }
+      : { status: 'older_schema', version };
   }
 
   close(): void {
@@ -225,10 +343,12 @@ export class MirrorStore {
    * Ensure the write-path index on `paper_categories(paper_id)` exists (issue
    * #50). A no-op when it already does; the first call on a full-corpus mirror
    * builds it in one pass over the junction. Called by the harvest runner, never
-   * by {@link MirrorStore.open} — see `MIRROR_WRITE_INDEX_SQL`.
+   * by {@link MirrorStore.open} — see `MIRROR_WRITE_INDEX_SQL`. Another writer's
+   * lock is waited out up to the writer busy timeout, then fails with
+   * `SQLITE_BUSY` (issue #64).
    */
   ensureWriteIndex(): void {
-    this.db.exec(MIRROR_WRITE_INDEX_SQL);
+    this.db.exec([MIRROR_WRITE_INDEX_SQL]);
   }
 
   /**
@@ -583,15 +703,11 @@ export class MirrorStore {
   /**
    * Schema version this database carries, and the version the running code
    * expects. They diverge only mid-upgrade — {@link MirrorStore.open} migrates
-   * before returning — so a mismatch reported here means a migration failed.
+   * before returning, and {@link MirrorStore.openReader} opens nothing older —
+   * so a mismatch reported here means a migration failed.
    */
   schemaVersion(): { current: number; expected: number } {
-    const row = this.db
-      .prepare<{ version: number }>(
-        `SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`,
-      )
-      .get();
-    return { current: row?.version ?? 0, expected: MIRROR_SCHEMA_VERSION };
+    return { current: readSchemaVersion(this.db) ?? 0, expected: MIRROR_SCHEMA_VERSION };
   }
 
   integrityCheck(): { ok: boolean; results: string[] } {
@@ -662,6 +778,27 @@ export function rawToRow(r: ArxivRawRecord): PaperRow {
 // Schema migration
 // ---------------------------------------------------------------------------
 
+function hasTable(db: SqliteHandle, name: string): boolean {
+  return (
+    db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !==
+    undefined
+  );
+}
+
+/**
+ * The schema version the file records, or `undefined` when it records none: no
+ * `schema_version` table, or no row in it yet (a writer records the version in
+ * the transaction that creates the schema, or once every migration is in place).
+ */
+function readSchemaVersion(db: SqliteHandle): number | undefined {
+  if (!hasTable(db, 'schema_version')) return;
+  return db
+    .prepare<{ version: number }>(
+      `SELECT version FROM schema_version ORDER BY version DESC LIMIT 1`,
+    )
+    .get()?.version;
+}
+
 /** Record the schema version reached. Called only after a migration completes. */
 function writeSchemaVersion(db: SqliteHandle, version: number): void {
   db.prepare(`DELETE FROM schema_version`).run();
@@ -669,6 +806,183 @@ function writeSchemaVersion(db: SqliteHandle, version: number): void {
     version,
     new Date().toISOString(),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Migration lease (issue #71)
+// ---------------------------------------------------------------------------
+
+/** The `migration_lease` row: which writer is migrating the file, and since when. */
+interface MigrationLease {
+  /** Random per claim, so a writer recognizes its own lease. */
+  holder: string;
+  pid: number;
+  /** ISO 8601. */
+  renewed_at: string;
+  /** ISO 8601. */
+  started_at: string;
+}
+
+/** A migration this writer claimed: the version it starts from and the lease it holds. */
+interface ClaimedMigration {
+  from: number;
+  lease: MigrationLease;
+}
+
+/** Runs a function in one write transaction. */
+type InTransaction = <T>(fn: () => T) => T;
+
+/**
+ * Whether `err` is the `conflict` a writer open throws when another writer owns
+ * the file's migration: it holds a live lease (`migration_in_progress`, nothing
+ * changed), or it took the lease over from this writer mid-migration
+ * (`migration_lease_lost`). Either way that writer finishes the migration, and
+ * running again once it has is the remedy.
+ */
+export function isMigrationConflict(err: unknown): err is McpError {
+  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.Conflict) return false;
+  const reason = (err.data as { reason?: unknown } | undefined)?.reason;
+  return reason === 'migration_in_progress' || reason === 'migration_lease_lost';
+}
+
+/** The lease the file records, or `undefined` for none (or a file without the table). */
+function readLease(db: SqliteHandle): MigrationLease | undefined {
+  if (!hasTable(db, 'migration_lease')) return;
+  return db
+    .prepare<MigrationLease>(
+      `SELECT holder, pid, started_at, renewed_at FROM migration_lease WHERE id = 1`,
+    )
+    .get();
+}
+
+function leaseLapsesAt(lease: MigrationLease): number {
+  return Date.parse(lease.renewed_at) + MIGRATION_LEASE_TTL_MS;
+}
+
+/** A lease renewed within the TTL. One whose timestamp does not parse has lapsed. */
+function leaseIsLive(lease: MigrationLease): boolean {
+  return Date.now() < leaseLapsesAt(lease);
+}
+
+function migrationInProgress(path: string, held: MigrationLease, from: number): McpError {
+  const lapsesAt = new Date(leaseLapsesAt(held)).toISOString();
+  return conflict(
+    `Mirror file ${path} is being migrated from schema v${from} to v${MIRROR_SCHEMA_VERSION} by another writer (pid ${held.pid}, started ${held.started_at}); this run changed nothing. Run it again once that migration finishes. If pid ${held.pid} is no longer running, its claim lapses at ${lapsesAt}.`,
+    {
+      reason: 'migration_in_progress',
+      path,
+      schemaVersion: from,
+      holderPid: held.pid,
+      startedAt: held.started_at,
+      renewedAt: held.renewed_at,
+      lapsesAt,
+    },
+  );
+}
+
+function leaseLost(path: string, held: MigrationLease | undefined): McpError {
+  return conflict(
+    `Another writer took over the schema migration of mirror file ${path}${held ? ` (pid ${held.pid})` : ''} after this one went ${MIGRATION_LEASE_TTL_MS / 60_000} min without committing; this writer stopped before its next batch. Run it again once that migration finishes.`,
+    { reason: 'migration_lease_lost', path, ...(held && { holderPid: held.pid }) },
+  );
+}
+
+/**
+ * Apply the schema in one write transaction and decide, under that lock, what
+ * this open still owes the file. A file without a `papers` table is new and
+ * records the current version in the same commit, so no reader or writer ever
+ * sees it at an older one. A file on an older version is claimed for this
+ * writer, unless another writer holds a live lease on it.
+ *
+ * Another writer's transaction can outlast the busy wait — a migration batch,
+ * or the drop of a full-corpus index. The open then reads the lease without the
+ * lock (WAL serves the last commit) and reports a live one as the migration it
+ * is; any other `SQLITE_BUSY` is rethrown.
+ *
+ * @returns The migration this writer now owns, or `undefined` for a current file.
+ */
+function applySchema(db: SqliteHandle, path: string): ClaimedMigration | undefined {
+  try {
+    return db.transaction(() => {
+      const created = !hasTable(db, 'papers');
+      db.exec(MIRROR_SCHEMA_STATEMENTS);
+      if (created) writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
+      const from = readSchemaVersion(db) ?? 0;
+      if (from >= MIRROR_SCHEMA_VERSION) return;
+      const held = readLease(db);
+      if (held && leaseIsLive(held)) throw migrationInProgress(path, held, from);
+      const now = new Date().toISOString();
+      const lease: MigrationLease = {
+        holder: randomUUID(),
+        pid: process.pid,
+        started_at: now,
+        renewed_at: now,
+      };
+      db.prepare(
+        `INSERT OR REPLACE INTO migration_lease(id, holder, pid, started_at, renewed_at)
+         VALUES (1, ?, ?, ?, ?)`,
+      ).run(lease.holder, lease.pid, lease.started_at, lease.renewed_at);
+      return { from, lease };
+    });
+  } catch (err) {
+    if (String((err as { code?: unknown }).code).startsWith('SQLITE_BUSY')) {
+      const held = readLease(db);
+      if (held && leaseIsLive(held)) {
+        throw migrationInProgress(path, held, readSchemaVersion(db) ?? 0);
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Run the migrations a claimed file needs, each batch in a transaction that
+ * first checks the lease still names this writer and renews it as it commits.
+ * The transaction that records the final version drops the lease. A writer
+ * whose lease was taken over stops before writing again; one that fails for
+ * any other reason drops its lease so the next writer need not wait it out.
+ */
+function migrate(db: SqliteHandle, path: string, { from, lease }: ClaimedMigration): void {
+  const assertHeld = () => {
+    const held = readLease(db);
+    if (held?.holder !== lease.holder) throw leaseLost(path, held);
+  };
+  const fenced: InTransaction = (fn) =>
+    db.transaction(() => {
+      assertHeld();
+      const result = fn();
+      db.prepare(`UPDATE migration_lease SET renewed_at = ? WHERE id = 1 AND holder = ?`).run(
+        new Date().toISOString(),
+        lease.holder,
+      );
+      return result;
+    });
+  const release = () =>
+    db.prepare(`DELETE FROM migration_lease WHERE id = 1 AND holder = ?`).run(lease.holder);
+
+  try {
+    // Each step's version is written only after it returns, so an interrupted
+    // upgrade resumes at the step it died in on the next open.
+    if (from < 2) {
+      migrateToV2(db, fenced);
+      fenced(() => writeSchemaVersion(db, 2));
+    }
+    if (from < 3) migrateToV3(db, fenced);
+    db.transaction(() => {
+      assertHeld();
+      writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
+      release();
+    });
+  } catch (err) {
+    if (!isMigrationConflict(err)) {
+      try {
+        db.transaction(release);
+      } catch {
+        // The lease lapses after its TTL instead; the migration's own failure is what surfaces.
+      }
+    }
+    throw err;
+  }
 }
 
 /**
@@ -680,7 +994,8 @@ function writeSchemaVersion(db: SqliteHandle, version: number): void {
  *   2. Populate `paper_categories` (category, paper_id, updated) for every row.
  *
  * Memory safety: streams rows via rowid windows (default 5 000 per batch) and
- * commits each batch independently — never loads millions of rows at once, and
+ * commits each batch independently, through `inTransaction` (the lease-fenced
+ * transaction of {@link migrate}) — never loads millions of rows at once, and
  * the WAL stays bounded. If the process is killed partway through, the stored
  * schema_version row is still 1 (the caller writes 2 only after this returns),
  * so re-opening resumes from the start without double-applying or corrupting.
@@ -688,7 +1003,7 @@ function writeSchemaVersion(db: SqliteHandle, version: number): void {
  * Progress: logs every batch to stdout so an operator can see the migration
  * advancing in container logs.
  */
-function migrateToV2(db: SqliteHandle, batchSize = 5_000): void {
+function migrateToV2(db: SqliteHandle, inTransaction: InTransaction, batchSize = 5_000): void {
   // --- Step 1: Date backfill ---
   // Check if there is actually anything to migrate (skip on empty DB).
   const countRow = db.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM papers`).get();
@@ -707,7 +1022,7 @@ function migrateToV2(db: SqliteHandle, batchSize = 5_000): void {
     while (true) {
       const rows = select.all(lastRowid, batchSize);
       if (rows.length === 0) break;
-      db.transaction(() => {
+      inTransaction(() => {
         for (const row of rows) {
           const pub = normalizeDateToIso(row.published);
           const upd = normalizeDateToIso(row.updated);
@@ -738,7 +1053,7 @@ function migrateToV2(db: SqliteHandle, batchSize = 5_000): void {
     while (true) {
       const rows = select.all(lastRowid, batchSize);
       if (rows.length === 0) break;
-      db.transaction(() => {
+      inTransaction(() => {
         for (const row of rows) {
           for (const cat of row.categories.split(' ').filter(Boolean)) {
             catInsert.run(cat, row.id, row.updated);
@@ -759,28 +1074,29 @@ function migrateToV2(db: SqliteHandle, batchSize = 5_000): void {
  * prefixes resolve on the mirror path (issue #37).
  *
  * FTS5 has no `ALTER TABLE ADD COLUMN`, so the index and its three sync
- * triggers are dropped and recreated from {@link MIRROR_FTS_SQL} — the same
- * definition a fresh database gets, so the two paths cannot drift. Dropping the
- * triggers first matters: they enumerate their columns, and a v2 trigger firing
- * against a v3 index would leave the index diverging from `papers` on every
- * subsequent write.
+ * triggers are dropped ({@link MIRROR_FTS_DROP_STATEMENTS}) and recreated from
+ * {@link MIRROR_FTS_STATEMENTS} — the same definition a fresh database gets, so
+ * the two paths cannot drift. Dropping the triggers first matters: they
+ * enumerate their columns, and a v2 trigger firing against a v3 index would
+ * leave the index diverging from `papers` on every subsequent write.
  *
  * Refill is batched by rowid window rather than FTS5's one-shot `'rebuild'`
  * command, for the same reasons as the v2 backfill: the WAL stays bounded on a
  * multi-million-row mirror, and an operator sees progress in container logs.
+ * The drop and the recreate commit together, and every batch commits on its
+ * own, each through `inTransaction` (the lease-fenced transaction of
+ * {@link migrate}), so no other writer's rebuild can interleave with this one
+ * (issue #71).
  *
  * Idempotent by construction — a re-run after a partial failure drops the
  * half-filled index and starts from an empty one. The caller writes
  * schema_version 3 only after this returns, so an interrupted run repeats.
  */
-function migrateToV3(db: SqliteHandle, batchSize = 5_000): void {
-  db.exec(`
-    DROP TRIGGER IF EXISTS papers_ai;
-    DROP TRIGGER IF EXISTS papers_ad;
-    DROP TRIGGER IF EXISTS papers_au;
-    DROP TABLE IF EXISTS papers_fts;
-  `);
-  db.exec(MIRROR_FTS_SQL);
+function migrateToV3(db: SqliteHandle, inTransaction: InTransaction, batchSize = 5_000): void {
+  inTransaction(() => {
+    db.exec(MIRROR_FTS_DROP_STATEMENTS);
+    db.exec(MIRROR_FTS_STATEMENTS);
+  });
 
   const countRow = db.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM papers`).get();
   const total = countRow?.n ?? 0;
@@ -804,7 +1120,7 @@ function migrateToV3(db: SqliteHandle, batchSize = 5_000): void {
     if (rows.length === 0) break;
     const upperRowid = rows[rows.length - 1]?.rowid ?? lastRowid;
     const lowerRowid = lastRowid;
-    db.transaction(() => {
+    inTransaction(() => {
       fill.run(lowerRowid, upperRowid);
     });
     processed += rows.length;
@@ -815,26 +1131,37 @@ function migrateToV3(db: SqliteHandle, batchSize = 5_000): void {
 }
 
 // ---------------------------------------------------------------------------
-// Singleton accessor
+// Per-process shared stores
 // ---------------------------------------------------------------------------
 
 let _store: MirrorStore | undefined;
+let _reader: MirrorStore | undefined;
 
-/** Open the shared mirror store for the current process. */
+/** Open the process's shared writer store, creating or migrating the file. Writers only. */
 export async function openStore(path: string): Promise<MirrorStore> {
   _store ??= await MirrorStore.open(path);
   return _store;
 }
 
-/** Return the open store or undefined when not yet opened. */
-export function getStore(): MirrorStore | undefined {
-  return _store;
+/**
+ * The server's shared query-only store, opened through
+ * {@link MirrorStore.openReader} and kept once it opens. A file that is not
+ * ready is reported and opened afresh on the next call, never kept.
+ */
+export async function openReaderStore(path: string): Promise<MirrorReaderOpen> {
+  if (_reader) return { status: 'open', store: _reader };
+  const opened = await MirrorStore.openReader(path);
+  if (opened.status !== 'open') return opened;
+  // A concurrent call can have opened one first; keep that one.
+  _reader ??= opened.store;
+  if (_reader !== opened.store) opened.store.close();
+  return { status: 'open', store: _reader };
 }
 
-/** Close and clear the shared store — test-only. */
+/** Close and clear both shared stores — test-only. */
 export function resetStore(): void {
-  if (_store) {
-    _store.close();
-    _store = undefined;
-  }
+  _store?.close();
+  _store = undefined;
+  _reader?.close();
+  _reader = undefined;
 }
