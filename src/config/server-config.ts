@@ -6,11 +6,23 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
+/**
+ * A request timeout in whole ms from 1 to 2^31 - 1, the range of the timer it
+ * runs on: any other value would fail every request rather than bound it.
+ * See issues #69, #74.
+ */
+const TimerMs = z.coerce.number().int().min(1).max(2_147_483_647);
+
 const ServerConfigSchema = z.object({
   apiBaseUrl: z.string().default('https://export.arxiv.org/api'),
   requestDelayMs: z.coerce.number().default(3000),
-  contentTimeoutMs: z.coerce.number().default(30000),
-  apiTimeoutMs: z.coerce.number().default(15000),
+  contentTimeoutMs: TimerMs.default(30000),
+  apiTimeoutMs: TimerMs.default(15000),
+  // Wall-clock budget for one arxiv_read_paper call (ms): its metadata lookup
+  // and every content request, retry, and wait between them. The default sits
+  // under the 60 s request timeout of MCP SDK clients, leaving room for the
+  // work no signal stops (PDF text extraction, HTML cleaning). See issue #69.
+  readTimeoutMs: TimerMs.default(50_000),
 
   // OAI-PMH mirror (issue #12). All optional; mirror is disabled by default.
   mirrorEnabled: z.stringbool().default(false),
@@ -39,6 +51,7 @@ export function getServerConfig(): ServerConfig {
     requestDelayMs: 'ARXIV_REQUEST_DELAY_MS',
     contentTimeoutMs: 'ARXIV_CONTENT_TIMEOUT_MS',
     apiTimeoutMs: 'ARXIV_API_TIMEOUT_MS',
+    readTimeoutMs: 'ARXIV_READ_TIMEOUT_MS',
     mirrorEnabled: 'ARXIV_MIRROR_ENABLED',
     mirrorPath: 'ARXIV_MIRROR_PATH',
     mirrorRefreshCron: 'ARXIV_MIRROR_REFRESH_CRON',

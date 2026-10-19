@@ -50,6 +50,13 @@
           "default": "15000"
         },
         {
+          "name": "ARXIV_READ_TIMEOUT_MS",
+          "description": "Time budget for one arxiv_read_paper call — its metadata lookup and every content request and retry (ms).",
+          "format": "string",
+          "isRequired": false,
+          "default": "50000"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -101,6 +108,13 @@
           "format": "string",
           "isRequired": false,
           "default": "15000"
+        },
+        {
+          "name": "ARXIV_READ_TIMEOUT_MS",
+          "description": "Time budget for one arxiv_read_paper call — its metadata lookup and every content request and retry (ms).",
+          "format": "string",
+          "isRequired": false,
+          "default": "50000"
         },
         {
           "name": "MCP_HTTP_HOST",
