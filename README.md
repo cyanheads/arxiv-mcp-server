@@ -62,17 +62,18 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 
 - Takes up to 100 IDs and looks up the first 10; the rest come back in `remaining_ids` for the next call's `paper_ids`
 - Accepts versioned (`2401.12345v2`), unversioned, and pre-2007 (`hep-th/9901001`) IDs, with an optional `arXiv:` prefix or an arxiv.org `abs` / `pdf` / `html` URL
-- Returns found papers plus a typed `not_found[]` (`not_in_arxiv` / `version_not_in_mirror` / `invalid_id`) for the rest
-- Fails `invalid_id` when no ID is well-formed, `no_match` when every ID misses, and `version_unavailable` when a version is reachable only on the live API
+- Returns found papers plus a typed `not_found[]` (`not_in_arxiv` / `version_not_in_mirror` / `version_not_served` / `live_lookup_failed` / `invalid_id`) for the rest; `version_not_served` is a superseded pre-2007 version arXiv's API answers HTTP 500 for, and its `detail` names the latest version. With the local mirror, `live_lookup_failed` marks an ID the mirror lacked whose live lookup failed; the papers the mirror served still come back
+- Fails `invalid_id` when no ID is well-formed, `no_match` when every ID misses, `version_unavailable` when a version is reachable only on the live API, and `version_not_served` when every ID is a version arXiv will not serve
 
 ---
 
 ### `arxiv_read_paper` <sub>tool</sub>
 
 - Tries arXiv HTML, then ar5iv, then PDF text extraction; the `source` field reports which answered. PDF text is plain, so math, tables, and headings flatten
+- ar5iv keeps one render per paper, so an ar5iv body may be another revision than `paper_id` and carries `revision_unconfirmed: true`, unless the read named no version and the paper's only version is v1; `pdf_url` is exactly the `paper_id` revision
 - `max_characters` defaults to 100,000 (pass `null` for the whole paper); page with `start`. The first page carries an `outline` of section headings with offsets
 - `paper_id` accepts the same ID spellings as `arxiv_get_metadata`
-- Fails `invalid_id`, `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (no text layer), or `version_unavailable` (version-pinned ID needs the live API)
+- Fails `invalid_id`, `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (no text layer), `version_unavailable` (version-pinned ID needs the live API), or `version_not_served` (a superseded pre-2007 version arXiv will not serve; names the latest version and this version's PDF)
 
 ---
 
@@ -87,7 +88,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 ### `arxiv://paper/{paperId}` <sub>resource</sub>
 
 - `paperId` accepts the same ID spellings as `arxiv_get_metadata`; percent-encode a legacy ID's slash (`arxiv://paper/hep-th%2F9901001`)
-- Fails `empty_id`, `invalid_id`, `no_match`, or `version_unavailable`
+- Fails `empty_id`, `invalid_id`, `no_match`, `version_unavailable`, or `version_not_served`
 
 ---
 
@@ -216,6 +217,7 @@ All configuration is optional — the server works out of the box with sensible 
 | `ARXIV_REQUEST_DELAY_MS` | Minimum delay between arXiv API requests (ms). | `3000` |
 | `ARXIV_CONTENT_TIMEOUT_MS` | Timeout for paper body fetches — HTML renders and PDF downloads (ms). | `30000` |
 | `ARXIV_API_TIMEOUT_MS` | Timeout for API search/metadata requests (ms). | `15000` |
+| `ARXIV_READ_TIMEOUT_MS` | Time budget for one `arxiv_read_paper` call — its metadata lookup and every content request and retry (ms). Keep it under your MCP client's request timeout (60 s by default). | `50000` |
 | `ARXIV_MIRROR_ENABLED` | Enable the local OAI-PMH metadata mirror. | `false` |
 | `ARXIV_MIRROR_PATH` | SQLite path for the mirror. | `./data/arxiv-mirror.db` |
 | `ARXIV_MIRROR_REFRESH_CRON` | UTC cron expression for in-process daily refresh (HTTP mode only). | unset |
@@ -263,7 +265,8 @@ For self-hosted deployments behind a single egress IP, arXiv's ~3-second crawl d
 Disabled by default. To enable:
 
 ```sh
-# 1. Cold-start harvest (~4.4h sequential, resumable from checkpoint). One-time per installation.
+# 1. Cold-start harvest (~4.4h sequential). One-time per installation.
+#    Waits out arXiv outages; Ctrl+C stops it, and a rerun resumes from its checkpoint.
 bun run mirror:init
 
 # 2. Enable the mirror.
@@ -273,7 +276,7 @@ export ARXIV_MIRROR_ENABLED=true
 bun run start:http
 ```
 
-Keep it current with `bun run mirror:refresh` (cron/systemd/launchd, or `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode) and check it with `bun run mirror:verify`. An interrupted refresh resumes from its saved position on the next run. A newer server migrates the mirror's schema in place, with no re-harvest.
+Keep it current with `bun run mirror:refresh` (cron/systemd/launchd, or `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode) and check it with `bun run mirror:verify`. An interrupted refresh resumes from its saved position on the next run. When a release changes the mirror's schema, the server answers from the live API until a writer migrates the file in place, with no re-harvest: with `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode the server starts that refresh itself; otherwise run `bun run mirror:refresh` or `bun run mirror:verify`. One writer migrates the file at a time: a mirror command started meanwhile changes nothing and exits 75, naming the process that holds the migration, so run it again once that finishes.
 
 Mirror search ranks with FTS5 BM25, so `sort_by=relevance` returns a different top set than the live API. Searches that go to the live API instead: `sort_by=submitted` descending (while `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive), searches whose free-text terms match 50,000 or more papers, and version-pinned requests (the mirror holds only the latest version).
 
