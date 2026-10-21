@@ -1,8 +1,9 @@
 /**
  * @fileoverview Incremental OAI-PMH refresh — fetches papers added/modified
  * since the last successful harvest (uses persisted `last_datestamp` as the
- * OAI `from=` parameter, or the saved resumption token when the previous run
- * stopped before draining). Runs until the list drains — no time budget.
+ * OAI `from=` parameter, or the saved resumption token when a previous run
+ * stopped inside the datestamp it started on, at its deadline or after itself
+ * resuming a saved token there). Runs until the list drains — no time budget.
  * Intended for nightly cron / systemd timer runs.
  *
  * Usage:

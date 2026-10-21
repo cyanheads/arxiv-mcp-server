@@ -649,7 +649,7 @@ describe('refresh child process (real)', () => {
     expect(harvestState()).toMatchObject({ status: 'complete', resumption_token: null });
   }, 20_000);
 
-  it('exits 0 and reports partial when it stops at its deadline', async () => {
+  it('exits 0 and reports partial when it stops at its deadline, saving no token once the checkpoint moved (#62)', async () => {
     // The budget leaves ~1.5 s once a worst-case page cycle is reserved.
     vi.stubEnv('ARXIV_MIRROR_REFRESH_TIMEOUT_MS', String(RESERVE_MS + 1500));
     respond = endless(200);
@@ -661,7 +661,8 @@ describe('refresh child process (real)', () => {
     expect(outcome).toMatchObject({ msg: 'Mirror refresh outcome', outcome: 'partial' });
     const state = harvestState();
     expect(state.status).toBe('in_progress');
-    expect(state.resumption_token).toBe(`tok-${outcome?.pagesFetched}`);
+    expect(state.resumption_token).toBeNull();
+    expect(state.last_datestamp).toBe('2026-06-04');
     expect(state.completed_at).toBeNull();
   }, 20_000);
 
@@ -697,9 +698,18 @@ describe('refresh child process (real)', () => {
     });
   }, 20_000);
 
-  it('resolves partial through runRefreshSubprocess with no signal sent, and the next run resumes (#39)', async () => {
+  it('resolves partial through runRefreshSubprocess with no signal sent, and the next run resumes inside the start datestamp (#39, #62)', async () => {
     const budget = RESERVE_MS + 1500;
     vi.stubEnv('ARXIV_MIRROR_REFRESH_TIMEOUT_MS', String(budget));
+    // Every page is stamped 2026-06-04, the datestamp the run starts on, so the
+    // budget runs out inside it and the token stays for the next run.
+    const store = await MirrorStore.open(dbPath);
+    store.writeHarvestState({
+      status: 'complete',
+      last_datestamp: '2026-06-04',
+      completed_at: 'c',
+    });
+    store.close();
     respond = endless(200);
     const log = makeLog();
 

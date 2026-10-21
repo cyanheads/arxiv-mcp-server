@@ -25,7 +25,8 @@
     "scripts/arxiv-mirror-init.ts",
     "scripts/arxiv-mirror-refresh.ts",
     "scripts/arxiv-mirror-verify.ts",
-    "scripts/_mirror-context.ts"
+    "scripts/_mirror-context.ts",
+    "scripts/tsconfig.json"
   ],
   "scripts": {
     "build": "bun scripts/build.ts",
@@ -113,7 +114,7 @@
     "@types/node-cron": "^3.0.11",
     "depcheck": "^1.4.7",
     "ignore": "^7.0.12",
-    "tsc-alias": "^1.9.7",
+    "tsc-alias": "^1.9.8",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }

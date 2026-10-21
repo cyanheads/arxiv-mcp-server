@@ -63,21 +63,30 @@ export type ProgressCallback = (info: {
  *
  * Where it starts: a previous run that stopped before draining (`in_progress`
  * or `error` with a saved resumption token) resumes from that token, which
- * carries the position inside its datestamp. Otherwise a refresh starts at
- * `from=last_datestamp` (OAI `from` is inclusive, so the boundary day is
- * re-read), and an init with no checkpoint harvests from the beginning. A
- * rejected token falls back to the datestamp checkpoint inside the harvester,
- * once per checkpoint: a second rejection before the checkpoint advances fails
- * the run (issue #59).
+ * carries the position inside its datestamp. Otherwise a refresh, or an init
+ * after an interrupted one, starts at `from=last_datestamp` (OAI `from` is
+ * inclusive, so the boundary day is re-read), and an init with no checkpoint
+ * harvests from the beginning. A rejected token falls back to the datestamp
+ * checkpoint inside the harvester, once per checkpoint: a second rejection
+ * before the checkpoint advances fails the run (issue #59).
  *
  * Before the first page it ensures the write-path index on
  * `paper_categories(paper_id)` (issue #50).
  *
  * Persists `harvest_state` after every page; `complete` (with `completed_at`)
  * is written only when the list drains. With `deadline`, the run stops after a
- * whole page once one worst-case page cycle no longer fits before it, leaving
- * the same checkpoint an interrupted run leaves (issue #39). An `init` run
- * waits out an upstream outage and re-sends the same request
+ * whole page once one worst-case page cycle no longer fits before it (issue
+ * #39).
+ *
+ * A token is an offset into a list arXiv recomputes on every request, so one
+ * resumed after arXiv re-modified a record it had already returned skips a
+ * record. A write therefore keeps the token only while the checkpoint is still
+ * on the datestamp the run started on, and only when the run stopped at its
+ * deadline there or had itself resumed a saved token: inside a datestamp one
+ * run could not clear. Every other write stores none, and the next run
+ * restarts at the checkpoint (issue #62).
+ *
+ * An `init` run waits out an upstream outage and re-sends the same request
  * (`HarvesterOptions.waitOutOutages`, issue #61); a refresh fails once a page
  * exhausts its retries. A cancelled `ctx.signal` always ends the run as a
  * failure, never as a deadline stop, and ends an outage wait at once.
@@ -118,6 +127,11 @@ export async function runHarvest(
   let lastDatestamp: string | undefined = existing.last_datestamp;
   let lastToken: string | undefined = startToken;
   let drained = true;
+  /** The token a write keeps for a later run, or none (issue #62; see above). */
+  const tokenToKeep = (atDeadline: boolean): string | undefined =>
+    lastDatestamp === existing.last_datestamp && (atDeadline || startToken !== undefined)
+      ? lastToken
+      : undefined;
   // One page cycle: the fetch at its worst plus the slowest apply seen so far.
   const fetchReserveMs = worstCasePageFetchMs(harvestOptions);
   let slowestApplyMs = 0;
@@ -134,12 +148,16 @@ export async function runHarvest(
       const pageStamp = pickLatestDatestamp(page);
       if (pageStamp && (!lastDatestamp || pageStamp > lastDatestamp)) lastDatestamp = pageStamp;
       lastToken = page.resumptionToken;
+      const atDeadline =
+        lastToken !== undefined &&
+        options.deadline !== undefined &&
+        Date.now() + fetchReserveMs + slowestApplyMs > options.deadline;
 
       store.writeHarvestState({
         status: 'in_progress',
         started_at: startedAt,
         last_datestamp: lastDatestamp,
-        resumption_token: lastToken,
+        resumption_token: tokenToKeep(atDeadline),
       });
 
       options.onProgress?.({
@@ -151,11 +169,7 @@ export async function runHarvest(
 
       // A signal that fired during the synchronous apply is only seen here.
       ctx.signal.throwIfAborted();
-      if (
-        lastToken &&
-        options.deadline !== undefined &&
-        Date.now() + fetchReserveMs + slowestApplyMs > options.deadline
-      ) {
+      if (atDeadline) {
         drained = false;
         break;
       }
@@ -186,7 +200,7 @@ export async function runHarvest(
       status: 'error',
       started_at: startedAt,
       last_datestamp: lastDatestamp,
-      resumption_token: lastToken,
+      resumption_token: tokenToKeep(false),
       error_message: message,
     });
     throw err;

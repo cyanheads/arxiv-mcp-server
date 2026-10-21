@@ -1,14 +1,15 @@
 /**
  * @fileoverview One-shot OAI-PMH harvest into the local mirror.
- * Idempotent and resumable — re-running after an interrupted harvest picks
- * up where the previous attempt left off (via persisted resumption token or
- * datestamp checkpoint). An arXiv outage doesn't end it: a page request that
+ * Idempotent and resumable — re-running after an interrupted harvest restarts
+ * at the datestamp checkpoint the previous attempt left (`from=` is inclusive,
+ * so that day is re-read). An arXiv outage doesn't end it: a page request that
  * still times out, hits a network error, or gets a 5xx other than 501 after
  * its retries waits (1 minute, doubling to 15, never shorter than a
  * `Retry-After`) and is sent again, each wait logged as a warning. A 4xx still
  * ends it, even one whose body stalls or drops after the status. Ctrl+C or
- * SIGTERM stops it at once, mid-wait included, and the next run resumes from
- * the saved position.
+ * SIGTERM stops it at once, mid-wait included, and the next run restarts at
+ * that checkpoint (or resumes the saved token, when the stopped run had itself
+ * resumed one and not yet left the datestamp it started on).
  *
  * Usage:
  *   bun run mirror:init

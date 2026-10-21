@@ -2,22 +2,24 @@
  * @fileoverview Tests for the mirror harvest runner — where a run starts
  * (saved resumption token vs. `from=last_datestamp`), what it persists as it
  * goes, the write-path index it ensures before the first page (#50), the
- * deadline that stops it after a whole page (#39), the stalled token recovery
- * that fails a run (#59), the outage wait only `init` runs (#61), and the run
- * on a file another writer is migrating (#71). Drives the real `MirrorStore` on
- * a temp file; only `fetch` (the OAI endpoint) is stubbed, except in the
- * real-process blocks, which run the mirror scripts against a loopback OAI
- * endpoint.
+ * deadline that stops it after a whole page (#39), which writes keep the token
+ * for a later run (#62), the stalled token recovery that fails a run (#59), the
+ * outage wait only `init` runs (#61), the run on a file another writer is
+ * migrating (#71), and the mirror scripts run from an installed package (#75).
+ * Drives the real `MirrorStore` on a temp file; only `fetch` (the OAI endpoint)
+ * is stubbed, except in the real-process blocks, which run the mirror scripts
+ * against a loopback OAI endpoint or, for the installed package, against stub
+ * server modules.
  * @module services/arxiv/mirror/runner.test
  */
 
 import { Database } from 'bun:sqlite';
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -87,6 +89,70 @@ function serve(...bodies: (string | { body: string; status: number })[]): void {
 
 const tokenOf = (u: URL | undefined) => u?.searchParams.get('resumptionToken') ?? null;
 const fromOf = (u: URL | undefined) => u?.searchParams.get('from') ?? null;
+/** Each request as its token, or its `from` when it sent none. */
+const startOf = (u: URL) => tokenOf(u) ?? fromOf(u);
+
+/**
+ * An OAI endpoint with arXiv's own `ListRecords` logic (arXiv/oaipmh
+ * `processors/db.py`, `fetch_list.py`, `resume.py`): the list for `from=D` is
+ * every record modified on or after D, ordered by (modtime, paper_id) and
+ * recomputed on every request, and a token is the request's `from` plus an
+ * offset `skip`. When a page spans days, the token's `from` moves to the page's
+ * last day and `skip` counts that day's records already shown. `modtimes` maps
+ * paper IDs to ISO instants. `touch` re-modifies a record, which moves it to
+ * the end of the list. `intercept` sees each request first: a Response it
+ * returns answers instead, and a signal it aborts fails the fetch.
+ */
+function serveArxivList(modtimes: Record<string, string>, pageSize = 3) {
+  const modified = new Map(Object.entries(modtimes));
+  const dayOf = (instant: string) => instant.slice(0, 10);
+  const endpoint = {
+    intercept: (_url: URL): Response | undefined => undefined,
+    touch: (id: string, instant: string) => void modified.set(id, instant),
+    /** The IDs of `modtimes` the mirror does not hold. */
+    missing: (store: MirrorStore) => {
+      const held = new Set(store.getPapersByIds([...modified.keys()]).map((p) => p.id));
+      return [...modified.keys()].filter((id) => !held.has(id));
+    },
+  };
+  mockFetch.mockImplementation(async (url, init) => {
+    const u = oaiUrl(url);
+    requests.push(u);
+    const answer = endpoint.intercept(u);
+    init?.signal?.throwIfAborted();
+    if (answer) return answer;
+    const token = new URLSearchParams(tokenOf(u) ?? '');
+    const from = tokenOf(u) ? token.get('from') : fromOf(u);
+    const skip = Number(token.get('skip') ?? 0);
+    const list = [...modified]
+      .filter(([, at]) => !from || dayOf(at) >= from)
+      .sort(([a, atA], [b, atB]) => atA.localeCompare(atB) || a.localeCompare(b));
+    const window = list.slice(skip, skip + pageSize + 1);
+    const over = window[pageSize];
+    let next: string | undefined;
+    if (over) {
+      const lastDay = dayOf(over[1]);
+      const sameDay = window.filter(([, at]) => dayOf(at) === lastDay).length;
+      next = new URLSearchParams(
+        sameDay === window.length
+          ? { ...(from && { from }), skip: String(skip + pageSize) }
+          : { from: lastDay, skip: String(sameDay - 1) },
+      ).toString();
+    }
+    const page = window.slice(0, pageSize).map(([id, at]) => record(id, dayOf(at)));
+    return new Response(listRecords(page, next), { headers: { 'content-type': 'text/xml' } });
+  });
+  return endpoint;
+}
+
+/** `count` records modified on `day`, a second apart, numbered from `first` (`2606.000NN`). */
+const modifiedOn = (day: string, first: number, count: number): Record<string, string> =>
+  Object.fromEntries(
+    Array.from({ length: count }, (_, i) => [
+      `2606.${String(first + i).padStart(5, '0')}`,
+      `${day}T01:00:${String(i).padStart(2, '0')}Z`,
+    ]),
+  );
 
 const makeCtx = (signal = new AbortController().signal) => ({
   log: { debug: vi.fn(), info: vi.fn(), notice: vi.fn(), warning: vi.fn(), error: vi.fn() },
@@ -337,7 +403,7 @@ describe('runHarvest', () => {
         ),
       );
 
-    it('stops after a whole page once no further page cycle fits, leaving a resumable checkpoint', async () => {
+    it('stops after a whole page once no further page cycle fits, leaving a datestamp checkpoint with no token past the start datestamp (#62)', async () => {
       const store = await seed({
         status: 'complete',
         last_datestamp: '2026-05-31',
@@ -357,20 +423,20 @@ describe('runHarvest', () => {
       });
       const state = store.readHarvestState();
       expect(state.status).toBe('in_progress');
-      expect(state.resumption_token).toBe('tok-1');
+      expect(state.resumption_token).toBeUndefined();
       expect(state.last_datestamp).toBe('2026-06-01');
       expect(state.completed_at).toBe('2026-06-01T00:00:00.000Z');
       expect(store.countPapers()).toBe(1);
     });
 
-    it('lets the next run continue from the checkpoint the stopped run left', async () => {
+    it('lets the next run restart at the datestamp checkpoint the stopped run left (#62)', async () => {
       await seed({ status: 'complete', last_datestamp: '2026-05-31', completed_at: 'c' });
       serve(...pages(3));
       await runHarvest(makeCtx(), { mode: 'refresh', deadline: Date.now() });
 
       const result = await runHarvest(makeCtx(), { mode: 'refresh' });
 
-      expect(requests.map(tokenOf)).toEqual([null, 'tok-1', 'tok-2']);
+      expect(requests.map(startOf)).toEqual(['2026-05-31', '2026-06-01', 'tok-2']);
       expect(result.drained).toBe(true);
       expect((await openStore(config.mirrorPath)).countPapers()).toBe(3);
     });
@@ -452,7 +518,7 @@ describe('runHarvest', () => {
       expect(store.readHarvestState().completed_at).not.toBe('2026-06-01T00:00:00.000Z');
     });
 
-    it('reports a cancellation as a failure, never as a deadline stop', async () => {
+    it('reports a cancellation as a failure, never as a deadline stop, and saves no token (#62)', async () => {
       const store = await seed({
         status: 'complete',
         last_datestamp: '2026-05-31',
@@ -474,7 +540,212 @@ describe('runHarvest', () => {
 
       const state = store.readHarvestState();
       expect(state.status).toBe('error');
-      expect(state.resumption_token).toBe('tok-1');
+      expect(state.resumption_token).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Which writes keep the token (#62)
+  // -------------------------------------------------------------------------
+
+  describe('token kept across runs (#62)', () => {
+    /** Nine records modified on 2026-06-04: three pages of three. */
+    const busyDay = modifiedOn('2026-06-04', 1, 9);
+
+    it('saves no token at a deadline stop past the start datestamp, so the next run restarts at the checkpoint and skips nothing (#62)', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-03',
+        completed_at: 'c',
+      });
+      const oai = serveArxivList(busyDay);
+
+      const first = await runHarvest(makeCtx(), { mode: 'refresh', deadline: Date.now() });
+
+      expect(first).toMatchObject({ drained: false, pagesFetched: 1, lastDatestamp: '2026-06-04' });
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'in_progress',
+        last_datestamp: '2026-06-04',
+      });
+      expect(store.readHarvestState()).not.toHaveProperty('resumption_token');
+
+      // arXiv re-modifies a record the stopped run already read: it moves to the
+      // end of the list, and every record after it one place earlier.
+      oai.touch('2606.00002', '2026-06-05T00:00:00Z');
+      requests = [];
+      const next = await runHarvest(makeCtx(), { mode: 'refresh' });
+
+      expect(requests.map(startOf)).toEqual([
+        '2026-06-04',
+        'from=2026-06-04&skip=3',
+        'from=2026-06-04&skip=6',
+      ]);
+      expect(next.drained).toBe(true);
+      expect(oai.missing(store)).toEqual([]);
+    });
+
+    it('stores no token on the per-page writes of a run that has not stopped, so a killed run restarts at the checkpoint (#62)', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-04',
+        completed_at: 'c',
+      });
+      serveArxivList(busyDay);
+      const saved: (string | undefined)[] = [];
+
+      await runHarvest(makeCtx(), {
+        mode: 'refresh',
+        onProgress: () => saved.push(store.readHarvestState().resumption_token),
+      });
+
+      // Pages one and two returned a token; neither write kept it.
+      expect(saved).toEqual([undefined, undefined, undefined]);
+    });
+
+    it('keeps the token at a deadline stop on the start datestamp, and the next run resumes it (#50, #62)', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-04',
+        completed_at: 'c',
+      });
+      const oai = serveArxivList(busyDay);
+
+      await runHarvest(makeCtx(), { mode: 'refresh', deadline: Date.now() });
+
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'in_progress',
+        last_datestamp: '2026-06-04',
+        resumption_token: 'from=2026-06-04&skip=3',
+      });
+
+      requests = [];
+      const next = await runHarvest(makeCtx(), { mode: 'refresh' });
+
+      expect(requests.map(startOf)).toEqual(['from=2026-06-04&skip=3', 'from=2026-06-04&skip=6']);
+      expect(next).toMatchObject({ drained: true, pagesFetched: 2 });
+      expect(oai.missing(store)).toEqual([]);
+    });
+
+    it('saves no token when a page fails on the start datestamp, and the next init restarts there (#62)', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-04',
+        completed_at: 'c',
+      });
+      const oai = serveArxivList(busyDay);
+      oai.intercept = (u) =>
+        tokenOf(u) === 'from=2026-06-04&skip=3'
+          ? new Response('Bad request', { status: 400 })
+          : undefined;
+
+      await expect(runHarvest(makeCtx(), { mode: 'refresh' })).rejects.toThrow(/HTTP 400/);
+
+      expect(requests.map(startOf)).toEqual(['2026-06-04', 'from=2026-06-04&skip=3']);
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'error',
+        last_datestamp: '2026-06-04',
+      });
+      expect(store.readHarvestState()).not.toHaveProperty('resumption_token');
+
+      oai.intercept = () => undefined;
+      oai.touch('2606.00002', '2026-06-05T00:00:00Z');
+      requests = [];
+      const next = await runHarvest(makeCtx(), { mode: 'init' });
+
+      expect(requests.map(startOf)[0]).toBe('2026-06-04');
+      expect(next.drained).toBe(true);
+      expect(oai.missing(store)).toEqual([]);
+    });
+
+    it('saves no token when a run on the start datestamp is cancelled (#62)', async () => {
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-04',
+        completed_at: 'c',
+      });
+      const oai = serveArxivList(busyDay);
+      const controller = new AbortController();
+      // Cancelled once the second page's request is in flight.
+      oai.intercept = (u) => {
+        if (tokenOf(u)) controller.abort(new Error('Aborted by SIGTERM'));
+        return;
+      };
+
+      await expect(runHarvest(makeCtx(controller.signal), { mode: 'refresh' })).rejects.toThrow(
+        'Aborted by SIGTERM',
+      );
+
+      const state = store.readHarvestState();
+      expect(state).toMatchObject({
+        status: 'error',
+        last_datestamp: '2026-06-04',
+        error_message: 'Aborted by SIGTERM',
+      });
+      expect(state).not.toHaveProperty('resumption_token');
+
+      oai.intercept = () => undefined;
+      requests = [];
+      await runHarvest(makeCtx(), { mode: 'refresh' });
+
+      expect(requests.map(startOf)[0]).toBe('2026-06-04');
+      expect(oai.missing(store)).toEqual([]);
+    });
+
+    it('keeps a resumed token while the checkpoint stays on the start datestamp, and drops it once the checkpoint moves (#62)', async () => {
+      // Three pages on 2026-06-04, then two on 2026-06-05.
+      const store = await seed({
+        status: 'complete',
+        last_datestamp: '2026-06-04',
+        completed_at: 'c',
+      });
+      const oai = serveArxivList({ ...busyDay, ...modifiedOn('2026-06-05', 10, 6) });
+      const failOn = (token: string) => {
+        oai.intercept = (u) =>
+          tokenOf(u) === token ? new Response('Bad request', { status: 400 }) : undefined;
+      };
+      const tokenNow = () => store.readHarvestState().resumption_token;
+
+      // Run 1 stops at its deadline inside the start datestamp: the token stays.
+      await runHarvest(makeCtx(), { mode: 'refresh', deadline: Date.now() });
+      expect(tokenNow()).toBe('from=2026-06-04&skip=3');
+
+      // Run 2 resumed it and fails still inside that datestamp: the newer token stays.
+      requests = [];
+      failOn('from=2026-06-04&skip=6');
+      await expect(runHarvest(makeCtx(), { mode: 'refresh' })).rejects.toThrow(/HTTP 400/);
+      expect(requests.map(startOf)).toEqual(['from=2026-06-04&skip=3', 'from=2026-06-04&skip=6']);
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'error',
+        last_datestamp: '2026-06-04',
+        resumption_token: 'from=2026-06-04&skip=6',
+      });
+
+      // Run 3 resumed that one and fails once its checkpoint moved to 2026-06-05: none stays.
+      requests = [];
+      failOn('from=2026-06-05&skip=3');
+      await expect(runHarvest(makeCtx(), { mode: 'refresh' })).rejects.toThrow(/HTTP 400/);
+      expect(requests.map(startOf)).toEqual([
+        'from=2026-06-04&skip=6',
+        'from=2026-06-05&skip=0',
+        'from=2026-06-05&skip=3',
+      ]);
+      expect(store.readHarvestState()).toMatchObject({
+        status: 'error',
+        last_datestamp: '2026-06-05',
+      });
+      expect(tokenNow()).toBeUndefined();
+
+      // Run 4 restarts at the checkpoint, past a record re-modified since run 3 read it.
+      oai.intercept = () => undefined;
+      oai.touch('2606.00011', '2026-06-06T00:00:00Z');
+      requests = [];
+      const last = await runHarvest(makeCtx(), { mode: 'refresh' });
+
+      expect(requests.map(startOf)).toEqual(['2026-06-05', 'from=2026-06-05&skip=3']);
+      expect(last).toMatchObject({ drained: true, lastDatestamp: '2026-06-06' });
+      expect(store.readHarvestState()).toMatchObject({ status: 'complete' });
+      expect(tokenNow()).toBeUndefined();
+      expect(oai.missing(store)).toEqual([]);
     });
   });
 
@@ -571,7 +842,7 @@ describe('runHarvest', () => {
       });
     });
 
-    it('still fails a refresh after the page retries, with no wait', async () => {
+    it('still fails a refresh after the page retries, with no wait and no token saved past the start datestamp (#62)', async () => {
       const store = await seed({
         status: 'complete',
         last_datestamp: '2026-05-31',
@@ -590,12 +861,13 @@ describe('runHarvest', () => {
       expect(requests.map(tokenOf)).toEqual([null, 'tok-1', 'tok-1', 'tok-1']);
       expect(store.readHarvestState()).toMatchObject({
         status: 'error',
-        resumption_token: 'tok-1',
+        last_datestamp: '2026-06-01',
       });
+      expect(store.readHarvestState()).not.toHaveProperty('resumption_token');
       expect(ctx.log.warning).not.toHaveBeenCalled();
     });
 
-    it('writes the transport cause and host into error_message when a refresh fails', async () => {
+    it('writes the transport cause and host into error_message when a refresh fails, and no token past the start datestamp (#62)', async () => {
       const store = await seed({
         status: 'complete',
         last_datestamp: '2026-05-31',
@@ -620,13 +892,13 @@ describe('runHarvest', () => {
 
       expect(store.readHarvestState()).toMatchObject({
         status: 'error',
-        resumption_token: 'tok-1',
         error_message:
           'arXiv OAI-PMH network error reaching oai.test: getaddrinfo ENOTFOUND oai.test (failed after 3 attempts)',
       });
+      expect(store.readHarvestState()).not.toHaveProperty('resumption_token');
     });
 
-    it('ends a wait at once on a cancelled signal, leaving the checkpoint the next init resumes from', async () => {
+    it('ends a wait at once on a cancelled signal, leaving the datestamp checkpoint the next init restarts at (#62)', async () => {
       // Opened before the clock is faked, so the run's open resolves at once.
       const store = await openStore(config.mirrorPath);
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
@@ -651,17 +923,17 @@ describe('runHarvest', () => {
       expect(requests.map(tokenOf)).toEqual([null, 'tok-1']);
       expect(store.readHarvestState()).toMatchObject({
         status: 'error',
-        resumption_token: 'tok-1',
         last_datestamp: '2026-06-01',
         error_message: 'Aborted by SIGINT',
       });
+      expect(store.readHarvestState()).not.toHaveProperty('resumption_token');
 
       vi.useRealTimers();
       requests = [];
       serve(listRecords([record('2606.00002', '2026-06-02')]));
       const next = await runHarvest(makeCtx(), { mode: 'init' });
 
-      expect(requests.map(tokenOf)).toEqual(['tok-1']);
+      expect(requests.map(startOf)).toEqual(['2026-06-01']);
       expect(next.drained).toBe(true);
       expect(store.readHarvestState().status).toBe('complete');
     });
@@ -730,7 +1002,7 @@ describe('runHarvest', () => {
       });
     }
 
-    it('exits 1 at once on SIGTERM during an outage wait, and the next run resumes from the saved token', async () => {
+    it('exits 1 at once on SIGTERM during an outage wait, and the next run restarts at the datestamp checkpoint (#62)', async () => {
       const firstPage = listRecords([record('2606.00001', '2026-06-01')], 'tok-1');
       respond = (url, res) => {
         if (!url.searchParams.has('resumptionToken')) {
@@ -759,9 +1031,9 @@ describe('runHarvest', () => {
       const state = (await openStore(config.mirrorPath)).readHarvestState();
       expect(state).toMatchObject({
         status: 'error',
-        resumption_token: 'tok-1',
         last_datestamp: '2026-06-01',
       });
+      expect(state).not.toHaveProperty('resumption_token');
       resetStore();
 
       const resumeAt = served.length;
@@ -770,7 +1042,8 @@ describe('runHarvest', () => {
 
       expect(second.code).toBe(0);
       expect(second.stdout).toContain('Harvest complete');
-      expect(served[resumeAt]?.searchParams.get('resumptionToken')).toBe('tok-1');
+      expect(served[resumeAt]?.searchParams.get('resumptionToken')).toBeNull();
+      expect(served[resumeAt]?.searchParams.get('from')).toBe('2026-06-01');
       expect((await openStore(config.mirrorPath)).readHarvestState().status).toBe('complete');
     }, 30_000);
   });
@@ -893,6 +1166,99 @@ describe('runHarvest', () => {
         30_000,
       );
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // The mirror scripts as the npm package ships them (#75)
+  // -------------------------------------------------------------------------
+
+  describe('mirror scripts installed from the package (real process, #75)', () => {
+    const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
+
+    /** Server modules that report the tree they were loaded from as the mirror path. */
+    const serverStubs = (tree: string): Record<string, string> => ({
+      'config/server-config': `export const getServerConfig = () => ({ mirrorPath: '${tree}' });`,
+      'services/arxiv/mirror/index': `export const isMigrationConflict = () => false;
+export const openStore = async () => ({
+  readHarvestState: () => ({ status: 'pending' }),
+  schemaVersion: () => ({ current: 3, expected: 3 }),
+  integrityCheck: () => ({ ok: true, results: ['ok'] }),
+});`,
+    });
+
+    /**
+     * The package under another project's `node_modules`: the `scripts/` entries
+     * `package.json` `files` lists, a `dist/` of stub modules standing in for the
+     * build, and a `src/` beside it only when `withSrc` (a checkout). The project
+     * root carries its own `tsconfig.json` mapping `@/*` elsewhere.
+     */
+    async function installPackage(withSrc: boolean): Promise<string> {
+      const pkg = join(dir, 'node_modules', '@cyanheads', 'arxiv-mcp-server');
+      const { files } = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8')) as {
+        files: string[];
+      };
+      await mkdir(join(pkg, 'scripts'), { recursive: true });
+      for (const entry of files.filter((f) => f.startsWith('scripts/'))) {
+        await copyFile(join(ROOT, entry), join(pkg, entry));
+      }
+      const trees: [string, string][] = withSrc
+        ? [
+            ['dist', '.js'],
+            ['src', '.ts'],
+          ]
+        : [['dist', '.js']];
+      for (const [tree, ext] of trees) {
+        for (const [module, body] of Object.entries(serverStubs(tree))) {
+          const file = join(pkg, tree, `${module}${ext}`);
+          await mkdir(dirname(file), { recursive: true });
+          await writeFile(file, body);
+        }
+      }
+      await writeFile(
+        join(dir, 'tsconfig.json'),
+        JSON.stringify({ compilerOptions: { paths: { '@/*': ['./src/*'] } } }),
+      );
+      return pkg;
+    }
+
+    function runVerify(pkg: string, cwd: string) {
+      return new Promise<{ code: number | null; stderr: string; stdout: string }>((resolve) => {
+        const child = spawn(process.execPath, [join(pkg, 'scripts', 'arxiv-mirror-verify.ts')], {
+          cwd,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
+        child.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        child.on('close', (code) => resolve({ code, stderr, stdout }));
+      });
+    }
+
+    it('resolves their @/ imports to dist/ with no src/, from the package directory and from the project root (#75)', async () => {
+      const pkg = await installPackage(false);
+
+      for (const cwd of [pkg, dir]) {
+        const { code, stderr, stdout } = await runVerify(pkg, cwd);
+
+        expect(code, stderr).toBe(0);
+        expect(stdout).toContain('Verifying mirror at dist');
+        expect(stdout).toContain('Mirror OK');
+      }
+    }, 30_000);
+
+    it('resolves them to src/ first when a checkout also holds a built dist/ (#75)', async () => {
+      const pkg = await installPackage(true);
+
+      const { code, stderr, stdout } = await runVerify(pkg, pkg);
+
+      expect(code, stderr).toBe(0);
+      expect(stdout).toContain('Verifying mirror at src');
+    }, 30_000);
   });
 });
 

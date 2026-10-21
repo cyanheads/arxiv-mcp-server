@@ -70,7 +70,12 @@ export interface HarvestState {
   error_message?: string | undefined;
   /** Last OAI datestamp observed (max across all harvested records). YYYY-MM-DD. */
   last_datestamp?: string | undefined;
-  /** Resumption token from the last page; used to resume an interrupted full harvest. */
+  /**
+   * Resumption token the next run resumes from instead of `from=last_datestamp`.
+   * Saved only while the checkpoint is still on the datestamp the run started
+   * on, and only when that run stopped at its deadline there or had itself
+   * resumed a saved token; every other write stores none (issue #62).
+   */
   resumption_token?: string | undefined;
   /** Wall-clock timestamp the last refresh started (ISO 8601). */
   started_at?: string | undefined;
