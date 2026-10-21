@@ -65,9 +65,9 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
     {
       reason: 'unsupported_query_syntax',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Query translates to a mirror FTS5 expression the search engine cannot parse, typically two operands juxtaposed across a parenthesized group without an explicit operator.',
+      when: 'The mirror search engine rejected the FTS5 expression the query translated to. Every query the translator accepts is meant to parse, so this marks a translator defect.',
       recovery:
-        'Add an explicit AND or OR between adjacent terms and parenthesized groups, then retry.',
+        'Rewrite the query with an explicit AND, OR, or ANDNOT between every pair of operands and groups, then retry.',
       thrownBy: 'service',
     },
     {

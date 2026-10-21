@@ -20,7 +20,6 @@ import {
 import {
   defaultIsTransient,
   httpErrorFromResponse,
-  pdfParser,
   type RequestContext,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
@@ -40,8 +39,10 @@ import {
 } from './date-window.js';
 import {
   expandCategoryOperands,
+  isDriverError,
   MIRROR_SEARCH_MATCH_CAP,
   type MirrorNotReady,
+  type MirrorQuery,
   type MirrorSearcher,
   type MirrorSearchOutcome,
   openReaderStore,
@@ -50,6 +51,7 @@ import {
   searchInWorker,
   translateQuery,
 } from './mirror/index.js';
+import { extractInWorker, type PdfTextExtractor } from './pdf-text.js';
 import {
   ARXIV_API_RESULT_LIMIT,
   type OutlineEntry,
@@ -993,6 +995,12 @@ export interface ArxivServiceOptions {
    * writer that migrates it.
    */
   onMirrorSchemaOutdated?: () => void;
+  /**
+   * Where PDF text is extracted: a worker thread per extraction by default
+   * (issue #73). `extractInThread` extracts on the request thread, so a test on
+   * a fake clock is not raced by a worker replying on the real one.
+   */
+  pdfTextExtractor?: PdfTextExtractor;
 }
 
 export class ArxivService {
@@ -1013,9 +1021,11 @@ export class ArxivService {
    */
   private consecutiveRateLimits = 0;
   private readonly mirrorSearcher: MirrorSearcher;
+  private readonly pdfTextExtractor: PdfTextExtractor;
 
   constructor(private readonly options: ArxivServiceOptions = {}) {
     this.mirrorSearcher = options.mirrorSearcher ?? searchInWorker;
+    this.pdfTextExtractor = options.pdfTextExtractor ?? extractInWorker;
     this.parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: '@_',
@@ -1053,12 +1063,25 @@ export class ArxivService {
     // Built before the path split so the mirror echoes the same string the live
     // API would have received — one definition of "what was actually searched".
     const searchQuery = buildSearchQuery(query, options);
-    // The mirror's answer, or `undefined` when it is not ready or the query's
-    // free-text term is over its match cap — a query over the cap never falls
-    // back to it, so the cap bounds every mirror search.
+    const translated = translateQuery(query);
+    // The mirror's answer, or `undefined` when it is not ready, the query's
+    // free-text term is over its match cap, or the query is one the mirror
+    // cannot answer as arXiv does (#65) — such a query never falls back to it,
+    // so the mirror answers only what it can answer faithfully and within its cap.
     const fromMirror = async () => {
+      if (translated.route === 'live') {
+        if (config.mirrorEnabled) {
+          ctx.log.info('The mirror cannot answer this query as arXiv does; not using it', {
+            query,
+            reason: translated.reason,
+          });
+        }
+        return;
+      }
       const ready = await tryReadyMirror(ctx, this.options.onMirrorSchemaOutdated);
-      return ready && (await this.searchMirror(ready, query, searchQuery, options, ctx));
+      return (
+        ready && (await this.searchMirror(ready, translated, query, searchQuery, options, ctx))
+      );
     };
 
     // Mirror path: enabled, harvest complete, the query isn't sort-by-recent
@@ -1116,7 +1139,16 @@ export class ArxivService {
       // A cancelled call is over: answering it from the mirror would turn the
       // caller's cancellation into a success nobody is waiting for.
       if (!bypassForRecency || ctx.signal.aborted) throw err;
-      const mirrored = await fromMirror();
+      // The mirror stands in for a live call that already failed, so a mirror
+      // that throws leaves that failure standing, unless the caller cancelled
+      // meanwhile. See issue #76.
+      const mirrored = await fromMirror().catch((mirrorErr: unknown) => {
+        if (ctx.signal.aborted) throw ctx.signal.reason;
+        ctx.log.warning('Mirror fallback failed on recency bypass; returning the live failure', {
+          error: mirrorErr instanceof Error ? mirrorErr.message : String(mirrorErr),
+        });
+        throw err;
+      });
       // A mirror that matches nothing says nothing about the newest papers the
       // bypass went live for: the live failure stands rather than reading as
       // a query with no matches. See issue #68.
@@ -1167,12 +1199,12 @@ export class ArxivService {
   }
 
   /**
-   * Search the local OAI-PMH mirror via FTS5. Translates the arXiv query
-   * syntax, applies category-subtree expansion, and merges any tool-level
-   * `options.category` / submitted-date window into the structured filter set.
+   * Search the local OAI-PMH mirror via FTS5 with the query's translation, and
+   * merge any tool-level `options.category` / submitted-date window into the
+   * structured filter set.
    *
-   * The query's own `cat:` operands and `options.category` stay separate
-   * category groups rather than one merged set: the live path AND-s the two
+   * The query's own category groups and `options.category` stay separate
+   * groups rather than one merged set: the live path AND-s the two
    * (`(… cat:X …) AND cat:Y`), so folding them into a single OR-ed set would
    * make the same pair of inputs widen the result set here while narrowing it
    * there.
@@ -1189,21 +1221,22 @@ export class ArxivService {
    * free-text term is probed; a category- or date-only search keeps its
    * index-backed mirror path (#19, #49). `undefined` too when the reader
    * worker's own open finds the file not ready or throws, each reported as the
-   * request thread's open reports it.
+   * request thread's open reports it, and when SQLite raises during the probe
+   * or the search, logged as a warning (#76).
    *
    * The probe and the search run through the service's `MirrorSearcher`: in the
    * reader worker unless the service was built with another (issue #58).
    */
   private async searchMirror(
     mirror: ReadyMirror,
+    translated: MirrorQuery,
     query: string,
     effectiveQuery: string,
     options: SearchOptions,
     ctx: Context,
   ): Promise<SearchResult | undefined> {
-    const translated = translateQuery(query);
     const categoryGroups = [
-      translated.categoryFilters,
+      ...translated.categoryGroups,
       options.category ? categorySubtree(options.category) : [],
     ].filter((group) => group.length > 0);
     const published = intersectBounds(
@@ -1246,6 +1279,14 @@ export class ArxivService {
             reason: 'unsupported_query_syntax',
           },
         );
+      }
+      // Any other error SQLite raised mid-read (a corrupt page, an I/O error) is
+      // handled as a failed open: logged, and the call goes live, so the engine's
+      // text never reaches the caller. A cancellation, a reader that stopped
+      // (`ServiceUnavailable`), and this code's own errors still throw. See #76.
+      if (isDriverError(err)) {
+        ctx.log.warning('Mirror search failed; using live API', { error: err.message });
+        return;
       }
       throw err;
     }
@@ -1293,7 +1334,17 @@ export class ArxivService {
     // lookup is by base ID but the match is version-aware: a row satisfies a
     // slot only when it carries the version that slot asked for. An explicit
     // older version is a miss, patched from the live API below. See issue #25.
-    const rows = ready.store.getPapersByIds(ids.map(stripVersion));
+    let rows: PaperRow[];
+    try {
+      rows = ready.store.getPapersByIds(ids.map(stripVersion));
+    } catch (err) {
+      // SQLite raising mid-read is a failed open (#76): the whole lookup goes
+      // live, whatever `mirrorFallbackLive` says — it gates misses, not a
+      // mirror that cannot answer.
+      if (!isDriverError(err)) throw err;
+      ctx.log.warning('Mirror lookup failed; using live API', { error: err.message });
+      return this.fetchLivePapers(ids, ctx);
+    }
     const slots = resolveRequestedIds(ids, rows.map(rowToMetadata), (p) => p.id);
 
     const missingIndices = slots.flatMap((p, i) => (p === undefined ? [i] : []));
@@ -1458,72 +1509,7 @@ export class ArxivService {
     ctx: Context,
   ): Promise<PaperContent> {
     const deadline = startReadDeadline(paperId, getServerConfig().readTimeoutMs);
-    // Metadata: prefer live API for per-version fidelity (the mirror only
-    // stores the latest version). When the live lookup fails, a mirror that
-    // holds the paper answers instead — latest-version metadata is better than
-    // an error.
-    let paper: PaperMetadata | undefined;
-    let liveMiss: PaperLookupMiss | undefined;
-    try {
-      const lookup = await this.fetchLivePapers([paperId], ctx, deadline);
-      paper = lookup.papers[0];
-      liveMiss = lookup.not_found?.[0];
-    } catch (err) {
-      // A cancelled call is over: answering it from the mirror, or naming the
-      // version the mirror holds, would report something nobody is waiting for.
-      if (ctx.signal.aborted) throw ctx.signal.reason;
-      // Out of time: whatever the mirror holds, none is left to fetch its body.
-      // A wait for the API queue or a retry ends with the deadline's own reason.
-      if (deadline.signal.aborted) {
-        throw err === deadline.signal.reason
-          ? deadline.exceeded('its arXiv API lookup had not finished')
-          : err;
-      }
-      const ready = await tryReadyMirror(ctx, this.options.onMirrorSchemaOutdated);
-      if (!ready) throw err;
-      const rows = ready.store.getPapersByIds([stripVersion(paperId)]);
-      const [stored] = rows;
-      // A paper the mirror does not hold says nothing about arXiv: the live
-      // failure stands, as it does with no mirror, rather than reading as an
-      // ID that does not exist. See issue #68.
-      if (!stored) throw err;
-      ctx.log.warning('Live API failed for readContent metadata; falling back to mirror', {
-        paperId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      const [match] = resolveRequestedIds([paperId], rows.map(rowToMetadata), (p) => p.id);
-      // A version-pinned read must not degrade to whichever version the mirror
-      // happens to hold — the substituted ID would flow into the HTML fetch
-      // below and return a different revision's body. Unversioned reads keep
-      // degrading to the latest stored version. See issue #33.
-      if (!match) {
-        throw serviceUnavailable(
-          `arXiv is unavailable and version ${parseVersion(paperId)} of '${stored.id}' cannot be served locally — the mirror holds version ${stored.version} only.`,
-          {
-            paperId,
-            mirrorVersion: stored.version,
-            reason: 'version_unavailable',
-            retryable: true,
-          },
-          { cause: err },
-        );
-      }
-      paper = match;
-    }
-    if (!paper) {
-      // The version exists upstream, so `no_match` would have the caller doubt
-      // a valid ID. Name the version that can be read instead. See issue #53.
-      if (liveMiss?.reason === 'version_not_served') {
-        throw notFound(
-          [`Paper '${paperId}' could not be served.`, liveMiss.detail].filter(Boolean).join(' '),
-          { paperId, pdfUrl: `https://arxiv.org/pdf/${paperId}`, reason: 'version_not_served' },
-        );
-      }
-      throw notFound(
-        `Paper '${paperId}' not found. Verify the ID format (e.g., '2401.12345' or '2401.12345v2').`,
-        { paperId, reason: 'no_match' },
-      );
-    }
+    const { paper, fromMirror } = await this.readMetadata(paperId, ctx, deadline);
 
     // Body fetch with its own retry (2s base delay for heavier pages).
     // Same fail-fast-on-rate-limit policy as API calls — see isArxivTransient.
@@ -1572,10 +1558,12 @@ export class ArxivService {
           : { entries: [], omittedLevels: [] };
     // ar5iv keeps one render per paper and serves it for any version, and its
     // page names no revision. Its body is the requested revision for certain
-    // only when the paper has one: an unversioned read whose latest is v1.
-    // See issue #63.
+    // only when the paper has one: an unversioned read whose live lookup found
+    // v1 the latest. A mirror row's v1 can trail a revision published since its
+    // last refresh. See issues #63, #79.
     const revisionUnconfirmed =
-      source === 'ar5iv' && !(parseVersion(paperId) === undefined && parseVersion(paper.id) === 1);
+      source === 'ar5iv' &&
+      !(!fromMirror && parseVersion(paperId) === undefined && parseVersion(paper.id) === 1);
 
     return {
       paper_id: paper.id,
@@ -1595,6 +1583,152 @@ export class ArxivService {
       ...(outline?.continuesAt !== undefined ? { outline_continues_at: outline.continuesAt } : {}),
       ...(revisionUnconfirmed ? { revision_unconfirmed: true } : {}),
     };
+  }
+
+  /**
+   * The metadata a read fetches its body for, and whether the mirror supplied
+   * it. The live API answers first, for per-version fidelity: the mirror stores
+   * the latest version only, as of its last refresh.
+   *
+   * An unversioned read with the mirror enabled waits on that lookup for at most
+   * `ARXIV_API_TIMEOUT_MS` from the read's start, its wait for the API queue
+   * included: the bound a lookup at the head of the queue already has. A lookup
+   * still pending then, for a paper the mirror holds, is withdrawn (dropped from
+   * the queue, or its open request aborted) and the stored row answers, so reads
+   * queued behind a hung arXiv do not spend their deadline in the queue. A mirror
+   * that lacks the paper leaves the read waiting. See issue #79.
+   *
+   * A lookup that fails is answered from a mirror holding the paper: an
+   * unversioned read takes the stored version, and a pin the stored version does
+   * not match fails `version_unavailable` (#33). A paper the mirror lacks keeps
+   * the live error (#68). A cancelled read fails as cancelled and never reads the
+   * mirror.
+   */
+  private async readMetadata(
+    paperId: string,
+    ctx: Context,
+    deadline: ReadDeadline,
+  ): Promise<{ fromMirror: boolean; paper: PaperMetadata }> {
+    const config = getServerConfig();
+    const withdraw = new AbortController();
+    const lookup = this.fetchLivePapers([paperId], ctx, {
+      exceeded: deadline.exceeded,
+      signal: AbortSignal.any([deadline.signal, withdraw.signal]),
+    });
+    // The cap and the failure fallback share one mirror read.
+    let stored: Promise<PaperRow | undefined> | undefined;
+    const readStored = () => {
+      stored ??= this.readMirrorRow(paperId, ctx);
+      return stored;
+    };
+
+    if (parseVersion(paperId) === undefined && config.mirrorEnabled) {
+      let cap: ReturnType<typeof setTimeout> | undefined;
+      const capReached = await Promise.race([
+        lookup.then(
+          () => false,
+          () => false,
+        ),
+        new Promise<boolean>((resolve) => {
+          cap = setTimeout(() => resolve(true), config.apiTimeoutMs);
+        }),
+      ]);
+      clearTimeout(cap);
+      if (capReached && !ctx.signal.aborted && !deadline.signal.aborted) {
+        const row = await readStored();
+        if (row) {
+          withdraw.abort();
+          ctx.log.info(
+            'Live API lookup still pending; answering readContent metadata from mirror',
+            {
+              paperId,
+              apiTimeoutMs: config.apiTimeoutMs,
+            },
+          );
+          return { paper: rowToMetadata(row), fromMirror: true };
+        }
+      }
+    }
+
+    let result: PaperLookupResult;
+    try {
+      result = await lookup;
+    } catch (err) {
+      // A cancelled call is over: answering it from the mirror, or naming the
+      // version the mirror holds, would report something nobody is waiting for.
+      if (ctx.signal.aborted) throw ctx.signal.reason;
+      // Out of time: whatever the mirror holds, none is left to fetch its body.
+      // A wait for the API queue or a retry ends with the deadline's own reason.
+      if (deadline.signal.aborted) {
+        throw err === deadline.signal.reason
+          ? deadline.exceeded('its arXiv API lookup had not finished')
+          : err;
+      }
+      const row = await readStored();
+      // A paper the mirror does not hold says nothing about arXiv: the live
+      // failure stands, as it does with no mirror, rather than reading as an
+      // ID that does not exist. So does a mirror read that failed. See #68, #76.
+      if (!row) throw err;
+      ctx.log.warning('Live API failed for readContent metadata; falling back to mirror', {
+        paperId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      const [match] = resolveRequestedIds([paperId], [rowToMetadata(row)], (p) => p.id);
+      // A version-pinned read must not degrade to whichever version the mirror
+      // happens to hold — the substituted ID would flow into the HTML fetch
+      // and return a different revision's body. Unversioned reads keep
+      // degrading to the latest stored version. See issue #33.
+      if (!match) {
+        throw serviceUnavailable(
+          `arXiv is unavailable and version ${parseVersion(paperId)} of '${row.id}' cannot be served locally — the mirror holds version ${row.version} only.`,
+          {
+            paperId,
+            mirrorVersion: row.version,
+            reason: 'version_unavailable',
+            retryable: true,
+          },
+          { cause: err },
+        );
+      }
+      return { paper: match, fromMirror: true };
+    }
+
+    const [paper] = result.papers;
+    if (paper) return { paper, fromMirror: false };
+    // The version exists upstream, so `no_match` would have the caller doubt
+    // a valid ID. Name the version that can be read instead. See issue #53.
+    const liveMiss = result.not_found?.[0];
+    if (liveMiss?.reason === 'version_not_served') {
+      throw notFound(
+        [`Paper '${paperId}' could not be served.`, liveMiss.detail].filter(Boolean).join(' '),
+        { paperId, pdfUrl: `https://arxiv.org/pdf/${paperId}`, reason: 'version_not_served' },
+      );
+    }
+    throw notFound(
+      `Paper '${paperId}' not found. Verify the ID format (e.g., '2401.12345' or '2401.12345v2').`,
+      { paperId, reason: 'no_match' },
+    );
+  }
+
+  /**
+   * The ready mirror's row for `paperId`, or `undefined` when there is none. A
+   * read the SQLite driver fails (a corrupt page, an I/O error) is logged and
+   * counts as a miss, so the read keeps its live lookup's outcome and the store's
+   * error never reaches the caller. See issue #76.
+   */
+  private async readMirrorRow(paperId: string, ctx: Context): Promise<PaperRow | undefined> {
+    const ready = await tryReadyMirror(ctx, this.options.onMirrorSchemaOutdated);
+    if (!ready) return;
+    try {
+      return ready.store.getPapersByIds([stripVersion(paperId)])[0];
+    } catch (err) {
+      if (!isDriverError(err)) throw err;
+      ctx.log.warning('Mirror read failed for readContent metadata; using the live lookup', {
+        paperId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1920,14 +2054,19 @@ export class ArxivService {
   }
 
   /**
-   * Download the paper's PDF and extract its text via the framework's
-   * `pdfParser` (lazy-loaded `unpdf`). Returns `undefined` when arXiv answers
+   * Download the paper's PDF and extract its text with the service's
+   * `PdfTextExtractor` (the framework's `pdfParser`, lazy-loaded `unpdf`, in a
+   * worker thread by default). Returns `undefined` when arXiv answers
    * that it has no PDF (4xx other than 429), so the caller can distinguish "no
    * artifact at all" from "PDF held no extractable text" and report the one
    * that happened. A 429 is not an absent artifact — it is the same throttle
    * `fetchApi` classifies, so it is raised as `rate_limited` rather than
    * collapsing into a `content_unavailable` that would tell the caller the
    * paper has no full text.
+   *
+   * The extraction holds no other request and draws on the read's deadline like
+   * every request: past it, the worker is terminated and the read fails with
+   * `Timeout`; a cancelled read ends it the same way. See #73.
    *
    * The extracted string is plain text: prose survives intact, while math,
    * tables, and heading structure flatten into the reading order the PDF
@@ -1947,7 +2086,7 @@ export class ArxivService {
     const signal = requestSignal(ctx, config.contentTimeoutMs, deadline);
 
     let response: Response;
-    let bytes: Uint8Array | undefined;
+    let bytes: Uint8Array<ArrayBuffer> | undefined;
     try {
       response = await fetch(paper.pdf_url, {
         signal,
@@ -1980,12 +2119,15 @@ export class ArxivService {
       return;
     }
 
-    const { text } = await pdfParser.extractText(
-      bytes,
-      { mergePages: true },
-      ctx as unknown as RequestContext,
-    );
-    return typeof text === 'string' ? text : text.join('\n\n');
+    try {
+      return await this.pdfTextExtractor(bytes, callSignal(ctx, deadline));
+    } catch (err) {
+      if (ctx.signal.aborted) throw ctx.signal.reason;
+      if (deadline.signal.aborted) {
+        throw deadline.exceeded('its PDF text extraction had not finished');
+      }
+      throw err;
+    }
   }
 
   // -------------------------------------------------------------------------

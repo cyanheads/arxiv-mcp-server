@@ -845,6 +845,17 @@ export function isMigrationConflict(err: unknown): err is McpError {
   return reason === 'migration_in_progress' || reason === 'migration_lease_lost';
 }
 
+/**
+ * Whether `err` is an error the SQLite driver raised — `bun:sqlite`'s
+ * `SQLiteError` or better-sqlite3's `SqliteError`, `fts5:` parse errors
+ * included — rather than one this code threw. Keyed on the driver's error
+ * class name, which survives the reader worker's wire, never on the message:
+ * SQLite's wording is not this server's to depend on (issue #76).
+ */
+export function isDriverError(err: unknown): err is Error {
+  return err instanceof Error && (err.name === 'SQLiteError' || err.name === 'SqliteError');
+}
+
 /** The lease the file records, or `undefined` for none (or a file without the table). */
 function readLease(db: SqliteHandle): MigrationLease | undefined {
   if (!hasTable(db, 'migration_lease')) return;

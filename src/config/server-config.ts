@@ -18,10 +18,11 @@ const ServerConfigSchema = z.object({
   requestDelayMs: z.coerce.number().default(3000),
   contentTimeoutMs: TimerMs.default(30000),
   apiTimeoutMs: TimerMs.default(15000),
-  // Wall-clock budget for one arxiv_read_paper call (ms): its metadata lookup
-  // and every content request, retry, and wait between them. The default sits
-  // under the 60 s request timeout of MCP SDK clients, leaving room for the
-  // work no signal stops (PDF text extraction, HTML cleaning). See issue #69.
+  // Wall-clock budget for one arxiv_read_paper call (ms): its metadata lookup,
+  // every content request, retry, and wait between them, and PDF text
+  // extraction. The default sits under the 60 s request timeout of MCP SDK
+  // clients, leaving room for the work no signal stops (HTML cleaning). See
+  // issues #69, #73.
   readTimeoutMs: TimerMs.default(50_000),
 
   // OAI-PMH mirror (issue #12). All optional; mirror is disabled by default.

@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { pdfParser } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import {
@@ -1737,6 +1738,120 @@ describe('ArxivService.readContent', () => {
     });
     // Fail fast: isArxivTransient excludes RateLimited, so the chain is not replayed.
     expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  // -------------------------------------------------------------------------
+  // PDF text extraction runs off the request thread (issue #73)
+  // -------------------------------------------------------------------------
+
+  /** A parseable PDF of `pages` pages, each holding `lines` lines that name their page. */
+  function makeBookPdfBytes(pages: number, lines = 1): Uint8Array {
+    const objects = [
+      '<</Type/Catalog/Pages 2 0 R>>',
+      '',
+      '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>',
+    ];
+    const kids: string[] = [];
+    for (let page = 1; page <= pages; page++) {
+      const stream = Array.from(
+        { length: lines },
+        (_, line) =>
+          `BT /F1 10 Tf 40 ${760 - line * 18} Td (Page ${page} line ${line} of the book) Tj ET`,
+      ).join('\n');
+      objects.push(`<</Length ${stream.length}>>\nstream\n${stream}\nendstream`);
+      objects.push(
+        `<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents ${objects.length} 0 R/Resources<</Font<</F1 3 0 R>>>>>>`,
+      );
+      kids.push(`${objects.length} 0 R`);
+    }
+    objects[1] = `<</Type/Pages/Kids[${kids.join(' ')}]/Count ${pages}>>`;
+    let body = '%PDF-1.4\n';
+    const offsets = objects.map((object, i) => {
+      const offset = body.length;
+      body += `${i + 1} 0 obj\n${object}\nendobj\n`;
+      return offset;
+    });
+    const xrefStart = body.length;
+    body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) body += `${String(offset).padStart(10, '0')} 00000 n \n`;
+    body += `trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\nstartxref\n${xrefStart}\n%%EOF\n`;
+    return new TextEncoder().encode(body);
+  }
+
+  /** Queue metadata, an arxiv.org/html 404, an ar5iv 307, and `pdf` as arXiv's PDF. */
+  function serveOnlyThePdf(pdf: Uint8Array): void {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(
+        new Response(pdf, { status: 200, headers: { 'content-type': 'application/pdf' } }),
+      );
+  }
+
+  it('serves the text pdf.js extracts from every page, in page order', async () => {
+    const pdf = makeBookPdfBytes(3, 2);
+    // pdf.js takes ownership of the bytes it parses, so the reference extraction gets a copy.
+    const { text } = await pdfParser.extractText(pdf.slice(), { mergePages: true });
+    serveOnlyThePdf(pdf);
+
+    const result = await getArxivService().readContent(
+      '2401.12345',
+      { maxCharacters: null },
+      createMockContext(),
+    );
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toBe(text);
+    const at = (needle: string) => result.content.indexOf(needle);
+    expect(at('Page 1 line 0')).toBeGreaterThanOrEqual(0);
+    expect(at('Page 1 line 1')).toBeGreaterThan(at('Page 1 line 0'));
+    expect(at('Page 2 line 0')).toBeGreaterThan(at('Page 1 line 1'));
+    expect(at('Page 3 line 1')).toBeGreaterThan(at('Page 3 line 0'));
+    expect(result.body_characters).toBe(text.length);
+  });
+
+  it('fails a PDF pdf.js cannot parse with InternalError (pdf_text_extract_failed), once', async () => {
+    serveOnlyThePdf(new TextEncoder().encode('%PDF-1.4\nnot a document\n%%EOF\n'));
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.InternalError,
+      message: 'Failed to extract text from PDF: Invalid PDF structure.',
+      data: { reason: 'pdf_text_extract_failed' },
+    });
+    // A document that does not parse would fail the same way again: no replay.
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps the request thread free while a long PDF extracts (#73)', async () => {
+    // pdf.js loaded here first, so an extraction on this thread spends no turn loading it.
+    await pdfParser.extractText(makeBookPdfBytes(1), { mergePages: true });
+    serveOnlyThePdf(makeBookPdfBytes(300, 20));
+    /**
+     * Turns of this thread's event loop until the read settles. pdf.js runs on
+     * promise jobs, so an extraction on this thread holds every turn until it
+     * ends and none pass; in its worker, other work keeps getting turns.
+     */
+    let turns = 0;
+    let reading = true;
+    const turn = () => {
+      if (!reading) return;
+      turns += 1;
+      setImmediate(turn);
+    };
+    setImmediate(turn);
+
+    const result = await getArxivService()
+      .readContent('2401.12345', {}, createMockContext())
+      .finally(() => {
+        reading = false;
+      });
+
+    expect(result.source).toBe('pdf_text');
+    expect(result.content).toContain('Page 300 line 19 of the book');
+    expect(turns).toBeGreaterThanOrEqual(1_000);
   });
 
   // -------------------------------------------------------------------------

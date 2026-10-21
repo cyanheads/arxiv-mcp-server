@@ -161,7 +161,61 @@ describe('mirror and live search contract parity', () => {
     // The deepest full page arXiv serves: start + max_results = 10,000 (#56).
     { query: 'ti:transformer', expectedQuery: 'ti:transformer', ids: [0, 2], start: 9_990 },
     { query: 'ti:unfindable', expectedQuery: 'ti:unfindable', ids: [] },
+    // Boolean operators around lifted operands keep arXiv's meaning (#65): each
+    // AND-ed cat: is its own filter, and AND binds tighter than ANDNOT.
+    { query: 'cat:cs AND cat:cs.CL', expectedQuery: 'cat:cs* AND cat:cs.CL', ids: [0] },
+    // An OR-ed set of cat: operands is one filter: each code admits one paper,
+    // and together they keep out the third paper the residual matches.
+    {
+      query: '(cat:cs.LG OR cat:astro-ph.CO) AND (ti:transformer OR ti:dark)',
+      expectedQuery: '(cat:cs.LG OR cat:astro-ph.CO) AND (ti:transformer OR ti:dark)',
+      ids: [0, 1],
+    },
+    {
+      query: 'ti:transformer ANDNOT abs:vision AND ti:architecture',
+      expectedQuery: 'ti:transformer ANDNOT abs:vision AND ti:architecture',
+      ids: [0],
+    },
+    {
+      query: 'ti:transformer AND cat:cs ANDNOT abs:language',
+      expectedQuery: 'ti:transformer AND cat:cs* ANDNOT abs:language',
+      ids: [2],
+    },
   ];
+
+  // Issue #65: a filter the mirror cannot apply as arXiv does sends the query
+  // live with the mirror enabled too, so both runs return arXiv's answer.
+  it('answers a cat: OR-ed with a term from the live API whether or not the mirror is enabled', async () => {
+    const input = { query: 'ti:transformer OR cat:astro-ph.CO', sort_by: 'submitted' as const };
+    const fetch = vi.fn(async (request: string | URL | Request) => {
+      const url = new URL(request instanceof Request ? request.url : String(request));
+      expect(url.searchParams.get('search_query')).toBe('ti:transformer OR cat:astro-ph.CO');
+      return new Response(
+        `<feed xmlns="http://www.w3.org/2005/Atom"
+        xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+        xmlns:arxiv="http://arxiv.org/schemas/atom">
+        <opensearch:totalResults>3</opensearch:totalResults>
+        <opensearch:startIndex>0</opensearch:startIndex>
+        ${[0, 1, 2].map((index) => atom(records[index]!)).join('')}</feed>`,
+        { headers: { 'content-type': 'application/atom+xml' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetch);
+    const live = await runToolContract(arxivSearchPapers, input);
+    expect(live.isError, JSON.stringify(live)).not.toBe(true);
+
+    vi.stubEnv('ARXIV_MIRROR_ENABLED', 'true');
+    resetServerConfig();
+    initArxivService();
+    const mirror = await runToolContract(arxivSearchPapers, input);
+    expect(mirror.isError, JSON.stringify(mirror)).not.toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(mirror.structuredContent).toEqual(live.structuredContent);
+    expect(mirror.content).toEqual(live.content);
+    expect(
+      (mirror.structuredContent as { papers: { id: string }[] }).papers.map((paper) => paper.id),
+    ).toEqual(['2401.10001v2', '2401.10002v1', '2401.10003v1']);
+  });
 
   // Issue #56: past arXiv's 10,000-result limit the two paths part ways — the
   // live path refuses before any request, the mirror keeps serving the page.

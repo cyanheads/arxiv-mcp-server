@@ -182,7 +182,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       .literal(true)
       .optional()
       .describe(
-        'Present, true, when source is ar5iv: ar5iv keeps one render per paper whatever version is asked for, so the body may be another revision than paper_id, while pdf_url is exactly the paper_id revision. Absent for every other source, and for an unversioned read of a paper whose only version is v1.',
+        'Present, true, when source is ar5iv: ar5iv keeps one render per paper whatever version is asked for, so the body may be another revision than paper_id, while pdf_url is exactly the paper_id revision. Absent for every other source, and for an unversioned read where the arXiv API reported v1 as the only version of the paper.',
       ),
     outline: z
       .array(OutlineEntrySchema)

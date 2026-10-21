@@ -5,12 +5,43 @@
  */
 
 import { readFileSync } from 'node:fs';
+import type { Worker } from 'node:worker_threads';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { pdfParser } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
 import { getArxivService, initArxivService } from '@/services/arxiv/arxiv-service.js';
+import { extractInThread } from '@/services/arxiv/pdf-text.js';
+
+/**
+ * Every PDF extraction worker started, with a promise of its exit. With
+ * `killOnPost`, a worker is terminated in the turn its PDF is posted to it, so
+ * it dies before it can reply. Workers are real; only their construction and
+ * the post are observed.
+ */
+const tracked = vi.hoisted(() => ({
+  killOnPost: false,
+  workers: [] as { exited: Promise<number>; worker: Worker }[],
+}));
+
+vi.mock('node:worker_threads', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:worker_threads')>();
+  class TrackedWorker extends actual.Worker {
+    constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      super(...args);
+      tracked.workers.push({
+        worker: this,
+        exited: new Promise<number>((resolve) => this.once('exit', resolve)),
+      });
+    }
+    override postMessage(...args: Parameters<Worker['postMessage']>): void {
+      super.postMessage(...args);
+      if (tracked.killOnPost) void this.terminate();
+    }
+  }
+  return { ...actual, default: { ...actual, Worker: TrackedWorker }, Worker: TrackedWorker };
+});
 
 /** The config every test reads. Suites that need other values assign them and restore. */
 const testConfig = vi.hoisted(() => ({
@@ -80,6 +111,8 @@ beforeEach(() => {
     throw new Error(`Unmocked request: ${url}`);
   });
   initArxivService();
+  tracked.workers.length = 0;
+  tracked.killOnPost = false;
 });
 
 afterEach(() => {
@@ -607,6 +640,59 @@ function pdfResponse(text: string): Response {
   });
 }
 
+/** A parseable PDF of `pages` pages of text: long enough that its extraction is still running a few turns after it starts. */
+function bookPdfBytes(pages: number): Uint8Array {
+  const objects = [
+    '<</Type/Catalog/Pages 2 0 R>>',
+    '',
+    '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>',
+  ];
+  const kids: string[] = [];
+  for (let page = 1; page <= pages; page++) {
+    const stream = Array.from(
+      { length: 20 },
+      (_, line) => `BT /F1 10 Tf 40 ${760 - line * 18} Td (Page ${page} line ${line}) Tj ET`,
+    ).join('\n');
+    objects.push(`<</Length ${stream.length}>>\nstream\n${stream}\nendstream`);
+    objects.push(
+      `<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents ${objects.length} 0 R/Resources<</Font<</F1 3 0 R>>>>>>`,
+    );
+    kids.push(`${objects.length} 0 R`);
+  }
+  objects[1] = `<</Type/Pages/Kids[${kids.join(' ')}]/Count ${pages}>>`;
+  let pdf = '%PDF-1.4\n';
+  const offsets = objects.map((object, i) => {
+    const offset = pdf.length;
+    pdf += `${i + 1} 0 obj\n${object}\nendobj\n`;
+    return offset;
+  });
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\nstartxref\n${xrefStart}\n%%EOF\n`;
+  return new TextEncoder().encode(pdf);
+}
+
+/** A PDF response that calls `onRead` once its whole body has been read, the moment extraction can begin. */
+function watchedPdfResponse(bytes: Uint8Array, onRead: () => void): Response {
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+      onRead();
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'content-type': 'application/pdf' } });
+}
+
+/** Let pending work run, without moving the fake clock, until `done()` holds. */
+async function untilTrue(done: () => boolean, what: string): Promise<void> {
+  for (let turn = 0; !done(); turn += 1) {
+    if (turn === 10_000) throw new Error(`Never happened: ${what}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 type Host = 'api' | 'html' | 'ar5iv' | 'pdf';
 
 /**
@@ -706,6 +792,8 @@ describe('fake clock suites', () => {
     saved = { ...testConfig };
     Object.assign(testConfig, SHIPPED_TIMEOUTS);
     useFakeClock();
+    // A worker's reply arrives on the real clock, which these tests do not move.
+    initArxivService({ pdfTextExtractor: extractInThread });
   });
 
   afterEach(() => {
@@ -997,7 +1085,7 @@ describe('fake clock suites', () => {
         for (const ar5iv of MATRIX_BEHAVIORS) {
           for (const pdf of MATRIX_BEHAVIORS) {
             mockFetch.mockClear();
-            initArxivService();
+            initArxivService({ pdfTextExtractor: extractInThread });
             stubHosts({ html, ar5iv, pdf });
             const read = await settle(readPaper);
             const label = `${html}/${ar5iv}/${pdf}`;
@@ -1127,5 +1215,165 @@ describe('fake clock suites', () => {
       expect(text).not.toContain('not retryable');
       expect(call.elapsedMs).toBe(50_000);
     });
+
+    /**
+     * Read with the PDF as the only rung that serves, its extraction in a
+     * worker, and let the deadline pass mid-extraction: no fake time passes
+     * until the PDF has been read and its extraction has begun.
+     */
+    async function readPastTheDeadlineDuringExtraction(read: () => Promise<unknown>) {
+      let pdfRead = false;
+      stubHosts({
+        html: 'miss',
+        ar5iv: 'miss',
+        pdf: () =>
+          watchedPdfResponse(bookPdfBytes(300), () => {
+            pdfRead = true;
+          }),
+      });
+      const outcome: { error?: unknown; settled: boolean; value?: unknown } = { settled: false };
+      const done = read().then(
+        (value) => Object.assign(outcome, { settled: true, value }),
+        (error: unknown) => Object.assign(outcome, { settled: true, error }),
+      );
+      await untilTrue(() => pdfRead, 'the PDF was read');
+      // The turn the extraction starts in.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(SHIPPED_TIMEOUTS.readTimeoutMs);
+      await done;
+      return outcome;
+    }
+
+    it('ends an extraction that outlasts the deadline with Timeout naming it, never replayed (#73)', async () => {
+      initArxivService();
+
+      const read = await readPastTheDeadlineDuringExtraction(readPaper);
+
+      expect(read.value).toBeUndefined();
+      expect(read.error).toBeInstanceOf(McpError);
+      expect(read.error).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        message: `${DEADLINE_PREFIX}its PDF text extraction had not finished.`,
+        data: { paperId: '2401.12345', timeoutMs: 50_000 },
+      });
+      expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf']);
+      // The worker the extraction ran in is gone with it.
+      expect(tracked.workers).toHaveLength(1);
+      await tracked.workers[0]?.exited;
+    });
+
+    it('reports an extraction past the deadline as a Timeout on both surfaces of arxiv_read_paper (#73)', async () => {
+      initArxivService();
+
+      const call = await readPastTheDeadlineDuringExtraction(() =>
+        runToolContract(arxivReadPaper, { paper_id: '2401.12345' }),
+      );
+
+      const result = call.value as Awaited<ReturnType<typeof runToolContract>> | undefined;
+      if (!result) throw new Error('arxiv_read_paper did not settle with a result');
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: { code: number; message: string } })
+        .error;
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.message).toBe(`${DEADLINE_PREFIX}its PDF text extraction had not finished.`);
+      const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+      expect(text).toContain(error.message);
+      await tracked.workers[0]?.exited;
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PDF text extraction in a worker thread (#73); the workers run on the real clock
+// ---------------------------------------------------------------------------
+
+describe('ArxivService.readContent — PDF text extraction in a worker (#73)', () => {
+  const CANCELLED = 'The client cancelled the call.';
+
+  /** Serve the PDF as the only rung with a render, and cancel `controller` once its extraction is under way. */
+  function cancelDuringExtraction(controller: AbortController): void {
+    stubHosts({
+      html: 'miss',
+      ar5iv: 'miss',
+      pdf: () =>
+        watchedPdfResponse(bookPdfBytes(300), () =>
+          // Two turns on: the read has handed the PDF to its extraction.
+          setImmediate(() =>
+            setImmediate(() => controller.abort(new DOMException(CANCELLED, 'AbortError'))),
+          ),
+        ),
+    });
+  }
+
+  it('fails as cancelled when the caller cancels during extraction, ending its worker', async () => {
+    const controller = new AbortController();
+    cancelDuringExtraction(controller);
+
+    const outcome = await getArxivService()
+      .readContent('2401.12345', {}, createMockContext({ signal: controller.signal }))
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+
+    expect(outcome).toEqual({ error: expect.objectContaining({ name: 'AbortError' }) });
+    expect((outcome as { error: Error }).error.message).toBe(CANCELLED);
+    expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf']);
+    expect(tracked.workers).toHaveLength(1);
+    await tracked.workers[0]?.exited;
+  });
+
+  it('reports a read cancelled during extraction as cancelled on both surfaces', async () => {
+    const controller = new AbortController();
+    cancelDuringExtraction(controller);
+
+    const result = await runToolContract(
+      arxivReadPaper,
+      { paper_id: '2401.12345' },
+      { context: { signal: controller.signal } },
+    );
+
+    expect(result.isError).toBe(true);
+    const error = (result.structuredContent as { error: { code: number; message: string } }).error;
+    expect(error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(error.message).toBe(CANCELLED);
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    expect(text).toContain(CANCELLED);
+    // The cancellation landed once the extraction had its worker.
+    expect(tracked.workers).toHaveLength(1);
+    await tracked.workers[0]?.exited;
+  });
+
+  it('fails with ServiceUnavailable, after one replay, when its worker dies before replying', async () => {
+    tracked.killOnPost = true;
+    stubHosts({ html: 'miss', ar5iv: 'miss', pdf: () => pdfResponse('never extracted') });
+    // Each worker dies on the real clock; the backoff before the replay runs on a fake one.
+    useFakeClock();
+    try {
+      const read = readPaper().then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+
+      await untilTrue(() => tracked.workers.length === 1, 'the first extraction started');
+      await tracked.workers[0]?.exited;
+      // The longest backoff before the replay: 2 s, ±25% jitter.
+      await vi.advanceTimersByTimeAsync(2500);
+      await untilTrue(() => tracked.workers.length === 2, 'the replay started its extraction');
+      await tracked.workers[1]?.exited;
+      const outcome = await read;
+
+      expect(outcome).toEqual({ error: expect.any(McpError) });
+      expect((outcome as { error: McpError }).error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message:
+          'The PDF text extraction worker stopped before replying; retry the read. (failed after 2 attempts)',
+        data: { exitCode: expect.any(Number) },
+      });
+      expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf', 'html', 'ar5iv', 'pdf']);
+      expect(tracked.workers).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -70,7 +70,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 ### `arxiv_read_paper` <sub>tool</sub>
 
 - Tries arXiv HTML, then ar5iv, then PDF text extraction; the `source` field reports which answered. PDF text is plain, so math, tables, and headings flatten
-- ar5iv keeps one render per paper, so an ar5iv body may be another revision than `paper_id` and carries `revision_unconfirmed: true`, unless the read named no version and the paper's only version is v1; `pdf_url` is exactly the `paper_id` revision
+- ar5iv keeps one render per paper, so an ar5iv body may be another revision than `paper_id` and carries `revision_unconfirmed: true`, unless the read named no version and arXiv's API reported v1 as the paper's only version; `pdf_url` is exactly the `paper_id` revision
 - `max_characters` defaults to 100,000 (pass `null` for the whole paper); page with `start`. The first page carries an `outline` of section headings with offsets
 - `paper_id` accepts the same ID spellings as `arxiv_get_metadata`
 - Fails `invalid_id`, `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (no text layer), `version_unavailable` (version-pinned ID needs the live API), or `version_not_served` (a superseded pre-2007 version arXiv will not serve; names the latest version and this version's PDF)
@@ -216,8 +216,8 @@ All configuration is optional — the server works out of the box with sensible 
 | `ARXIV_API_BASE_URL` | arXiv API base URL. | `https://export.arxiv.org/api` |
 | `ARXIV_REQUEST_DELAY_MS` | Minimum delay between arXiv API requests (ms). | `3000` |
 | `ARXIV_CONTENT_TIMEOUT_MS` | Timeout for paper body fetches — HTML renders and PDF downloads (ms). | `30000` |
-| `ARXIV_API_TIMEOUT_MS` | Timeout for API search/metadata requests (ms). | `15000` |
-| `ARXIV_READ_TIMEOUT_MS` | Time budget for one `arxiv_read_paper` call — its metadata lookup and every content request and retry (ms). Keep it under your MCP client's request timeout (60 s by default). | `50000` |
+| `ARXIV_API_TIMEOUT_MS` | Timeout for API search/metadata requests (ms). With the mirror enabled, also the longest an unversioned `arxiv_read_paper` waits on its metadata lookup, queue included, before a mirror holding the paper answers. | `15000` |
+| `ARXIV_READ_TIMEOUT_MS` | Time budget for one `arxiv_read_paper` call — its metadata lookup, every content request and retry, and PDF text extraction (ms). Keep it under your MCP client's request timeout (60 s by default). | `50000` |
 | `ARXIV_MIRROR_ENABLED` | Enable the local OAI-PMH metadata mirror. | `false` |
 | `ARXIV_MIRROR_PATH` | SQLite path for the mirror. | `./data/arxiv-mirror.db` |
 | `ARXIV_MIRROR_REFRESH_CRON` | UTC cron expression for in-process daily refresh (HTTP mode only). | unset |
@@ -260,7 +260,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Optional: local mirror
 
-For self-hosted deployments behind a single egress IP, arXiv's ~3-second crawl delay serializes concurrent users. An optional local mirror removes that rate-limit exposure for `arxiv_search_papers` and `arxiv_get_metadata` by serving from a SQLite + FTS5 store harvested via OAI-PMH. `arxiv_read_paper` always uses the live API — full-content harvesting is against arXiv's data policy.
+For self-hosted deployments behind a single egress IP, arXiv's ~3-second crawl delay serializes concurrent users. An optional local mirror removes that rate-limit exposure for `arxiv_search_papers` and `arxiv_get_metadata` by serving from a SQLite + FTS5 store harvested via OAI-PMH. `arxiv_read_paper` always fetches the body live — full-content harvesting is against arXiv's data policy — and takes its metadata from the mirror only when the live lookup fails or, for an ID without a version, is still pending after `ARXIV_API_TIMEOUT_MS`, reading the stored version, which can trail arXiv's latest until the next refresh.
 
 Disabled by default. To enable:
 
@@ -276,9 +276,11 @@ export ARXIV_MIRROR_ENABLED=true
 bun run start:http
 ```
 
-Keep it current with `bun run mirror:refresh` (cron/systemd/launchd, or `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode) and check it with `bun run mirror:verify`. An interrupted refresh resumes from its saved position on the next run. When a release changes the mirror's schema, the server answers from the live API until a writer migrates the file in place, with no re-harvest: with `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode the server starts that refresh itself; otherwise run `bun run mirror:refresh` or `bun run mirror:verify`. One writer migrates the file at a time: a mirror command started meanwhile changes nothing and exits 75, naming the process that holds the migration, so run it again once that finishes.
+From an npm install, the `mirror:*` commands belong to the package rather than your project: run them in the package directory (`bun run --cwd node_modules/@cyanheads/arxiv-mcp-server mirror:init`), or run a script directly from your project root (`bun node_modules/@cyanheads/arxiv-mcp-server/scripts/arxiv-mirror-init.ts`). Set `ARXIV_MIRROR_PATH` to an absolute path outside `node_modules`, the same one the server reads, so a reinstall leaves the mirror in place.
 
-Mirror search ranks with FTS5 BM25, so `sort_by=relevance` returns a different top set than the live API. Searches that go to the live API instead: `sort_by=submitted` descending (while `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive), searches whose free-text terms match 50,000 or more papers, and version-pinned requests (the mirror holds only the latest version).
+Keep it current with `bun run mirror:refresh` (cron/systemd/launchd, or `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode) and check it with `bun run mirror:verify`. An interrupted refresh picks up on the next run at the last datestamp it checkpointed, re-reading that day; when the in-process refresh runs out of its `ARXIV_MIRROR_REFRESH_TIMEOUT_MS` budget before leaving the day it started on, the next run resumes where it stopped instead. When a release changes the mirror's schema, the server answers from the live API until a writer migrates the file in place, with no re-harvest: with `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode the server starts that refresh itself; otherwise run `bun run mirror:refresh` or `bun run mirror:verify`. One writer migrates the file at a time: a mirror command started meanwhile changes nothing and exits 75, naming the process that holds the migration, so run it again once that finishes.
+
+Mirror search ranks with FTS5 BM25, so `sort_by=relevance` returns a different top set than the live API. Searches that go to the live API instead: `sort_by=submitted` descending (while `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive), searches whose free-text terms match 50,000 or more papers, queries with a `cat:` or `submittedDate:` operand the mirror cannot apply as a filter (one joined to the rest by `OR`, or on the right of an `ANDNOT`) or that leave only `ANDNOT` terms once those operands are taken out, queries with unbalanced parentheses, and version-pinned requests (the mirror holds only the latest version).
 
 ### Docker
 
@@ -297,9 +299,9 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions` | Tool definitions (`*.tool.ts`). |
 | `src/mcp-server/resources/definitions` | Resource definitions (`*.resource.ts`). |
-| `src/services/arxiv` | `ArxivService` — live arXiv API client (search, metadata, HTML). |
+| `src/services/arxiv` | `ArxivService` — live arXiv API client (search, metadata, HTML), and PDF text extraction in a worker thread (`pdf-text.ts`). |
 | `src/services/arxiv/mirror` | Optional OAI-PMH mirror — harvester, SQLite + FTS5 store, query translator, runner. |
-| `scripts/arxiv-mirror-*.ts` | Mirror lifecycle scripts (`init`, `refresh`, `verify`). |
+| `scripts/arxiv-mirror-*.ts` | Mirror lifecycle scripts (`init`, `refresh`, `verify`); `scripts/tsconfig.json` resolves their `@/` imports to `src/`, or to `dist/` in an install. |
 | `tests/` | Unit and integration tests. |
 | `docs/` | Design document and directory structure. |
 

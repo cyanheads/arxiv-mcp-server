@@ -17,6 +17,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { categorySubtree } from '@/services/arxiv/categories.js';
 import { translateQuery } from '@/services/arxiv/mirror/query.js';
+import { fromWireError, toWireError } from '@/services/arxiv/mirror/reader.js';
 import {
   MIRROR_FTS_DROP_STATEMENTS,
   MIRROR_FTS_STATEMENTS,
@@ -25,7 +26,7 @@ import {
   MIRROR_SCHEMA_VERSION,
   MIRROR_WRITE_INDEX_SQL,
 } from '@/services/arxiv/mirror/schema.js';
-import { MirrorStore, rawToRow } from '@/services/arxiv/mirror/store.js';
+import { isDriverError, MirrorStore, rawToRow } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
 
 const mkRecord = (overrides: Partial<ArxivRawRecord> = {}): ArxivRawRecord => ({
@@ -765,8 +766,9 @@ describe('MirrorStore', () => {
 
     const resolve = (shape: (typeof SHAPES)[number]) => {
       const t = translateQuery(shape.q);
+      if (t.route === 'live') throw new Error(`${shape.q} routes live (${t.reason})`);
       const categoryGroups = [
-        t.categoryFilters,
+        ...t.categoryGroups,
         shape.category ? categorySubtree(shape.category) : [],
       ].filter((g) => g.length > 0);
       const from = shape.from ?? t.published.from;
@@ -1149,6 +1151,33 @@ describe('MirrorStore.openReader (#55)', () => {
   });
 });
 
+describe('isDriverError (#76)', () => {
+  const raised = (() => {
+    const db = new Database(':memory:');
+    try {
+      db.query('SELECT * FROM missing_table').all();
+    } catch (err) {
+      return err;
+    } finally {
+      db.close();
+    }
+    throw new Error('the driver accepted a query on a missing table');
+  })();
+
+  it('takes an error bun:sqlite raised, here or rebuilt from the reader worker’s reply', () => {
+    expect(isDriverError(raised)).toBe(true);
+    expect(isDriverError(fromWireError(structuredClone(toWireError(raised))))).toBe(true);
+  });
+
+  it('keys on the driver’s error class, never on the wording', () => {
+    expect(isDriverError(new Error('database disk image is malformed'))).toBe(false);
+    expect(isDriverError(new McpError(JsonRpcErrorCode.DatabaseError, 'SQLiteError'))).toBe(false);
+    expect(isDriverError('SQLiteError: no such table: missing_table')).toBe(false);
+    // The reader worker's reply, before `fromWireError` rebuilds it, carries the name but is no error.
+    expect(isDriverError(structuredClone(toWireError(raised)))).toBe(false);
+  });
+});
+
 // The suite runs on Bun, so the store's better-sqlite3 driver, the one a server
 // started with `node` uses, runs only here: the store bundled for Node and
 // driven by a `node` child, which reports what each open did.
@@ -1194,14 +1223,31 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
       status: string;
       write?: string | null;
     };
+    overwrittenPage: {
+      byCategory: DriverFailure | null;
+      byId: DriverFailure | null;
+      byTerm: DriverFailure | null;
+      opened: string;
+      owner: string | null;
+    };
     runtime: string;
+  }
+
+  /** A store call's error as the `node` child saw it, and whether {@link isDriverError} takes it as the driver's. */
+  interface DriverFailure {
+    classified: boolean;
+    code: string;
+    name: string;
   }
 
   const SCRIPT = `
     import { createRequire } from 'node:module';
-    import { existsSync, fstatSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+    import {
+      closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, statSync, writeFileSync,
+      writeSync,
+    } from 'node:fs';
     import { join } from 'node:path';
-    const { MirrorStore } = await import(process.env.STORE_BUNDLE);
+    const { isDriverError, MirrorStore } = await import(process.env.STORE_BUNDLE);
     const Database = createRequire(process.env.STORE_BUNDLE)('better-sqlite3');
     const dir = process.env.WORK_DIR;
     const fdsOpenOn = (path) => {
@@ -1267,6 +1313,49 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
       control, writer: writerFailure, afterWriter, reader: readerFailure,
       afterReader: fdsOpenOn(broken),
     };
+
+    // 16 pages of 0xFF from the papers page holding the marker row, as in #76.
+    const overwritten = join(dir, 'overwritten-page.db');
+    const seeding = await MirrorStore.open(overwritten);
+    const record = (paper_id, abstract, categories, doi) => ({
+      paper_id, identifier: 'oai:arXiv.org:' + paper_id, datestamp: '2024-02-15', title: 'Paper',
+      authors: 'A. Author', abstract, categories, doi,
+      versions: [{ version: 'v1', date: '2024-02-15T00:00:00Z' }],
+    });
+    seeding.applyBatch([
+      ...Array.from({ length: 2000 }, (_, i) =>
+        record('2301.' + String(i).padStart(5, '0'), 'filler', 'cs.LG')),
+      record('2402.99999', 'zymurgy', 'q-fin.TR', '10.76/overwritten-page-marker'),
+    ], []);
+    seeding.writeHarvestState({ status: 'complete', completed_at: '2024-02-16T00:00:00.000Z' });
+    seeding.close();
+    const raw = new Database(overwritten);
+    raw.pragma('wal_checkpoint(TRUNCATE)');
+    const pageSize = raw.pragma('page_size', { simple: true });
+    const bytes = readFileSync(overwritten);
+    const page = Math.floor(bytes.indexOf('10.76/overwritten-page-marker') / pageSize) + 1;
+    const owner = raw.prepare('SELECT name FROM dbstat WHERE pageno = ?').get(page)?.name ?? null;
+    raw.close();
+    const offset = (page - 1) * pageSize;
+    const length = Math.min(16 * pageSize, bytes.length - offset);
+    const fd = openSync(overwritten, 'r+');
+    writeSync(fd, Buffer.alloc(length, 0xff), 0, length, offset);
+    closeSync(fd);
+    const driverFailure = (fn) => {
+      try { fn(); return null; } catch (err) {
+        return { name: err.name, code: err.code, classified: isDriverError(err) };
+      }
+    };
+    const reading = await MirrorStore.openReader(overwritten);
+    const page1 = { limit: 2, offset: 0, sortBy: 'relevance', sortOrder: 'descending' };
+    report.overwrittenPage = {
+      owner,
+      opened: reading.status,
+      byId: driverFailure(() => reading.store.getPapersByIds(['2402.99999'])),
+      byTerm: driverFailure(() => reading.store.search({ ...page1, matchExpr: '"zymurgy"' })),
+      byCategory: driverFailure(() => reading.store.search({ ...page1, categoryGroups: [['q-fin.TR']] })),
+    };
+    reading.store.close();
 
     console.log(JSON.stringify(report));
   `;
@@ -1335,6 +1424,17 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
       afterWriter: 0,
       reader: { code: JsonRpcErrorCode.DatabaseError, cause: 'SQLITE_NOTADB' },
       afterReader: 0,
+    });
+  });
+
+  it('raises an overwritten page at query time as an error isDriverError takes as the driver’s (#76)', () => {
+    const corrupt = { name: 'SqliteError', code: 'SQLITE_CORRUPT', classified: true };
+    expect(report.overwrittenPage).toEqual({
+      owner: 'papers',
+      opened: 'open',
+      byId: corrupt,
+      byTerm: corrupt,
+      byCategory: corrupt,
     });
   });
 });

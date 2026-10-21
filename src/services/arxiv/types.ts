@@ -191,7 +191,8 @@ export interface PaperContent {
   /**
    * Set on an ar5iv body, which may be another revision than `paper_id`: ar5iv
    * keeps one render per paper. Absent on every other body, and on an
-   * unversioned read of a paper whose only version is v1. See issue #63.
+   * unversioned read whose live lookup found v1 the paper's only version; a
+   * mirror row's v1 can trail a later revision. See issues #63, #79.
    */
   revision_unconfirmed?: true;
   source: PaperContentSource;

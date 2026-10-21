@@ -51,7 +51,7 @@
         },
         {
           "name": "ARXIV_READ_TIMEOUT_MS",
-          "description": "Time budget for one arxiv_read_paper call — its metadata lookup and every content request and retry (ms).",
+          "description": "Time budget for one arxiv_read_paper call — its metadata lookup, every content request and retry, and PDF text extraction (ms).",
           "format": "string",
           "isRequired": false,
           "default": "50000"
@@ -111,7 +111,7 @@
         },
         {
           "name": "ARXIV_READ_TIMEOUT_MS",
-          "description": "Time budget for one arxiv_read_paper call — its metadata lookup and every content request and retry (ms).",
+          "description": "Time budget for one arxiv_read_paper call — its metadata lookup, every content request and retry, and PDF text extraction (ms).",
           "format": "string",
           "isRequired": false,
           "default": "50000"
