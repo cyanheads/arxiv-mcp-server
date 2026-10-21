@@ -1725,7 +1725,7 @@ export class ArxivService {
       if (!isDriverError(err)) throw err;
       ctx.log.warning('Mirror read failed for readContent metadata; using the live lookup', {
         paperId,
-        error: err instanceof Error ? err.message : String(err),
+        error: err.message,
       });
       return;
     }
