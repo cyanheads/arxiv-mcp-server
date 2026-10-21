@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.7.0](changelog/1.7.x/1.7.0.md) — 2026-10-21 · ⚠️ Breaking
+
+arxiv_read_paper extracts PDF text in a worker thread and now fails Timeout when extraction outlasts ARXIV_READ_TIMEOUT_MS. Mirror query errors and queries the mirror cannot answer as arXiv does go live; a hung arXiv API no longer times out reads the mirror can answer.
+
 ## [1.6.1](changelog/1.6.x/1.6.1.md) — 2026-10-18
 
 Moves mirror searches off the request thread, gives arxiv_read_paper one read deadline (ARXIV_READ_TIMEOUT_MS), makes the server's mirror connection query-only with one migrating writer at a time, and fixes the lookup and read paths around outages, stalled bodies, and superseded old-style versions.

@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-10-21 06:38:15
+Generated on: 2026-10-21 17:42:55
 
 ```text
 arxiv-mcp-server/
@@ -30,6 +30,7 @@ arxiv-mcp-server/
 │   ├── 1.4.x/
 │   ├── 1.5.x/
 │   ├── 1.6.x/
+│   ├── 1.7.x/
 │   └── template.md
 ├── claude-plans/
 ├── dev-logs/
