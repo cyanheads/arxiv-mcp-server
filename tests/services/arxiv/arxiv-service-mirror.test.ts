@@ -302,8 +302,8 @@ function seedBulk(count: number, term: string): void {
      FROM n`,
   ).run(count, term);
   db.prepare(
-    `INSERT INTO paper_categories(category, paper_id, updated)
-     SELECT 'cs.LG', id, updated FROM papers WHERE id LIKE 'bulk.%'`,
+    `INSERT INTO paper_categories(category, paper_id, updated, published)
+     SELECT 'cs.LG', id, updated, published FROM papers WHERE id LIKE 'bulk.%'`,
   ).run();
   db.close();
 }
@@ -1848,8 +1848,9 @@ describe('ArxivService — mirror integration', () => {
 
     // -----------------------------------------------------------------------
     // Issue #65 — a cat: or submittedDate: operand stays on the mirror only as
-    // a conjunct of the whole query under arXiv's precedence, where AND binds
-    // tighter than ANDNOT and OR. Every other shape goes live.
+    // a conjunct of the whole query under arXiv's grammar, where every operator
+    // shares one precedence grouped to the right (#82). Every other shape goes
+    // live.
     // -----------------------------------------------------------------------
 
     describe('boolean operators around cat: and submittedDate: operands (#65)', () => {
@@ -1928,7 +1929,7 @@ describe('ArxivService — mirror integration', () => {
           ['2403.10001'],
           '(cat:cs.LG OR cat:cs.AI) AND (cat:math.* OR (cat:math.* OR cat:math))',
         ],
-        // No cat: at all: AND binds tighter than ANDNOT, so this is
+        // No cat: at all: operators group to the right, so this is
         // alpha ∧ ¬(beta ∧ gamma), never (alpha ∧ ¬beta) ∧ gamma.
         ['alpha ANDNOT beta AND gamma', ['2403.20001', '2403.20002', '2403.20003']],
       ])(
@@ -2069,6 +2070,203 @@ describe('ArxivService — mirror integration', () => {
         const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
         expect(text).toContain('2402.99999v1');
         expect(text).toContain('From Live API');
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Issue #82 — the mirror reads a query with arXiv's grammar (adjacency is
+    // OR, one precedence grouped right, uppercase operators only) and sends
+    // what it cannot read that way live.
+    // -----------------------------------------------------------------------
+
+    describe("arXiv's query grammar on the mirror (#82)", () => {
+      beforeEach(async () => {
+        const store = await MirrorStore.open(configOverrides.mirrorPath);
+        const papers: [string, string][] = [
+          ['2404.10001', 'Quantum computing with qubits'],
+          ['2404.10002', 'Quantum annealing'],
+          ['2404.10003', 'Computing at scale'],
+          ['2404.10004', 'Quantum error correction'],
+          ['2404.10005', 'Distributed computing'],
+          // Unmatched filler, so each title word is rare enough for BM25 to weigh.
+          ...Array.from({ length: 10 }, (_, i): [string, string] => [
+            `2404.200${i + 10}`,
+            'Unrelated filler',
+          ]),
+        ];
+        store.applyBatch(
+          papers.map(([paper_id, title]) =>
+            mkRecord({ paper_id, title, abstract: 'Plain abstract.', categories: 'quant-ph' }),
+          ),
+          [],
+        );
+        store.close();
+      });
+
+      it('answers space-separated terms with every paper holding either, both-term papers first', async () => {
+        const result = await service.search(
+          'ti:quantum ti:computing',
+          { maxResults: 10, sortBy: 'relevance' },
+          createMockContext(),
+        );
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(result.total_results).toBe(5);
+        expect(result.papers[0]?.id).toBe('2404.10001v1');
+        expect(result.papers.map((p) => p.id.replace(/v\d+$/, '')).sort()).toEqual([
+          '2404.10001',
+          '2404.10002',
+          '2404.10003',
+          '2404.10004',
+          '2404.10005',
+        ]);
+        expect(result.effective_query).toBe('ti:quantum ti:computing');
+      });
+
+      it('answers AND with the papers holding every term', async () => {
+        const result = await service.search(
+          'ti:quantum AND ti:computing',
+          { maxResults: 10 },
+          createMockContext(),
+        );
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(result.papers.map((p) => p.id)).toEqual(['2404.10001v1']);
+      });
+
+      it('reports the widened mirror answer through the tool’s structured and text output', async () => {
+        initArxivService({ mirrorSearcher: searchInThread });
+        const result = await runToolContract(arxivSearchPapers, {
+          query: 'quantum computing',
+          max_results: 10,
+        });
+
+        expect(result.isError, JSON.stringify(result)).toBeFalsy();
+        expect(mockFetch).not.toHaveBeenCalled();
+        const structured = result.structuredContent as {
+          papers: { id: string; title: string }[];
+          totalFound: number;
+        };
+        expect(structured.totalFound).toBe(5);
+        expect(structured.papers[0]?.title).toBe('Quantum computing with qubits');
+        const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(text).toContain('Quantum annealing');
+        expect(text).toContain('Distributed computing');
+      });
+
+      it.each([
+        ['ti: quantum', 'empty_field_value'],
+        ['cat: quantum', 'empty_field_value'],
+        ['quantum AND ti:', 'empty_field_value'],
+        ['ti:""', 'empty_field_value'],
+        ['""', 'empty_phrase'],
+        ['()', 'empty_query'],
+        ['rn:CERN', 'field_not_in_mirror'],
+        ['id:2401.12345', 'field_not_in_mirror'],
+        ['quantum cat:quant-ph', 'filter_not_conjunct'],
+        // A category filter naming no code: the mirror would drop it and answer
+        // with every quantum paper, in any category.
+        ['quantum AND cat:zzz*', 'empty_category'],
+        ['cat:zzz.*', 'empty_category'],
+        // A word arXiv's index drops: beside OR the mirror would match every
+        // paper holding it, where arXiv matches next to none.
+        ['(quantum of computing) AND ti:annealing', 'stopword_term'],
+        ['ti:quantum and ti:computing', 'stopword_term'],
+        // A date filter the mirror cannot apply, read as terms it would match on.
+        ['ti:quantum AND (lastUpdatedDate:[202410010000 TO 202410012359])', 'field_not_in_mirror'],
+        ['ti:quantum AND submittedDate:[2024 TO 2025]', 'field_not_in_mirror'],
+      ])('sends %s to the live API without consulting the mirror (%s)', async (query, reason) => {
+        serveLivePaper();
+        const stateSpy = vi.spyOn(MirrorStore.prototype, 'readHarvestState');
+        const probeSpy = vi.spyOn(MirrorStore.prototype, 'matchReachesCap');
+        const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+        try {
+          const ctx = createMockContext();
+          const info = vi.spyOn(ctx.log, 'info');
+          const result = await service.search(query, { maxResults: 5 }, ctx);
+          expect(mockFetch).toHaveBeenCalledTimes(1);
+          const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+          expect(url.searchParams.get('search_query')).toBe(query);
+          expect(result.papers.map((p) => p.id)).toEqual(['2402.99999v1']);
+          expect(info).toHaveBeenCalledWith(
+            'The mirror cannot answer this query as arXiv does; not using it',
+            { query, reason },
+          );
+          expect(stateSpy).not.toHaveBeenCalled();
+          expect(probeSpy).not.toHaveBeenCalled();
+          expect(searchSpy).not.toHaveBeenCalled();
+        } finally {
+          stateSpy.mockRestore();
+          probeSpy.mockRestore();
+          searchSpy.mockRestore();
+        }
+      });
+
+      it.each([
+        'ti: quantum',
+        '""',
+        '()',
+        'rn:CERN',
+        'quantum AND cat:zzz*',
+        '(quantum of computing) AND ti:annealing',
+        'ti:quantum AND (lastUpdatedDate:[202410010000 TO 202410012359])',
+      ])('returns a failed recency bypass for %s, never a mirror answer', async (query) => {
+        configOverrides.mirrorRecentDaysLive = 2;
+        mockFetch.mockResolvedValue(
+          new Response('Rate exceeded.', {
+            status: 200,
+            headers: { 'content-type': 'text/plain' },
+          }),
+        );
+        const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+        try {
+          await expect(
+            service.search(
+              query,
+              { maxResults: 5, sortBy: 'submitted', sortOrder: 'descending' },
+              createMockContext(),
+            ),
+          ).rejects.toMatchObject({
+            code: JsonRpcErrorCode.RateLimited,
+            data: { reason: 'rate_limited' },
+          });
+          expect(mockFetch).toHaveBeenCalledTimes(1);
+          expect(searchSpy).not.toHaveBeenCalled();
+        } finally {
+          searchSpy.mockRestore();
+        }
+      });
+
+      it.each([
+        'ti: quantum',
+        '""',
+        '()',
+        'rn:CERN',
+        'quantum AND cat:zzz*',
+        '(quantum of computing) AND ti:annealing',
+        'ti:quantum AND (lastUpdatedDate:[202410010000 TO 202410012359])',
+      ])('refuses start 10,000 for %s before any request', async (query) => {
+        await expect(
+          service.search(query, { start: 10_000 }, createMockContext()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason: 'start_beyond_result_limit' },
+        });
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+
+      it('reports the live answer to an rn: query through the tool’s structured and text output', async () => {
+        serveLivePaper();
+        initArxivService({ mirrorSearcher: searchInThread });
+        const result = await runToolContract(arxivSearchPapers, {
+          query: 'rn:CERN',
+          max_results: 10,
+        });
+
+        expect(result.isError, JSON.stringify(result)).toBeFalsy();
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        const structured = result.structuredContent as { papers: { id: string }[] };
+        expect(structured.papers.map((p) => p.id)).toEqual(['2402.99999v1']);
+        const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(text).toContain('2402.99999v1');
       });
     });
 
@@ -2479,6 +2677,100 @@ describe('ArxivService — mirror integration', () => {
         const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
         expect(text).toContain('1025313');
         expect(text).toContain('From Live API');
+      }, 30_000);
+    });
+
+    // A search without a free-text term, one category code aside, stops its
+    // count at the cap and stays on the mirror, flagging the total as a floor.
+    describe('a term-less count that stops at the cap (#78)', () => {
+      const textOf = (result: { content: { type: string; text?: string }[] }): string =>
+        result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+
+      it('flags a capped archive count on both surfaces of arxiv_search_papers, through start 10,000', async () => {
+        seedBulk(50_000, 'ubiquitous');
+        initArxivService();
+
+        const first = await runToolContract(arxivSearchPapers, { query: 'cat:cs', max_results: 5 });
+        expect(first.isError, JSON.stringify(first)).toBeFalsy();
+        expect(first.structuredContent).toMatchObject({
+          totalFound: 50_000,
+          totalFoundIsLowerBound: true,
+          truncated: true,
+          shown: 5,
+        });
+        const notice = (first.structuredContent as { notice: string }).notice;
+        expect(notice).toContain('50000 or more total matches');
+        expect(notice).toContain('only the first 10005 are reachable');
+        expect(textOf(first)).toContain('**Total Found Is Lower Bound:** true');
+        expect(textOf(first)).toContain('50000 or more total matches');
+
+        // The deepest page the schema accepts still holds a full page of papers.
+        const deepest = await runToolContract(arxivSearchPapers, {
+          query: 'cat:cs',
+          start: 10_000,
+          max_results: 50,
+        });
+        expect(deepest.isError, JSON.stringify(deepest)).toBeFalsy();
+        const structured = deepest.structuredContent as {
+          notice: string;
+          papers: unknown[];
+          totalFoundIsLowerBound?: true;
+        };
+        expect(structured.papers).toHaveLength(50);
+        expect(structured.totalFoundIsLowerBound).toBe(true);
+        expect(structured.notice).toContain('50000 or more total matches');
+        expect(structured.notice).not.toContain('exceeds total results');
+        expect(mockFetch).not.toHaveBeenCalled();
+      }, 30_000);
+
+      it('sets total_is_lower_bound for a window alone and for two category groups', async () => {
+        // One more than the cap, so an exact count (50,001 in the window) is
+        // told apart from one that stopped at the cap.
+        seedBulk(50_001, 'ubiquitous');
+        const ctx = createMockContext();
+
+        const byDate = await service.search(
+          'submittedDate:[202301010000 TO 202401010000]',
+          { maxResults: 2 },
+          ctx,
+        );
+        // 50,002 papers carry cs.LG and a code under cs: two groups, capped.
+        const twoGroups = await service.search('cat:cs', { maxResults: 2, category: 'cs.LG' }, ctx);
+
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(byDate).toMatchObject({ total_results: 50_000, total_is_lower_bound: true });
+        expect(byDate.papers).toHaveLength(2);
+        expect(twoGroups).toMatchObject({ total_results: 50_000, total_is_lower_bound: true });
+        expect(twoGroups.papers).toHaveLength(2);
+      }, 30_000);
+
+      it('leaves the flag off an exact count: one code, a group under the cap, and a live total', async () => {
+        const ctx = createMockContext();
+        const underCap = await service.search('cat:cs', { maxResults: 2 }, ctx);
+        expect(underCap.total_results).toBe(1);
+        expect(underCap).not.toHaveProperty('total_is_lower_bound');
+
+        seedBulk(50_000, 'ubiquitous');
+        mockFetch.mockResolvedValueOnce(atomResponse(ATOM_AT_CAP));
+        initArxivService();
+        const byCode = await runToolContract(arxivSearchPapers, {
+          query: 'cat:cs.LG',
+          max_results: 2,
+        });
+        const live = await runToolContract(arxivSearchPapers, {
+          query: 'ubiquitous',
+          max_results: 1,
+        });
+
+        expect(byCode.structuredContent).toMatchObject({ totalFound: 50_001 });
+        expect(live.structuredContent).toMatchObject({ totalFound: 1_025_313 });
+        for (const result of [byCode, live]) {
+          expect(result.isError, JSON.stringify(result)).toBeFalsy();
+          expect(result.structuredContent).not.toHaveProperty('totalFoundIsLowerBound');
+          expect(textOf(result)).not.toContain('Lower Bound');
+          expect(textOf(result)).not.toContain('or more');
+        }
+        expect(mockFetch).toHaveBeenCalledTimes(1);
       }, 30_000);
     });
   });
@@ -3050,9 +3342,11 @@ describe('ArxivService — mirror integration', () => {
         const deep = await viaWorker.search('cat:cs.LG', { start: 10_000, maxResults: 3 }, ctx);
 
         expect(mockFetch).not.toHaveBeenCalled();
-        // The bulk papers, plus the seeded cs.LG paper where the filter reaches it.
+        // The bulk papers, plus the seeded cs.LG paper where the filter reaches
+        // it. One code counts exactly; a whole archive and a window stop at the
+        // cap (#78).
         expect(byCode.total_results).toBe(50_001);
-        expect(byArchive.total_results).toBe(50_001);
+        expect(byArchive.total_results).toBe(50_000);
         expect(byDate.total_results).toBe(50_000);
         expect(deep).toMatchObject({ start: 10_000, total_results: 50_001 });
         expect(deep.papers).toHaveLength(3);
@@ -3085,7 +3379,8 @@ describe('ArxivService — mirror integration', () => {
 
       expect(mockFetch).not.toHaveBeenCalled();
       expect(offThread.result).toEqual(onThread.result);
-      expect(offThread.result).toMatchObject({ total_results: 50_001 });
+      // 50,001 papers in the archive: the count stops at the cap (#78).
+      expect(offThread.result).toMatchObject({ total_results: 50_000 });
       // The same search on the request thread holds the timer until it returns.
       expect(onThread.ticks).toBe(0);
       expect(offThread.ticks).toBeGreaterThan(0);
@@ -3563,8 +3858,8 @@ describe('ArxivService — mirror integration', () => {
                    '2024-02-15T00:00:00.000Z', ?)`,
         ).run(MARKER_DOI);
         db.prepare(
-          `INSERT INTO paper_categories(category, paper_id, updated)
-           VALUES ('q-fin.TR', '2402.99999', '2024-02-15T00:00:00.000Z')`,
+          `INSERT INTO paper_categories(category, paper_id, updated, published)
+           VALUES ('q-fin.TR', '2402.99999', '2024-02-15T00:00:00.000Z', '2024-02-15T00:00:00.000Z')`,
         ).run();
         db.run('PRAGMA wal_checkpoint(TRUNCATE)');
         const { page_size: pageSize } = db.query('PRAGMA page_size').get() as { page_size: number };

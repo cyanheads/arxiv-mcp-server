@@ -264,6 +264,16 @@ async function serverErrorFailure(
   return signal.aborted ? requestFailure(signal.reason, ctx, site, deadline) : failure;
 }
 
+/**
+ * What the PDF rung found: no PDF (arXiv answered a 4xx other than 429), a PDF
+ * the parser could not read, or the text extracted from one, which is empty
+ * when the PDF has no text layer.
+ */
+type PdfRungOutcome =
+  | { kind: 'absent' }
+  | { cause: McpError; kind: 'unparseable' }
+  | { kind: 'text'; text: string };
+
 // ---------------------------------------------------------------------------
 // Raw XML types (fast-xml-parser output shapes)
 // ---------------------------------------------------------------------------
@@ -948,10 +958,11 @@ async function tryReadyMirror(
  * set instead of silently widening it.
  *
  * The caller's query is wrapped in parens so every appended `AND` scopes to the
- * whole expression. Without them arXiv's parser binds `AND` tighter than the
- * implicit conjunction between bare terms — "mixture of experts AND cat:cs.CL"
- * parses as "mixture ∧ of ∧ (experts AND cat:cs.CL)", leaking earlier terms
- * across all categories.
+ * whole expression. Without them arXiv's parser, which joins adjacent terms with
+ * `OR` and groups every operator to the right, would attach the clause to the
+ * last operand alone — "mixture of experts AND cat:cs.CL" parses as
+ * "mixture OR (of OR (experts AND cat:cs.CL))", leaking earlier terms across all
+ * categories (issue #82).
  *
  * Any `cat:` operand the caller wrote is expanded to its subtree first, so it
  * carries the meaning the mirror has always given it and the tool's `query`
@@ -1219,7 +1230,9 @@ export class ArxivService {
    * matches at least {@link MIRROR_SEARCH_MATCH_CAP} papers — the caller answers
    * it from the live API instead, whose total is arXiv's own exact count. Only a
    * free-text term is probed; a category- or date-only search keeps its
-   * index-backed mirror path (#19, #49). `undefined` too when the reader
+   * index-backed mirror path (#19, #49), and unless it filters on one category
+   * code alone, its count stops at the cap and the result carries
+   * `total_is_lower_bound` (#78). `undefined` too when the reader
    * worker's own open finds the file not ready or throws, each reported as the
    * request thread's open reports it, and when SQLite raises during the probe
    * or the search, logged as a warning (#76).
@@ -1306,10 +1319,11 @@ export class ArxivService {
       reportMirrorOpenFailed(ctx, outcome.error);
       return;
     }
-    const { papers, total } = outcome;
+    const { papers, total, totalIsLowerBound } = outcome;
     ctx.log.info('Mirror search', {
       query,
       total,
+      totalIsLowerBound,
       returned: papers.length,
       matchExpr: translated.matchExpr,
       categoryGroups,
@@ -1318,6 +1332,7 @@ export class ArxivService {
     });
     return {
       total_results: total,
+      ...(totalIsLowerBound && { total_is_lower_bound: true }),
       start: offset,
       papers: papers.map(rowToMetadata),
       effective_query: effectiveQuery,
@@ -2026,47 +2041,56 @@ export class ArxivService {
     }
 
     // Last rung: the PDF, extracted to plain text.
-    const pdfText = await this.fetchPdfText(paper, ctx, deadline);
-    if (pdfText !== undefined && pdfText.trim() !== '') {
-      return { content: pdfText, source: 'pdf_text', url: paper.pdf_url };
+    const pdf = await this.fetchPdfText(paper, ctx, deadline);
+    if (pdf.kind === 'text' && pdf.text.trim() !== '') {
+      return { content: pdf.text, source: 'pdf_text', url: paper.pdf_url };
     }
     // The PDF did not cover for ar5iv, so report what ar5iv did rather than a
     // verdict about the paper's artifacts that ar5iv never answered.
     if (ar5ivFailure) throw ar5ivFailure;
-    if (pdfText === undefined) {
-      throw notFound(
-        `No readable content for paper '${paperId}': neither arxiv.org/html nor ar5iv has an HTML render, and arXiv served no PDF at ${paper.pdf_url}.`,
-        {
-          paperId,
-          pdfUrl: paper.pdf_url,
-          reason: 'content_unavailable',
-        },
-      );
+    const data = { paperId, pdfUrl: paper.pdf_url };
+    switch (pdf.kind) {
+      case 'absent':
+        throw notFound(
+          `No readable content for paper '${paperId}': neither arxiv.org/html nor ar5iv has an HTML render, and arXiv served no PDF at ${paper.pdf_url}.`,
+          { ...data, reason: 'content_unavailable' },
+        );
+      case 'unparseable':
+        throw notFound(
+          `Paper '${paperId}' has no HTML render, and its PDF could not be parsed — the file arXiv served is damaged, truncated, or not a PDF. Download it at ${paper.pdf_url}.`,
+          { ...data, reason: 'pdf_extraction_failed' },
+          { cause: pdf.cause },
+        );
+      case 'text':
+        throw notFound(
+          `Paper '${paperId}' has no HTML render, and its PDF yielded no extractable text — the file is image-only (scanned) or carries no text layer. Download it at ${paper.pdf_url}.`,
+          { ...data, reason: 'pdf_extraction_failed' },
+        );
     }
-    throw notFound(
-      `Paper '${paperId}' has no HTML render, and its PDF yielded no extractable text — the file is image-only (scanned) or carries no text layer. Download it at ${paper.pdf_url}.`,
-      {
-        paperId,
-        pdfUrl: paper.pdf_url,
-        reason: 'pdf_extraction_failed',
-      },
-    );
   }
 
   /**
    * Download the paper's PDF and extract its text with the service's
    * `PdfTextExtractor` (the framework's `pdfParser`, lazy-loaded `unpdf`, in a
-   * worker thread by default). Returns `undefined` when arXiv answers
-   * that it has no PDF (4xx other than 429), so the caller can distinguish "no
-   * artifact at all" from "PDF held no extractable text" and report the one
-   * that happened. A 429 is not an absent artifact — it is the same throttle
+   * worker thread by default). Reports what it found as a `PdfRungOutcome`, so
+   * the caller can tell "no artifact at all" (`absent`: arXiv answered a 4xx
+   * other than 429) from "a PDF with no text this tool can read" and report the
+   * one that happened. A 429 is not an absent artifact — it is the same throttle
    * `fetchApi` classifies, so it is raised as `rate_limited` rather than
    * collapsing into a `content_unavailable` that would tell the caller the
    * paper has no full text.
    *
+   * A PDF the parser rejects (`data.reason` `pdf_text_extract_failed`: a damaged
+   * or truncated file, an empty body, an HTML page in its place) is `unparseable`
+   * rather than a throw, so it yields to a failure ar5iv is holding as an empty
+   * text layer does. See #81. Every other extraction failure is raised: a worker
+   * that died before replying (`ServiceUnavailable`, replayed), a missing
+   * `unpdf` peer.
+   *
    * The extraction holds no other request and draws on the read's deadline like
    * every request: past it, the worker is terminated and the read fails with
-   * `Timeout`; a cancelled read ends it the same way. See #73.
+   * `Timeout`; a cancelled read ends it the same way. Both are checked before
+   * the extraction's own failure is read. See #73.
    *
    * The extracted string is plain text: prose survives intact, while math,
    * tables, and heading structure flatten into the reading order the PDF
@@ -2076,7 +2100,7 @@ export class ArxivService {
     paper: PaperMetadata,
     ctx: Context,
     deadline: ReadDeadline,
-  ): Promise<string | undefined> {
+  ): Promise<PdfRungOutcome> {
     const config = getServerConfig();
     const site = {
       label: 'arXiv PDF',
@@ -2116,15 +2140,18 @@ export class ArxivService {
           retryable: true,
         });
       }
-      return;
+      return { kind: 'absent' };
     }
 
     try {
-      return await this.pdfTextExtractor(bytes, callSignal(ctx, deadline));
+      return { kind: 'text', text: await this.pdfTextExtractor(bytes, callSignal(ctx, deadline)) };
     } catch (err) {
       if (ctx.signal.aborted) throw ctx.signal.reason;
       if (deadline.signal.aborted) {
         throw deadline.exceeded('its PDF text extraction had not finished');
+      }
+      if (err instanceof McpError && err.data?.reason === 'pdf_text_extract_failed') {
+        return { kind: 'unparseable', cause: err };
       }
       throw err;
     }

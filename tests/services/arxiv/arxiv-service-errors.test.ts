@@ -698,11 +698,15 @@ type Host = 'api' | 'html' | 'ar5iv' | 'pdf';
 /**
  * How a host answers: hangs before its headers, stalls after them, has no copy
  * (404; a 307 on ar5iv), is down (503), serves a copy holding none of the paper
- * (an empty article; an image-only PDF), or serves the paper.
+ * (an empty article; an image-only PDF), serves the paper, or (the PDF host
+ * only) serves a file the PDF parser cannot read.
  */
-type HostBehavior = 'hang' | 'stall' | 'miss' | '503' | 'placeholder' | 'ok';
+type HostBehavior = 'hang' | 'stall' | 'miss' | '503' | 'placeholder' | 'ok' | 'unparseable';
 
 const MATRIX_BEHAVIORS = ['hang', 'stall', 'miss', '503', 'placeholder'] as const;
+
+/** A file that starts like a PDF and has none of its structure: the PDF parser rejects it. */
+const UNPARSEABLE_PDF = '%PDF-1.4\nnot a document\n%%EOF\n';
 
 const SECTIONED_PAGE =
   '<html><body><article class="ltx_document"><h2 class="ltx_title ltx_title_section">1 Introduction</h2><p class="ltx_p">Paper text.</p></article></body></html>';
@@ -735,6 +739,11 @@ function answer(
     case 'ok':
       if (host === 'api') return atomResponse(ATOM_SINGLE);
       return host === 'pdf' ? pdfResponse('served from the PDF') : htmlResponse(SECTIONED_PAGE);
+    case 'unparseable':
+      return new Response(new TextEncoder().encode(UNPARSEABLE_PDF), {
+        status: 200,
+        headers: { 'content-type': contentType },
+      });
   }
 }
 
@@ -1058,14 +1067,15 @@ describe('fake clock suites', () => {
       expect(read.elapsedMs).toBe(50_000);
     });
 
-    it('settles every combination of hung, stalled, absent, unavailable, and placeholder hosts by the deadline', async () => {
+    it('settles every combination of hung, stalled, absent, unavailable, and placeholder hosts, and an unparseable PDF, by the deadline', async () => {
       const { Timeout, ServiceUnavailable, NotFound } = JsonRpcErrorCode;
       const slow = (behavior: HostBehavior) => behavior === 'hang' || behavior === 'stall';
       /**
        * What each combination fails with, and when: a slow rung times out at the
        * content timeout (an ar5iv one is held for the PDF), a 503 is replayed once
        * after a 1.5–2.5 s backoff, and an ar5iv timeout followed by a slow or
-       * unavailable PDF runs into the deadline.
+       * unavailable PDF runs into the deadline. A PDF the parser cannot read ends
+       * the chain as an image-only one does (#81).
        */
       const expected = (
         html: HostBehavior,
@@ -1083,7 +1093,7 @@ describe('fake clock suites', () => {
       let combinations = 0;
       for (const html of MATRIX_BEHAVIORS) {
         for (const ar5iv of MATRIX_BEHAVIORS) {
-          for (const pdf of MATRIX_BEHAVIORS) {
+          for (const pdf of [...MATRIX_BEHAVIORS, 'unparseable'] as const) {
             mockFetch.mockClear();
             initArxivService({ pdfTextExtractor: extractInThread });
             stubHosts({ html, ar5iv, pdf });
@@ -1106,8 +1116,36 @@ describe('fake clock suites', () => {
           }
         }
       }
-      expect(combinations).toBe(125);
+      expect(combinations).toBe(150);
     }, 180_000);
+
+    it('fails with the deadline, not pdf_extraction_failed, when the extraction it cut short rejects as unparseable', async () => {
+      stubHosts({ html: 'miss', ar5iv: 'miss', pdf: 'ok' });
+      // An extraction that answers the deadline's abort with the parser's own failure.
+      initArxivService({
+        pdfTextExtractor: (_bytes, signal) =>
+          new Promise<string>((_resolve, reject) =>
+            onAbort(signal, () =>
+              reject(
+                new McpError(
+                  JsonRpcErrorCode.InternalError,
+                  'Failed to extract text from PDF: Invalid PDF structure.',
+                  { reason: 'pdf_text_extract_failed' },
+                ),
+              ),
+            ),
+          ),
+      });
+
+      const read = await settle(readPaper);
+
+      expect(read.error).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        message: `${DEADLINE_PREFIX}its PDF text extraction had not finished.`,
+      });
+      expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf']);
+      expect(read.elapsedMs).toBe(50_000);
+    });
 
     it('serves a healthy read with its two requests and leaves nothing behind to fire', async () => {
       stubHosts({ html: 'ok' });
@@ -1376,4 +1414,97 @@ describe('ArxivService.readContent — PDF text extraction in a worker (#73)', (
       vi.useRealTimers();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// A PDF the parser cannot read, through the tool (#81); real workers, real clock
+// ---------------------------------------------------------------------------
+
+describe('arxiv_read_paper — a PDF the parser cannot read (#81)', () => {
+  interface WireError {
+    code: number;
+    data: {
+      paperId?: string;
+      pdfUrl?: string;
+      reason?: string;
+      recovery?: { hint: string };
+      retryable?: boolean;
+    };
+    message: string;
+  }
+
+  const contract = arxivReadPaper.errors?.find((e) => e.reason === 'pdf_extraction_failed');
+
+  async function readThroughTool() {
+    const result = await runToolContract(arxivReadPaper, { paper_id: '2401.12345' });
+    expect(result.isError).toBe(true);
+    const error = (result.structuredContent as { error: WireError }).error;
+    const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+    return { error, text };
+  }
+
+  it('declares one entry for both causes, with a recovery that fits each', () => {
+    expect(contract).toMatchObject({ code: JsonRpcErrorCode.NotFound, severity: 'notice' });
+    expect(contract).not.toHaveProperty('retryable', true);
+    expect(contract?.when).toContain('no text layer');
+    expect(contract?.when).toContain('cannot read');
+    expect(contract?.recovery).toContain('arxiv_get_metadata');
+    expect(contract?.recovery).toContain('error.data.pdfUrl');
+    // OCR is offered for the image-only cause alone, beside a remedy for the unparseable one.
+    expect(contract?.recovery).toContain('optical character recognition for an image-only PDF');
+    expect(contract?.recovery).toContain('a PDF repair tool for one that does not parse');
+  });
+
+  it('puts pdf_extraction_failed, its recovery, paperId, and pdfUrl on both surfaces', async () => {
+    stubHosts({ html: 'miss', ar5iv: 'miss', pdf: 'unparseable' });
+
+    const { error, text } = await readThroughTool();
+
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.message).toBe(
+      "Paper '2401.12345v1' has no HTML render, and its PDF could not be parsed — the file arXiv served is damaged, truncated, or not a PDF. Download it at http://arxiv.org/pdf/2401.12345v1.",
+    );
+    expect(error.data).toMatchObject({
+      reason: 'pdf_extraction_failed',
+      paperId: '2401.12345v1',
+      pdfUrl: 'http://arxiv.org/pdf/2401.12345v1',
+      recovery: { hint: contract?.recovery },
+    });
+    expect(error.data.retryable).not.toBe(true);
+    expect(text).toContain(error.message);
+    expect(text).toContain(contract?.recovery ?? '<missing>');
+    expect(text).toContain('pdf_extraction_failed');
+    expect(text).not.toContain('pdf_text_extract_failed');
+    expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf']);
+  });
+
+  it('gives a PDF with no text layer the same reason and recovery under its own message', async () => {
+    stubHosts({ html: 'miss', ar5iv: 'miss', pdf: 'placeholder' });
+
+    const { error, text } = await readThroughTool();
+
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.message).toBe(
+      "Paper '2401.12345v1' has no HTML render, and its PDF yielded no extractable text — the file is image-only (scanned) or carries no text layer. Download it at http://arxiv.org/pdf/2401.12345v1.",
+    );
+    expect(error.data).toMatchObject({
+      reason: 'pdf_extraction_failed',
+      recovery: { hint: contract?.recovery },
+    });
+    expect(text).toContain(contract?.recovery ?? '<missing>');
+    expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf']);
+  });
+
+  it('reports a held ar5iv outage ahead of an unparseable PDF on both surfaces, after one replay', async () => {
+    stubHosts({ html: 'miss', ar5iv: '503', pdf: 'unparseable' });
+
+    const { error, text } = await readThroughTool();
+
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.message).toBe('ar5iv returned HTTP 503. (failed after 2 attempts)');
+    expect(error.data.reason).toBeUndefined();
+    expect(text).toContain(error.message);
+    expect(text).not.toContain(contract?.recovery ?? '<missing>');
+    expect(requestedHosts()).toEqual(['api', 'html', 'ar5iv', 'pdf', 'html', 'ar5iv', 'pdf']);
+  }, 30_000);
 });

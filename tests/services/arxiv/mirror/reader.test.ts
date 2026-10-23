@@ -4,7 +4,7 @@
  * Covers its lifecycle (started by the first search, reused, never holding the
  * process open, replaced after a crash or a failed open, terminated on close),
  * cancellation, errors crossing the thread, and answers equal to the in-thread
- * search. Workers are real; `node:worker_threads` is wrapped only to record
+ * search, the count's lower-bound flag included (#78). Workers are real; `node:worker_threads` is wrapped only to record
  * each worker started and each message posted to one.
  * @module services/arxiv/mirror/reader.test
  */
@@ -87,8 +87,8 @@ function seedBulk(path: string, count: number, term: string): void {
      FROM n`,
   ).run(count, term);
   db.prepare(
-    `INSERT INTO paper_categories(category, paper_id, updated)
-     SELECT 'cs.LG', id, updated FROM papers WHERE id LIKE 'bulk.%'`,
+    `INSERT INTO paper_categories(category, paper_id, updated, published)
+     SELECT 'cs.LG', id, updated, published FROM papers WHERE id LIKE 'bulk.%'`,
   ).run();
   db.close();
 }
@@ -182,14 +182,50 @@ describe('searchInWorker (#58)', () => {
 
     expect(answers[0]).toMatchObject({ status: 'searched', total: 12 });
     expect(answers[1]).toMatchObject({ status: 'searched' });
-    expect(answers[6]).toEqual({ status: 'searched', papers: [], total: 12 });
+    expect(answers[6]).toEqual({
+      status: 'searched',
+      papers: [],
+      total: 12,
+      totalIsLowerBound: false,
+    });
     expect(answers[7]).toEqual({ status: 'over_cap' });
-    expect(answers[8]).toMatchObject({ status: 'searched', total: MIRROR_SEARCH_MATCH_CAP + 3 });
+    // One code counts exactly past the cap (#78).
+    expect(answers[8]).toMatchObject({
+      status: 'searched',
+      total: MIRROR_SEARCH_MATCH_CAP + 3,
+      totalIsLowerBound: false,
+    });
     const ascending = answers[1]?.status === 'searched' ? answers[1].papers : [];
     expect(ascending).toHaveLength(5);
     expect(ascending.map((p) => p.published)).toEqual(
       [...ascending.map((p) => p.published)].sort(),
     );
+  });
+
+  it('carries whether the total stopped at the cap across the thread (#78)', async () => {
+    const cases: [
+      ReadyMirror,
+      MirrorSearchOptions,
+      { total: number; totalIsLowerBound: boolean },
+    ][] = [
+      [bulk, ARCHIVE_SEARCH, { total: MIRROR_SEARCH_MATCH_CAP, totalIsLowerBound: true }],
+      [
+        bulk,
+        page({ categoryGroups: [['cs.LG']], sortBy: 'published' }),
+        { total: MIRROR_SEARCH_MATCH_CAP + 3, totalIsLowerBound: false },
+      ],
+      [
+        small,
+        page({ categoryGroups: [['cs.LG', 'cs.AI']] }),
+        { total: 6, totalIsLowerBound: false },
+      ],
+    ];
+    for (const [mirror, options, count] of cases) {
+      const viaWorker = await searchInWorker(mirror, options, live());
+      expect(viaWorker).toEqual(await searchInThread(mirror, options, live()));
+      expect(viaWorker).toMatchObject({ status: 'searched', ...count });
+      expect(viaWorker.status === 'searched' && viaWorker.papers).toHaveLength(5);
+    }
   });
 
   it('carries an fts5 error raised in the worker with its message intact', async () => {
@@ -236,6 +272,7 @@ describe('searchInWorker (#58)', () => {
       status: 'searched',
       papers: [],
       total: 0,
+      totalIsLowerBound: false,
     });
     expect(tracked.workers.length).toBe(before + 2);
   });
@@ -297,9 +334,11 @@ describe('searchInWorker (#58)', () => {
       message: 'The mirror reader stopped before answering this search; retry it.',
       data: { exitCode: expect.any(Number) },
     });
+    // An unfiltered search counts up to the cap (#78).
     await expect(searchInWorker(bulk, page(), live())).resolves.toMatchObject({
       status: 'searched',
-      total: MIRROR_SEARCH_MATCH_CAP + 12,
+      total: MIRROR_SEARCH_MATCH_CAP,
+      totalIsLowerBound: true,
     });
     expect(tracked.workers.at(-1)).not.toBe(worker);
   });
@@ -379,8 +418,12 @@ describe('searchInWorker (#58)', () => {
       // Settled before the worker answered: the search queued behind it, posted
       // only once that answer arrives, had not been posted yet.
       expect(postsWhenSettled).toBe(postsBeforeReply);
-      // The bulk papers, plus the cs.LG and cs.AI lattice papers.
-      expect(await next).toMatchObject({ status: 'searched', total: MIRROR_SEARCH_MATCH_CAP + 6 });
+      // The bulk papers, plus the cs.LG and cs.AI lattice papers: past the cap (#78).
+      expect(await next).toMatchObject({
+        status: 'searched',
+        total: MIRROR_SEARCH_MATCH_CAP,
+        totalIsLowerBound: true,
+      });
       expect(order).toEqual(['cancelled', 'next']);
       // The cancelled search had been posted; the worker ran it, then the next one.
       expect(tracked.posts.slice(-2)).toEqual([ARCHIVE_SEARCH, ARCHIVE_SEARCH]);
@@ -426,7 +469,8 @@ describe('searchInWorker (#58)', () => {
        await searchInWorker(mirror, search, new AbortController().signal);
        // Not awaited: the waiting caller alone must keep the process alive for the answer.
        searchInWorker(mirror, search, new AbortController().signal)
-         .then((outcome) => console.log('answered', outcome.status, outcome.total));
+         .then((outcome) =>
+           console.log('answered', outcome.status, outcome.total, outcome.totalIsLowerBound));
        opened.store.close();`,
     );
     const child = spawn(process.execPath, [script], {
@@ -448,7 +492,7 @@ describe('searchInWorker (#58)', () => {
       });
     });
 
-    expect(stdout.trim()).toBe(`answered searched ${MIRROR_SEARCH_MATCH_CAP + 6}`);
+    expect(stdout.trim()).toBe(`answered searched ${MIRROR_SEARCH_MATCH_CAP} true`);
     expect(exitCode).toBe(0);
   }, 30_000);
 });

@@ -24,9 +24,15 @@ import {
   MIRROR_PRAGMA_STATEMENTS,
   MIRROR_SCHEMA_STATEMENTS,
   MIRROR_SCHEMA_VERSION,
+  MIRROR_V4_STATEMENTS,
   MIRROR_WRITE_INDEX_SQL,
 } from '@/services/arxiv/mirror/schema.js';
-import { isDriverError, MirrorStore, rawToRow } from '@/services/arxiv/mirror/store.js';
+import {
+  isDriverError,
+  MIRROR_SEARCH_MATCH_CAP,
+  MirrorStore,
+  rawToRow,
+} from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
 
 const mkRecord = (overrides: Partial<ArxivRawRecord> = {}): ArxivRawRecord => ({
@@ -160,6 +166,60 @@ function schemaNames(path: string, type: 'table' | 'trigger'): string[] {
 }
 const tableNames = (path: string) => schemaNames(path, 'table');
 const triggerNames = (path: string) => schemaNames(path, 'trigger');
+
+/** The SQL of every statement `fn` prepares through `bun:sqlite`, in order. */
+function preparedBy(fn: () => unknown): string[] {
+  const prepared = vi.spyOn(Database.prototype, 'prepare');
+  try {
+    fn();
+    return prepared.mock.calls.map(([sql]) => String(sql));
+  } finally {
+    prepared.mockRestore();
+  }
+}
+
+/** Every statement `fn` runs through `bun:sqlite`, with the values bound to it, in order. */
+function boundBy(fn: () => unknown): { params: unknown[]; sql: string }[] {
+  const runs: { params: unknown[]; sql: string }[] = [];
+  const prepare = Database.prototype.prepare;
+  const prepared = vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (
+    this: Database,
+    sql: string,
+  ) {
+    const statement = prepare.call(this, sql);
+    for (const method of ['all', 'get', 'run'] as const) {
+      const call = statement[method].bind(statement) as (...params: unknown[]) => unknown;
+      Object.assign(statement, {
+        [method]: (...params: unknown[]) => {
+          runs.push({ params, sql });
+          return call(...params);
+        },
+      });
+    }
+    return statement;
+  } as typeof prepare);
+  try {
+    fn();
+    return runs;
+  } finally {
+    prepared.mockRestore();
+  }
+}
+
+/** `EXPLAIN QUERY PLAN` of `sql` against `path`, read on a separate connection. */
+function planOf(path: string, sql: string): string[] {
+  const db = new Database(path, { readonly: true });
+  try {
+    return (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map(
+      (r) => r.detail,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/** The page fetch: `papers` columns for rows already chosen, read by key. */
+const isPageFetch = (sql: string) => /FROM papers\s+WHERE (papers\.rowid|id) IN \(/.test(sql);
 
 describe('MirrorStore', () => {
   let dir: string;
@@ -540,6 +600,65 @@ describe('MirrorStore', () => {
     expect(result.results.length).toBeGreaterThan(0);
   });
 
+  // `mirror:verify` checks each v4 index and the fill trigger against the schema
+  // module: a file can record v4 and still lack one, and no open recreates it.
+  describe('v4 schema objects', () => {
+    const V4_OBJECTS = [
+      'index paper_categories_cat_published_idx',
+      'index paper_categories_cat_updated_idx',
+      'index papers_published_idx',
+      'index papers_updated_idx',
+      'index papers_revised_early_idx',
+      'trigger paper_categories_published_fill',
+    ];
+    const statuses = () =>
+      store.checkSchemaObjects().map((o) => `${o.type} ${o.name}: ${o.status}`);
+    const allOk = V4_OBJECTS.map((object) => `${object}: ok`);
+    const runOnFile = (...statements: string[]) => {
+      const db = new Database(dbPath);
+      for (const sql of statements) db.run(sql);
+      db.close();
+    };
+
+    it('finds each one as the schema defines it in a new file', () => {
+      expect(statuses()).toEqual(allOk);
+    });
+
+    it('reports a dropped and a redefined object, no open rebuilds them, and their restore statements do', async () => {
+      runOnFile(
+        'DROP INDEX papers_updated_idx',
+        'DROP INDEX paper_categories_cat_published_idx',
+        'CREATE INDEX paper_categories_cat_published_idx ON paper_categories(category, paper_id, published)',
+        'DROP TRIGGER paper_categories_published_fill',
+        'CREATE TRIGGER paper_categories_published_fill AFTER INSERT ON paper_categories BEGIN SELECT 1; END',
+      );
+      const damaged = [
+        'index paper_categories_cat_published_idx: differs',
+        'index paper_categories_cat_updated_idx: ok',
+        'index papers_published_idx: ok',
+        'index papers_updated_idx: missing',
+        'index papers_revised_early_idx: ok',
+        'trigger paper_categories_published_fill: differs',
+      ];
+      expect(statuses()).toEqual(damaged);
+
+      store.close();
+      store = await MirrorStore.open(dbPath);
+      expect(statuses()).toEqual(damaged);
+
+      runOnFile(...store.checkSchemaObjects().flatMap((o) => (o.status === 'ok' ? [] : o.restore)));
+      expect(statuses()).toEqual(allOk);
+    });
+
+    it('takes a definition that differs from the schema only in spacing or IF NOT EXISTS as the same', () => {
+      runOnFile(
+        'DROP INDEX papers_published_idx',
+        'CREATE INDEX IF NOT EXISTS papers_published_idx\n    ON papers(published,   updated)',
+      );
+      expect(statuses()).toEqual(allOk);
+    });
+  });
+
   // Issue #50 — the write path's index on paper_categories(paper_id) is built
   // by the harvest runner through ensureWriteIndex, never by open.
   describe('write-path index (#50)', () => {
@@ -558,11 +677,12 @@ describe('MirrorStore', () => {
       store.ensureWriteIndex();
 
       expect(await junctionIndexes()).toEqual([
+        'paper_categories_cat_published_idx',
         'paper_categories_cat_updated_idx',
         'paper_categories_paper_id_idx',
         'sqlite_autoindex_paper_categories_1',
       ]);
-      expect(store.schemaVersion().current).toBe(3);
+      expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
     });
 
     it('leaves every search result and count unchanged', () => {
@@ -659,6 +779,7 @@ describe('MirrorStore', () => {
       for (const sql of [
         ...MIRROR_PRAGMA_STATEMENTS,
         ...MIRROR_SCHEMA_STATEMENTS,
+        ...MIRROR_V4_STATEMENTS,
         MIRROR_WRITE_INDEX_SQL,
         ...MIRROR_FTS_DROP_STATEMENTS,
         ...MIRROR_FTS_STATEMENTS,
@@ -865,8 +986,8 @@ describe('MirrorStore', () => {
         }
         expect(walked).toEqual(full.papers.map((p) => p.id));
 
-        expect(run(7, total)).toEqual({ papers: [], total });
-        expect(run(7, total + 50)).toEqual({ papers: [], total });
+        expect(run(7, total)).toEqual({ papers: [], total, totalIsLowerBound: false });
+        expect(run(7, total + 50)).toEqual({ papers: [], total, totalIsLowerBound: false });
       },
     );
 
@@ -880,7 +1001,7 @@ describe('MirrorStore', () => {
           sortBy: 'relevance',
           sortOrder: 'descending',
         }),
-      ).toEqual({ papers: [], total: 0 });
+      ).toEqual({ papers: [], total: 0, totalIsLowerBound: false });
     });
 
     it('orders relevance pages by BM25 score, best first, not by insertion order', async () => {
@@ -954,6 +1075,175 @@ describe('MirrorStore', () => {
       expect(result.total).toBe(3);
       expect(result.papers.map((p) => p.id)).toEqual(['strong', 'medium', 'weak']);
     });
+
+    // Issue #84 — a term beside a category group tests each FTS hit against the
+    // group from the hit's own `papers.categories`; no statement reads the junction.
+    describe('a term beside a category group (#84)', () => {
+      const TERM_GROUP_SHAPES: (typeof SHAPES)[number][] = [
+        { q: 'all:study AND cat:cs' },
+        { q: 'all:study AND cat:cs', category: 'math' },
+        { q: '(protein OR galaxy) AND cat:cs.LG', category: 'astro-ph' },
+        {
+          q: 'all:study AND cat:cs',
+          from: '2021-01-01T00:00:00.000Z',
+          to: '2022-12-31T00:00:00.000Z',
+        },
+        { q: 'au:smith OR co:icml', category: 'cs', from: '2020-06-01T00:00:00.000Z' },
+      ];
+
+      /** One page as the store answered it before #84: the group read through `IN (SELECT …)`. */
+      function pageBefore84(
+        filters: ReturnType<typeof resolve>,
+        sortBy: 'relevance' | 'published' | 'updated',
+        offset: number,
+      ): { ids: string[]; total: number } {
+        const db = new Database(dbPath, { readonly: true });
+        const where = ['papers_fts MATCH ?'];
+        const params: string[] = [filters.matchExpr];
+        for (const group of filters.categoryGroups) {
+          where.push(
+            `papers.id IN (SELECT paper_id FROM paper_categories WHERE category IN (${group.map(() => '?').join(', ')}))`,
+          );
+          params.push(...group);
+        }
+        if (filters.publishedFrom !== undefined) {
+          where.push('papers.published >= ?');
+          params.push(filters.publishedFrom);
+        }
+        if (filters.publishedTo !== undefined) {
+          where.push('papers.published <= ?');
+          params.push(filters.publishedTo);
+        }
+        const order = sortBy === 'relevance' ? 'papers_fts.rank' : `papers.${sortBy} DESC`;
+        const from = `FROM papers_fts CROSS JOIN papers ON papers.rowid = papers_fts.rowid WHERE ${where.join(' AND ')}`;
+        const ids = (
+          db
+            .prepare(
+              `SELECT papers.id AS id ${from} ORDER BY ${order}, papers.rowid LIMIT 7 OFFSET ?`,
+            )
+            .all(...params, offset) as { id: string }[]
+        ).map((r) => r.id);
+        const { n } = db.prepare(`SELECT COUNT(*) AS n ${from}`).get(...params) as { n: number };
+        db.close();
+        return { ids, total: n };
+      }
+
+      it.each(
+        TERM_GROUP_SHAPES.map(
+          (s) => [s.q + (s.category ? ` [category ${s.category}]` : ''), s] as const,
+        ),
+      )('answers %s with the totals, papers, and order it gave before', (_label, shape) => {
+        seedVaried();
+        // Matches for every shape's term that carry one shape group and not the other.
+        store.applyBatch(
+          ['math.AP astro-ph.CO', 'cs.LG hep-th'].map((categories, i) =>
+            mkRecord({
+              paper_id: `one-sided-${i}`,
+              title: 'protein galaxy study',
+              authors: 'Ann Smith',
+              comments: 'ICML',
+              categories,
+              versions: [{ version: 'v1', date: '2021-06-01T00:00:00Z' }],
+            }),
+          ),
+          [],
+        );
+        const filters = resolve(shape);
+        // Every group drops some of the term's matches, so a group the store ignored would show.
+        const { total } = pageBefore84(filters, 'relevance', 0);
+        for (const group of filters.categoryGroups) {
+          const without = filters.categoryGroups.filter((g) => g !== group);
+          expect(
+            pageBefore84({ ...filters, categoryGroups: without }, 'relevance', 0).total,
+            group.join(' '),
+          ).toBeGreaterThan(total);
+        }
+        for (const sortBy of ['relevance', 'published', 'updated'] as const) {
+          for (const offset of [0, 7]) {
+            const result = store.search({
+              ...filters,
+              limit: 7,
+              offset,
+              sortBy,
+              sortOrder: 'descending',
+            });
+            const before = pageBefore84(filters, sortBy, offset);
+            expect(before.total).toBeGreaterThan(0);
+            expect({ ids: result.papers.map((p) => p.id), total: result.total }).toEqual(before);
+            expect(result.totalIsLowerBound).toBe(false);
+          }
+        }
+      });
+
+      it.each(
+        TERM_GROUP_SHAPES.map(
+          (s) => [s.q + (s.category ? ` [category ${s.category}]` : ''), s] as const,
+        ),
+      )(
+        'tests each match against the group without reading the junction for %s',
+        (_label, shape) => {
+          seedVaried();
+          const filters = resolve(shape);
+          for (const sortBy of ['relevance', 'published', 'updated'] as const) {
+            const statements = preparedBy(() =>
+              store.search({ ...filters, limit: 7, offset: 0, sortBy, sortOrder: 'descending' }),
+            );
+            expect(statements.length, sortBy).toBeGreaterThan(0);
+            for (const sql of statements) {
+              // The junction under any alias, through any of its indexes.
+              expect(sql, sortBy).not.toMatch(/paper_categories/);
+              expect(planOf(dbPath, sql).join('\n'), sql).not.toMatch(
+                /LIST SUBQUERY|paper_categories/,
+              );
+            }
+          }
+        },
+      );
+
+      it('matches a group code only as a whole category token, wherever the paper lists it', () => {
+        store.applyBatch(
+          [
+            mkRecord({ paper_id: 'lg', title: 'probe', categories: 'cs.LG' }),
+            mkRecord({ paper_id: 'str-el', title: 'probe', categories: 'cond-mat.str-el' }),
+            mkRecord({ paper_id: 'math-ph', title: 'probe', categories: 'math-ph' }),
+            mkRecord({ paper_id: 'three', title: 'probe', categories: 'hep-th math.AP cs.CV' }),
+          ],
+          [],
+        );
+        const ids = (...categoryGroups: string[][]) =>
+          store
+            .search({
+              matchExpr: '"probe"',
+              categoryGroups,
+              limit: 10,
+              offset: 0,
+              sortBy: 'relevance',
+              sortOrder: 'descending',
+            })
+            .papers.map((p) => p.id)
+            .sort();
+
+        // A code that is a prefix, a suffix, or a hyphenated stem of a carried one.
+        expect(ids(['cs.L'])).toEqual([]);
+        expect(ids(['LG'])).toEqual([]);
+        expect(ids(['cond-mat'])).toEqual([]);
+        expect(ids(['math'])).toEqual([]);
+        // A quoted `cat:` operand reaches the store verbatim: two adjacent codes are no one code.
+        expect(translateQuery('probe AND cat:"hep-th math.AP"')).toMatchObject({
+          route: 'mirror',
+          categoryGroups: [['hep-th math.AP']],
+        });
+        expect(ids(['hep-th math.AP'])).toEqual([]);
+        expect(ids(['math.AP cs.CV', 'cs.LG'])).toEqual(['lg']);
+        // First, middle, and last of a paper's codes; OR within a group, AND across.
+        expect(ids(['hep-th'])).toEqual(['three']);
+        expect(ids(['math.AP'])).toEqual(['three']);
+        expect(ids(['cs.CV'])).toEqual(['three']);
+        expect(ids(['cs.LG', 'cond-mat.str-el'])).toEqual(['lg', 'str-el']);
+        expect(ids(['math.AP'], ['cs.CV', 'cs.LG'])).toEqual(['three']);
+        expect(ids(['math.AP'], ['cs.LG'])).toEqual([]);
+      });
+    });
   });
 });
 
@@ -983,8 +1273,8 @@ describe('MirrorStore.matchReachesCap (#49)', () => {
              'cs.LG', 'cs.LG', '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z',
              '2024-01-01T00:00:00.000Z'
       FROM n;
-      INSERT INTO paper_categories(category, paper_id, updated)
-      SELECT 'cs.LG', id, updated FROM papers;
+      INSERT INTO paper_categories(category, paper_id, updated, published)
+      SELECT 'cs.LG', id, updated, published FROM papers;
     `);
     db.close();
     store = await MirrorStore.open(dbPath);
@@ -1025,6 +1315,441 @@ describe('MirrorStore.matchReachesCap (#49)', () => {
     expect(run([]).total).toBe(49_999);
     expect(run([['cs.LG']]).total).toBe(49_999);
     expect(run([['cs.LG']]).papers).toHaveLength(2);
+  });
+});
+
+/**
+ * Issue #78 — a search with no free-text term counts at most the match cap
+ * (a single code excepted) and reads at most that many index entries for a
+ * page. The corpus holds 60,000 papers, three per submission hour (so
+ * `published` ties in threes) and each revised 0–4 days after it (so `updated`
+ * ties too); IDs are a permutation of insertion order, so a tie broken on the
+ * ID and one broken on the rowid come out in different orders. One more paper
+ * was last revised before it was submitted, as arXiv dates a few.
+ */
+describe('MirrorStore.search without a free-text term (#78)', () => {
+  const PAPERS = 60_000;
+  /** Each code's members, by insertion index `i`. */
+  const CODES: [code: string, members: string][] = [
+    ['cs.LG', 'i % 2 = 0'],
+    ['cs.AI', 'i % 2 = 1'],
+    ['cs.CL', 'i % 3 = 0'],
+    ['stat.ML', 'i % 10 != 0'],
+    ['math.AP', 'i % 7 = 0'],
+    ['q-fin.ST', 'i % 20 != 0'],
+  ];
+  const CS = categorySubtree('cs');
+  /** The one paper last revised before it was submitted, in `cs.LG` and `stat.ML`. */
+  const REVISED_EARLY = 'p60000';
+  /** The instant `hours` after the first submission in the corpus. */
+  const at = (hours: number) => new Date(Date.UTC(2020, 0, 1) + hours * 3_600_000).toISOString();
+
+  interface Shape {
+    /** Bounds on `published`, in hours after the first submission. */
+    from?: number;
+    groups: string[][];
+    label: string;
+    sortBy: 'relevance' | 'published' | 'updated';
+    sortOrder?: 'ascending' | 'descending';
+    to?: number;
+  }
+
+  // Match counts in the comments; the cap is 50,000.
+  const SHAPES: Shape[] = [
+    { label: 'a multi-code group by relevance', groups: [CS], sortBy: 'relevance' }, // 60,001
+    { label: 'a multi-code group by submission', groups: [CS], sortBy: 'published' },
+    {
+      label: 'a multi-code group by update, ascending',
+      groups: [CS],
+      sortBy: 'updated',
+      sortOrder: 'ascending',
+    },
+    {
+      label: 'a multi-code group in a window by relevance',
+      groups: [CS],
+      from: 0,
+      to: 20_000,
+      sortBy: 'relevance',
+    }, // 60,001
+    {
+      label: 'a multi-code group in a window open above, by submission ascending',
+      groups: [CS],
+      from: 2_000,
+      sortBy: 'published',
+      sortOrder: 'ascending',
+    }, // 54,001
+    {
+      label: 'a multi-code group in a narrow window by relevance',
+      groups: [CS],
+      from: 1_000,
+      to: 7_000,
+      sortBy: 'relevance',
+    }, // 18,004
+    { label: 'a window alone by relevance', groups: [], from: 0, to: 20_000, sortBy: 'relevance' },
+    { label: 'a window open above, by submission', groups: [], from: 0, sortBy: 'published' },
+    {
+      label: 'a window open above, by update ascending',
+      groups: [],
+      from: 1_000,
+      sortBy: 'updated',
+      sortOrder: 'ascending',
+    }, // 57,001
+    {
+      label: 'a narrow window alone by relevance',
+      groups: [],
+      from: 5_000,
+      to: 15_000,
+      sortBy: 'relevance',
+    }, // 30,004
+    {
+      label: 'a window open below, by submission ascending',
+      groups: [],
+      to: 9_000,
+      sortBy: 'published',
+      sortOrder: 'ascending',
+    }, // 27,004
+    { label: 'no filter at all', groups: [], sortBy: 'relevance' }, // 60,001
+    { label: 'two groups by relevance', groups: [CS, ['stat.ML']], sortBy: 'relevance' }, // 54,001
+    { label: 'two groups by submission', groups: [['stat.ML'], CS], sortBy: 'published' },
+    {
+      label: 'two groups in a window by update',
+      groups: [CS, ['stat.ML']],
+      from: 0,
+      to: 20_000,
+      sortBy: 'updated',
+    },
+    {
+      label: 'two groups meeting under the cap',
+      groups: [['cs.LG'], ['cs.CL']],
+      sortBy: 'relevance',
+    }, // 10,000
+    {
+      label: 'a small group beside a large one',
+      groups: [CS, ['math.AP']],
+      sortBy: 'relevance',
+    }, // 8,572
+    {
+      label: 'two codes over the cap, the smaller listed second',
+      groups: [['q-fin.ST'], ['stat.ML']],
+      sortBy: 'relevance',
+    }, // 54,000
+    { label: 'one code by submission', groups: [['stat.ML']], sortBy: 'published' }, // 54,001
+    {
+      label: 'one code in a window by relevance',
+      groups: [['stat.ML']],
+      from: 0,
+      to: 20_000,
+      sortBy: 'relevance',
+    },
+    {
+      label: 'one code in a window by update, ascending',
+      groups: [['math.AP']],
+      from: 2_000,
+      to: 12_000,
+      sortBy: 'updated',
+      sortOrder: 'ascending',
+    },
+    { label: 'one code by relevance (the fast path)', groups: [['cs.LG']], sortBy: 'relevance' }, // 30,001
+    { label: 'a code no paper carries', groups: [['q-bio.BM']], sortBy: 'relevance' },
+    {
+      label: 'two groups no paper carries both of',
+      groups: [['cs.LG'], ['cs.AI']],
+      sortBy: 'published',
+    },
+    {
+      label: 'a multi-code group in a window open above, by update ascending',
+      groups: [CS],
+      from: 1_000,
+      sortBy: 'updated',
+      sortOrder: 'ascending',
+    }, // 57,001
+    {
+      label: 'one code in a window open above, by update ascending',
+      groups: [['stat.ML']],
+      from: 1_000,
+      sortBy: 'updated',
+      sortOrder: 'ascending',
+    }, // 51,301
+  ];
+  const cases = SHAPES.map((s) => [s.label, s] as const);
+
+  let dir: string;
+  let dbPath: string;
+  let store: MirrorStore;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-mirror-browse-test-'));
+    dbPath = join(dir, 'mirror.db');
+    (await MirrorStore.open(dbPath)).close();
+    const db = new Database(dbPath);
+    db.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+       INSERT INTO papers(id, version, title, authors, abstract, primary_category,
+                          categories, published, updated, latest_version)
+       SELECT printf('p%05d', i * 7919 % ?), '1', 'Paper', 'A. Author', 'Abstract', 'cs.LG',
+              'cs.LG', strftime('%Y-%m-%dT%H:%M:%fZ', '2020-01-01', '+' || (i / 3) || ' hours'),
+              strftime('%Y-%m-%dT%H:%M:%fZ', '2020-01-01', '+' || (i / 3 + 24 * (i % 5)) || ' hours'),
+              strftime('%Y-%m-%dT%H:%M:%fZ', '2020-01-01', '+' || (i / 3 + 24 * (i % 5)) || ' hours')
+       FROM n`,
+    ).run(PAPERS - 1, PAPERS);
+    for (const [code, members] of CODES) {
+      db.prepare(
+        `INSERT INTO paper_categories(category, paper_id, updated, published)
+         SELECT ?, id, updated, published FROM (SELECT rowid - 1 AS i, * FROM papers) WHERE ${members}`,
+      ).run(code);
+    }
+    // arXiv dates some revisions before their paper's first version
+    // (math/0002124: submitted 2000-02-15, revised 1999-11-17). This one is
+    // submitted inside every window that opens by hour 5,000 and revised before
+    // any of them opens.
+    db.prepare(
+      `INSERT INTO papers(id, version, title, authors, abstract, primary_category,
+                          categories, published, updated, latest_version)
+       VALUES (?, '2', 'Paper', 'A. Author', 'Abstract', 'cs.LG', 'cs.LG stat.ML', ?, ?, ?)`,
+    ).run(REVISED_EARLY, at(5_000.5), at(500.5), at(500.5));
+    for (const code of ['cs.LG', 'stat.ML']) {
+      db.prepare(
+        `INSERT INTO paper_categories(category, paper_id, updated, published)
+         SELECT ?, id, updated, published FROM papers WHERE id = ?`,
+      ).run(code, REVISED_EARLY);
+    }
+    db.close();
+    const opened = await MirrorStore.openReader(dbPath);
+    if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+    store = opened.store;
+  }, 30_000);
+
+  afterAll(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const optionsFor = (shape: Shape, offset: number, limit = 10) => ({
+    categoryGroups: shape.groups,
+    ...(shape.from !== undefined && { publishedFrom: at(shape.from) }),
+    ...(shape.to !== undefined && { publishedTo: at(shape.to) }),
+    limit,
+    offset,
+    sortBy: shape.sortBy,
+    sortOrder: shape.sortOrder ?? ('descending' as const),
+  });
+
+  const references = new Map<Shape, { ids: string[]; keys: string[] }>();
+  /**
+   * Every match, in the order the search pages through them: by the sort key,
+   * ties broken on the paper ID when a category group filters and on the rowid
+   * otherwise. Read with the `IN (SELECT …)` filter the store used before #78.
+   */
+  function reference(shape: Shape): { ids: string[]; keys: string[] } {
+    const cached = references.get(shape);
+    if (cached) return cached;
+    const where: string[] = [];
+    const params: string[] = [];
+    for (const group of shape.groups) {
+      where.push(
+        `id IN (SELECT paper_id FROM paper_categories WHERE category IN (${group.map(() => '?').join(', ')}))`,
+      );
+      params.push(...group);
+    }
+    if (shape.from !== undefined) {
+      where.push('published >= ?');
+      params.push(at(shape.from));
+    }
+    if (shape.to !== undefined) {
+      where.push('published <= ?');
+      params.push(at(shape.to));
+    }
+    const key = shape.sortBy === 'published' ? 'published' : 'updated';
+    const dir = shape.sortBy !== 'relevance' && shape.sortOrder === 'ascending' ? 'ASC' : 'DESC';
+    const tie = shape.groups.length > 0 ? 'id' : 'rowid';
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db
+      .prepare(
+        `SELECT id, ${key} AS k FROM papers ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
+         ORDER BY ${key} ${dir}, ${tie} ${dir}`,
+      )
+      .all(...params) as { id: string; k: string }[];
+    db.close();
+    const found = { ids: rows.map((r) => r.id), keys: rows.map((r) => r.k) };
+    references.set(shape, found);
+    return found;
+  }
+
+  const isSingleCode = (shape: Shape) => shape.groups.length === 1 && shape.groups[0]?.length === 1;
+
+  it('seeds shapes on both sides of the cap, with ties that straddle a page boundary', () => {
+    const counts = SHAPES.map((s) => reference(s).ids.length);
+    expect(counts.filter((n) => n >= MIRROR_SEARCH_MATCH_CAP).length).toBeGreaterThanOrEqual(10);
+    expect(
+      counts.filter((n) => n > 0 && n < MIRROR_SEARCH_MATCH_CAP).length,
+    ).toBeGreaterThanOrEqual(6);
+    const { keys } = reference(SHAPES[7] as Shape);
+    expect(keys[9]).toBe(keys[10]);
+    // An update order over a window at the cap starts with the paper revised before it opened.
+    for (const s of SHAPES.filter((s) => s.from === 1_000 && s.sortOrder === 'ascending')) {
+      expect(reference(s).ids.length, s.label).toBeGreaterThanOrEqual(MIRROR_SEARCH_MATCH_CAP);
+      expect(reference(s).ids[0], s.label).toBe(REVISED_EARLY);
+    }
+  });
+
+  it.each(cases)(
+    'counts %s exactly for one code, and up to the cap for any other',
+    (_label, shape) => {
+      const matches = reference(shape).ids.length;
+      const { total, totalIsLowerBound } = store.search(optionsFor(shape, 0));
+      expect({ total, totalIsLowerBound }).toEqual(
+        isSingleCode(shape) || matches < MIRROR_SEARCH_MATCH_CAP
+          ? { total: matches, totalIsLowerBound: false }
+          : { total: MIRROR_SEARCH_MATCH_CAP, totalIsLowerBound: true },
+      );
+    },
+  );
+
+  it.each(cases)(
+    'pages %s in sort order with ties broken on a unique key, through start 10,000',
+    (_label, shape) => {
+      const { ids, keys } = reference(shape);
+      const sortKey = (p: { published: string; updated: string }) =>
+        shape.sortBy === 'published' ? p.published : p.updated;
+      for (const offset of [0, 10, 10_000]) {
+        const { papers } = store.search(optionsFor(shape, offset));
+        // The sort key alone is the order the store kept before #78, which left ties unordered.
+        expect(papers.map(sortKey)).toEqual(keys.slice(offset, offset + 10));
+        expect(papers.map((p) => p.id)).toEqual(ids.slice(offset, offset + 10));
+      }
+      // Pages of 7 cut tie groups of 3 at every offset: none overlaps or skips.
+      const walked: string[] = [];
+      for (let offset = 0; offset < 63; offset += 7) {
+        walked.push(...store.search(optionsFor(shape, offset, 7)).papers.map((p) => p.id));
+      }
+      expect(walked).toEqual(ids.slice(0, 63));
+    },
+  );
+
+  it.each(cases)(
+    'plans %s with no list subquery, no full sort at the cap, and no papers row outside the page',
+    (_label, shape) => {
+      const atCap = reference(shape).ids.length >= MIRROR_SEARCH_MATCH_CAP;
+      // One code in update order with no window keeps its #19 plan: the page
+      // joins `papers` by ID as it walks the junction index.
+      const fastPath =
+        isSingleCode(shape) &&
+        shape.from === undefined &&
+        shape.to === undefined &&
+        shape.sortBy !== 'published';
+      for (const offset of atCap ? [0, 10_000] : [0]) {
+        const statements = preparedBy(() => store.search(optionsFor(shape, offset)));
+        expect(statements.length).toBeGreaterThan(0);
+        for (const sql of statements) {
+          const plan = planOf(dbPath, sql);
+          expect(plan.join('\n'), sql).not.toMatch(/LIST SUBQUERY/);
+          if (isPageFetch(sql)) continue;
+          if (atCap) expect(plan.join('\n'), sql).not.toMatch(/USE TEMP B-TREE FOR ORDER BY/);
+          // Any read of a `papers` row: by table name, through one of its indexes, or by rowid.
+          const readsPapers = (l: string) =>
+            /\b(SCAN|SEARCH) papers\b|sqlite_autoindex_papers_1|\bpapers_\w+_idx\b|INTEGER PRIMARY KEY/.test(
+              l,
+            );
+          for (const line of plan.filter(readsPapers)) {
+            expect(line, sql).toMatch(
+              fastPath && !/COUNT\(\*\)/.test(sql)
+                ? /COVERING INDEX|sqlite_autoindex_papers_1 \(id=\?\)/
+                : /COVERING INDEX/,
+            );
+          }
+        }
+      }
+    },
+  );
+
+  it.each([
+    ['ascending', 'ascending'],
+    ['descending', 'descending'],
+  ] as const)(
+    'browses one code by update, %s, straight off the index with no sort',
+    (_label, sortOrder) => {
+      const shape: Shape = {
+        label: 'the fast path',
+        groups: [['cs.LG']],
+        sortBy: 'updated',
+        sortOrder,
+      };
+      const { ids } = reference(shape);
+      for (const offset of [0, 10_000]) {
+        let page: string[] = [];
+        const statements = preparedBy(() => {
+          page = store.search(optionsFor(shape, offset)).papers.map((p) => p.id);
+        });
+        expect(page).toEqual(ids.slice(offset, offset + 10));
+        const browse = statements.filter((s) => !/COUNT\(\*\)/.test(s) && !isPageFetch(s));
+        expect(browse.length).toBeGreaterThan(0);
+        for (const sql of browse) {
+          expect(planOf(dbPath, sql).join('\n'), sql).not.toMatch(/USE TEMP B-TREE/);
+        }
+      }
+    },
+  );
+
+  describe('the group that drives two or more', () => {
+    const shape = (label: string) => {
+      const found = SHAPES.find((s) => s.label === label);
+      if (!found) throw new Error(`no shape '${label}'`);
+      return found;
+    };
+    /** The codes bound to the first `IN` list of the count that probes the other groups. */
+    function driverOf(s: Shape): string[] {
+      const count = boundBy(() => store.search(optionsFor(s, 0))).find(
+        ({ sql }) => /COUNT\(\*\)/.test(sql) && /EXISTS/.test(sql),
+      );
+      if (!count) throw new Error('no count probed a second group');
+      const slots = /IN \(([?, ]+)\)/.exec(count.sql)?.[1]?.split(',').length ?? 0;
+      return count.params.slice(0, slots) as string[];
+    }
+
+    it('is the code with fewer junction rows when both pass the cap', () => {
+      // q-fin.ST holds 57,000 rows, stat.ML 54,001.
+      expect(driverOf(shape('two codes over the cap, the smaller listed second'))).toEqual([
+        'stat.ML',
+      ]);
+    });
+
+    it('stays the group under the cap when two others tie there', () => {
+      const three: Shape = {
+        label: 'three groups',
+        groups: [['q-fin.ST'], ['stat.ML'], ['math.AP']],
+        sortBy: 'relevance',
+      };
+      expect(driverOf(three)).toEqual(['math.AP']);
+      // Every other group is still tested on each candidate.
+      const { ids } = reference(three);
+      for (const offset of [0, 10]) {
+        const page = store.search(optionsFor(three, offset));
+        expect({ ids: page.papers.map((p) => p.id), total: page.total }).toEqual({
+          ids: ids.slice(offset, offset + 10),
+          total: ids.length,
+        });
+      }
+    });
+
+    it('is a whole archive beside one code, since each candidate then costs one probe', () => {
+      // stat.ML's 54,001 rows would each probe every code under cs; cs's
+      // 80,001 rows each probe stat.ML alone.
+      expect(driverOf(shape('two groups by submission'))).toEqual(CS);
+    });
+
+    it.each([
+      'two codes over the cap, the smaller listed second',
+      'two groups meeting under the cap',
+    ])('takes no DISTINCT pass when it holds one code: %s', (label) => {
+      const s = shape(label);
+      expect(driverOf(s)).toHaveLength(1);
+      const atCap = reference(s).ids.length >= MIRROR_SEARCH_MATCH_CAP;
+      for (const offset of atCap ? [0, 10_000] : [0]) {
+        for (const sql of preparedBy(() => store.search(optionsFor(s, offset)))) {
+          expect(planOf(dbPath, sql).join('\n'), sql).not.toMatch(/TEMP B-TREE FOR DISTINCT/);
+        }
+      }
+    });
   });
 });
 

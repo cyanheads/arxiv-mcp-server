@@ -5,7 +5,8 @@
  * deadline that stops it after a whole page (#39), which writes keep the token
  * for a later run (#62), the stalled token recovery that fails a run (#59), the
  * outage wait only `init` runs (#61), the run on a file another writer is
- * migrating (#71), and the mirror scripts run from an installed package (#75).
+ * migrating (#71), `mirror:verify` on a file missing a v4 index or trigger,
+ * and the mirror scripts run from an installed package (#75).
  * Drives the real `MirrorStore` on a temp file; only `fetch` (the OAI endpoint)
  * is stubbed, except in the real-process blocks, which run the mirror scripts
  * against a loopback OAI endpoint or, for the installed package, against stub
@@ -25,6 +26,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { worstCasePageFetchMs } from '@/services/arxiv/mirror/harvester.js';
 import { runHarvest } from '@/services/arxiv/mirror/runner.js';
+import { MIRROR_SCHEMA_VERSION } from '@/services/arxiv/mirror/schema.js';
 import { MirrorStore, openStore, resetStore } from '@/services/arxiv/mirror/store.js';
 
 const config = {
@@ -339,7 +341,7 @@ describe('runHarvest', () => {
   describe('write-path index on paper_categories(paper_id)', () => {
     it('is absent from a file MirrorStore.open created and full-scans per write', async () => {
       const store = await MirrorStore.open(config.mirrorPath);
-      expect(store.schemaVersion().current).toBe(3);
+      expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
       store.close();
 
       for (const plan of writePathPlans(config.mirrorPath)) {
@@ -357,7 +359,7 @@ describe('runHarvest', () => {
       for (const plan of writePathPlans(config.mirrorPath)) expect(plan).toMatch(INDEXED_LOOKUP);
     });
 
-    it('is added to a populated schema-v3 file by the next refresh', async () => {
+    it('is added to a populated current-schema file by the next refresh', async () => {
       const store = await MirrorStore.open(config.mirrorPath);
       store.applyBatch(
         [
@@ -385,7 +387,9 @@ describe('runHarvest', () => {
       await runHarvest(makeCtx(), { mode: 'refresh' });
 
       for (const plan of writePathPlans(config.mirrorPath)) expect(plan).toMatch(INDEXED_LOOKUP);
-      expect((await openStore(config.mirrorPath)).schemaVersion().current).toBe(3);
+      expect((await openStore(config.mirrorPath)).schemaVersion().current).toBe(
+        MIRROR_SCHEMA_VERSION,
+      );
     });
   });
 
@@ -1157,7 +1161,7 @@ describe('runHarvest', () => {
 
           expect(code).toBe(75);
           expect(stderr).toContain(
-            `${label} did not run: Mirror file ${config.mirrorPath} is being migrated from schema v2 to v3 by another writer (pid 4242,`,
+            `${label} did not run: Mirror file ${config.mirrorPath} is being migrated from schema v2 to v${MIRROR_SCHEMA_VERSION} by another writer (pid 4242,`,
           );
           expect(stderr).toContain('Run it again once that migration finishes.');
           expect(served).toEqual([]);
@@ -1166,6 +1170,141 @@ describe('runHarvest', () => {
         30_000,
       );
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // mirror:verify against the schema's v4 indexes and trigger (#78)
+  // -------------------------------------------------------------------------
+
+  describe('mirror:verify script (real process)', () => {
+    const SCRIPT = fileURLToPath(
+      new URL('../../../../scripts/arxiv-mirror-verify.ts', import.meta.url),
+    );
+
+    function runVerify() {
+      return new Promise<{ code: number | null; stderr: string; stdout: string }>((resolve) => {
+        const child = spawn(process.execPath, [SCRIPT], {
+          env: { ...process.env, ARXIV_MIRROR_PATH: config.mirrorPath },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
+        child.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        child.on('close', (code) => resolve({ code, stderr, stdout }));
+      });
+    }
+
+    /** A current mirror file, then `statements` run against it on a separate connection. */
+    async function currentFileAfter(...statements: string[]): Promise<void> {
+      (await MirrorStore.open(config.mirrorPath)).close();
+      const db = new Database(config.mirrorPath);
+      for (const sql of statements) db.run(sql);
+      db.close();
+    }
+
+    /** The SQL the file stores for the schema object `name`, or `null` when it has none. */
+    function storedSql(name: string): string | null {
+      const db = new Database(config.mirrorPath, { readonly: true });
+      const row = db.query('SELECT sql FROM sqlite_master WHERE name = ?').get(name) as {
+        sql: string;
+      } | null;
+      db.close();
+      return row?.sql ?? null;
+    }
+
+    it('passes a current file, listing each v4 index and the fill trigger as ok', async () => {
+      await currentFileAfter();
+
+      const { code, stderr, stdout } = await runVerify();
+
+      expect(code, stderr).toBe(0);
+      for (const object of [
+        'index paper_categories_cat_published_idx',
+        'index paper_categories_cat_updated_idx',
+        'index papers_published_idx',
+        'index papers_updated_idx',
+        'index papers_revised_early_idx',
+        'trigger paper_categories_published_fill',
+      ]) {
+        expect(stdout).toContain(`  ${object}: ok\n`);
+      }
+      expect(stdout).toContain('Mirror OK');
+    }, 30_000);
+
+    it.each([
+      {
+        label: 'a dropped index',
+        damage: ['DROP INDEX papers_published_idx'],
+        name: 'papers_published_idx',
+        listed: 'index papers_published_idx: missing',
+        failure: 'index papers_published_idx is missing',
+        restore: [
+          'DROP INDEX IF EXISTS papers_published_idx;',
+          'CREATE INDEX papers_published_idx ON papers(published, updated);',
+        ],
+      },
+      {
+        label: 'an index with its v3 definition',
+        damage: [
+          'DROP INDEX paper_categories_cat_updated_idx',
+          'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated)',
+        ],
+        name: 'paper_categories_cat_updated_idx',
+        listed: 'index paper_categories_cat_updated_idx: differs from schema v4',
+        failure: 'index paper_categories_cat_updated_idx differs from schema v4',
+        restore: [
+          'DROP INDEX IF EXISTS paper_categories_cat_updated_idx;',
+          'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated, paper_id, published);',
+        ],
+      },
+      {
+        label: 'a partial index that lost its WHERE clause',
+        damage: [
+          'DROP INDEX papers_revised_early_idx',
+          'CREATE INDEX papers_revised_early_idx ON papers(published, updated)',
+        ],
+        name: 'papers_revised_early_idx',
+        listed: 'index papers_revised_early_idx: differs from schema v4',
+        failure: 'index papers_revised_early_idx differs from schema v4',
+        restore: [
+          'DROP INDEX IF EXISTS papers_revised_early_idx;',
+          'CREATE INDEX papers_revised_early_idx ON papers(published, updated) WHERE updated < published;',
+        ],
+      },
+      {
+        label: 'a dropped fill trigger',
+        damage: ['DROP TRIGGER paper_categories_published_fill'],
+        name: 'paper_categories_published_fill',
+        listed: 'trigger paper_categories_published_fill: missing',
+        failure: 'trigger paper_categories_published_fill is missing',
+        restore: [
+          'DROP TRIGGER IF EXISTS paper_categories_published_fill;',
+          'CREATE TRIGGER IF NOT EXISTS paper_categories_published_fill\nAFTER INSERT ON paper_categories',
+        ],
+      },
+    ])(
+      'exits 1 on $label, naming it and the statements that restore it, and leaves the file as it was',
+      async ({ damage, name, listed, failure, restore }) => {
+        await currentFileAfter(...damage);
+        const before = storedSql(name);
+
+        const { code, stderr, stdout } = await runVerify();
+
+        expect(code, stdout).toBe(1);
+        expect(stdout).toContain(`  ${listed}\n`);
+        expect(stdout).not.toContain('Mirror OK');
+        expect(stderr).toContain(`Schema objects FAILED: ${failure}.`);
+        for (const statement of restore) expect(stderr).toContain(statement);
+        // The writer open verify makes rebuilds nothing.
+        expect(storedSql(name)).toBe(before);
+      },
+      30_000,
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -1182,6 +1321,7 @@ describe('runHarvest', () => {
 export const openStore = async () => ({
   readHarvestState: () => ({ status: 'pending' }),
   schemaVersion: () => ({ current: 3, expected: 3 }),
+  checkSchemaObjects: () => [],
   integrityCheck: () => ({ ok: true, results: ['ok'] }),
 });`,
     });

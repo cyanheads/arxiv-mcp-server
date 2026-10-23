@@ -80,9 +80,9 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     {
       reason: 'pdf_extraction_failed',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Paper has no HTML rendering and its PDF carries no text layer — an image-only or scanned submission.',
+      when: 'Paper has no HTML rendering and its PDF yields no text: the PDF carries no text layer (an image-only or scanned submission), or the PDF parser cannot read the file (damaged, truncated, or not a PDF).',
       recovery:
-        'Download error.data.pdfUrl and run optical character recognition, or read the abstract via arxiv_get_metadata.',
+        'Read the abstract via arxiv_get_metadata, or download error.data.pdfUrl and process it outside this server: optical character recognition for an image-only PDF, a PDF repair tool for one that does not parse.',
       thrownBy: 'service',
       severity: 'notice',
     },

@@ -467,3 +467,83 @@ describe('arxivSearchPapers — max_results past the per-call cap', () => {
     expect(getEnrichment(ctx).cap).toBe(50);
   });
 });
+
+// Issue #78: a mirror search without a free-text term, other than one category
+// code, stops counting at 50,000 and flags the total as a lower bound.
+describe('arxivSearchPapers — a mirror total that stopped at the cap', () => {
+  /** A page of `count` distinct papers. */
+  function page(count: number): PaperMetadata[] {
+    return Array.from({ length: count }, (_, i) => ({
+      ...MOCK_PAPER,
+      id: `2401.${String(i + 1).padStart(5, '0')}v1`,
+    }));
+  }
+  const textOf = (result: { content: { type: string; text?: string }[] }): string =>
+    result.content.map((block) => block.text ?? '').join('\n');
+  const capped = (start: number, count: number): SearchResult => ({
+    total_results: 50_000,
+    total_is_lower_bound: true,
+    start,
+    papers: page(count),
+    effective_query: 'cat:cs.*',
+  });
+
+  it('flags the total and says "or more" on both surfaces', async () => {
+    mockSearch.mockResolvedValue(capped(0, 10));
+    const result = await runToolContract(arxivSearchPapers, { query: 'cat:cs' });
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      totalFound: 50_000,
+      totalFoundIsLowerBound: true,
+      truncated: true,
+      shown: 10,
+      cap: 10,
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('50000 or more total matches');
+    expect(notice).toContain('only the first 10010 are reachable');
+    expect(notice).toContain('submitted_from');
+    expect(notice).not.toMatch(/start=/);
+    const text = textOf(result);
+    expect(text).toContain('**Total Found Is Lower Bound:** true');
+    expect(text).toContain('50000 or more total matches');
+  });
+
+  it('keeps the date-window guidance on the deepest page, which is never empty', async () => {
+    mockSearch.mockResolvedValue(capped(10_000, 50));
+    const result = await runToolContract(arxivSearchPapers, {
+      query: 'cat:cs',
+      start: 10_000,
+      max_results: 50,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      totalFoundIsLowerBound: true,
+      pageStart: 10_000,
+      shown: 50,
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('50000 or more total matches, but only the first 10050 are reachable');
+    expect(notice).not.toContain('exceeds total results');
+    expect(notice).not.toContain('No papers found');
+  });
+
+  it('leaves the field out, and the count unqualified, when the total is exact', async () => {
+    const { total_is_lower_bound: _flag, ...exact } = capped(0, 10);
+    mockSearch.mockResolvedValue(exact);
+    const result = await runToolContract(arxivSearchPapers, { query: 'cat:cs' });
+
+    expect(result.structuredContent).not.toHaveProperty('totalFoundIsLowerBound');
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('50000 total matches');
+    expect(notice).not.toContain('or more');
+    expect(textOf(result)).not.toContain('Lower Bound');
+  });
+
+  it('describes totalFound as exact on arXiv and a floor for a capped mirror count', () => {
+    const description = arxivSearchPapers.enrichment?.totalFound?.description ?? '';
+    expect(description).toContain('50,000 or more');
+    expect(description).toContain('totalFoundIsLowerBound');
+  });
+});

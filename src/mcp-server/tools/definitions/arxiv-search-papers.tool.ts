@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
+import { MIRROR_SEARCH_MATCH_CAP } from '@/services/arxiv/mirror/store.js';
 import {
   ARXIV_API_RESULT_LIMIT,
   formatPaper,
@@ -27,6 +28,9 @@ const MAX_START = 10_000;
  * and the truncation disclosure says how to reach the rest. See issue #51.
  */
 const PAGE_CAP = 50;
+
+/** The mirror's count cap as the `totalFound` description spells it (issue #78). */
+const CAP_TEXT = MIRROR_SEARCH_MATCH_CAP.toLocaleString('en-US');
 
 /** Optional `YYYY-MM-DD`. Empty string passes so form-based clients that submit
  * the whole schema shape aren't punished; the handler treats it as unset. */
@@ -103,7 +107,7 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
       // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — this regex filters them out.
       .regex(/^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$/, 'Query contains control characters.')
       .describe(
-        `Search query. Field prefixes: ti: (title), au: (author — token-based; quote multi-token names like au:"hinton g" or pair with a topical clause to disambiguate common surnames), abs: (abstract), cat: (category — a leaf code matches exactly, a bare archive code such as cat:astro-ph matches its whole subtree), co: (comment), jr: (journal ref), all: (all fields). Boolean operators: AND, OR, ANDNOT. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
+        `Search query. Field prefixes: ti: (title), au: (author — token-based; quote multi-token names like au:"hinton g" or pair with a topical clause to disambiguate common surnames), abs: (abstract), cat: (category — a leaf code matches exactly, a bare archive code such as cat:astro-ph matches its whole subtree), co: (comment), jr: (journal ref), all: (all fields). Boolean operators, uppercase only: AND, OR, ANDNOT. Space-separated terms are joined with OR, so "quantum computing" matches papers with either word; AND requires every term ("quantum AND computing"). The operators share one precedence and group to the right ("a AND b OR c" reads as "a AND (b OR c)"), so use parentheses for any other grouping. Quote a multi-word topic to match it as a phrase, and put alternatives in parentheses before a filter so the filter applies to all of them: '"graph neural networks" AND cat:cs.LG', '(ti:transformer OR ti:attention) AND cat:cs.CL'. arXiv ignores common words such as of, the, and, for, in, so leave them out or keep them inside a quoted phrase. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
       ),
     category: z
       .string()
@@ -172,7 +176,17 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
       .describe(
         'The query as actually searched, carrying every filter applied — the category subtree and submitted-date window folded into arXiv syntax alongside the supplied terms. Replaying it as `query` with no other filters reproduces this exact result set.',
       ),
-    totalFound: z.number().describe('Total matching papers reported by arXiv (before pagination).'),
+    totalFound: z
+      .number()
+      .describe(
+        `Total matching papers before pagination. Exact, except for a search the local mirror answers with no free-text term that spans several category codes (a whole archive such as cat:cs, or two categories) or filters by submitted date alone: the mirror stops counting such a search at ${CAP_TEXT}, and a total of ${CAP_TEXT} there carries totalFoundIsLowerBound and means ${CAP_TEXT} or more.`,
+      ),
+    totalFoundIsLowerBound: z
+      .literal(true)
+      .optional()
+      .describe(
+        'Present when totalFound is a floor: at least that many papers match. Absent when totalFound is exact.',
+      ),
     pageStart: z.number().describe('Pagination offset of this result page.'),
     truncated: z
       .boolean()
@@ -198,6 +212,7 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
   enrichmentTrailer: {
     effectiveQuery: { label: 'Query' },
     totalFound: { label: 'Total Found' },
+    totalFoundIsLowerBound: { label: 'Total Found Is Lower Bound' },
     pageStart: { label: 'Page Start' },
   },
 
@@ -232,8 +247,13 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
     ctx.enrich({
       effectiveQuery: result.effective_query,
       totalFound: result.total_results,
+      ...(result.total_is_lower_bound && { totalFoundIsLowerBound: true }),
       pageStart: result.start,
     });
+    // A floor reads as one in the guidance too. It is at least the mirror's
+    // match cap, past the deepest start plus a page, so no page under it is
+    // empty and the guidance below names date windows.
+    const matches = `${result.total_results}${result.total_is_lower_bound ? ' or more' : ''} total matches`;
 
     // Disclose when this page was capped — more matches exist past start + shown.
     // Past the reachable bound "page further" stops being an executable
@@ -253,8 +273,8 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
         cap: limit === undefined ? pageSize : Math.min(pageSize, limit - result.start),
         guidance:
           result.total_results > reachable
-            ? `${result.total_results} total matches, but ${unreachable}. Split the search into submitted_from/submitted_to date windows and page within each — both bounds are inclusive, so consecutive windows cover every match with no gap; de-duplicate by paper id, since one submitted exactly at a window seam appears in both.`
-            : `${result.total_results} total matches. Page further with start=${nextStart}, or refine the query.`,
+            ? `${matches}, but ${unreachable}. Split the search into submitted_from/submitted_to date windows and page within each — both bounds are inclusive, so consecutive windows cover every match with no gap; de-duplicate by paper id, since one submitted exactly at a window seam appears in both.`
+            : `${matches}. Page further with start=${nextStart}, or refine the query.`,
       });
     }
 

@@ -1,14 +1,16 @@
 /**
  * @fileoverview arXiv query syntax → FTS5 translator with category-subtree
  * expansion. Parses field prefixes (`ti:`, `au:`, `abs:`, `cat:`, `co:`, `jr:`,
- * `all:`), boolean operators (`AND`, `OR`, `ANDNOT`), quoted phrases, and
- * parens with arXiv's precedence, where `AND` (explicit or implicit) binds
- * tighter than `ANDNOT` and `OR`. Lifts `cat:` operands into category groups
+ * `all:`), boolean operators, quoted phrases, and parens with arXiv's own
+ * grammar: only uppercase `AND`, `OR`, and `ANDNOT` are operators (`AND NOT`
+ * reads as `ANDNOT`), operands with no operator between them are joined with
+ * `OR`, and every operator shares one precedence and groups to the right
+ * (`a op b op c` = `a op (b op c)`). Lifts `cat:` operands into category groups
  * that apply against the indexed category columns instead of FTS, and
  * `submittedDate:[… TO …]` into ISO bounds on the indexed `published` column —
  * but only an operand that is a conjunct of the whole query, the one place a
- * filter beside the FTS match means what arXiv means. Any other query is routed
- * to the live API. See issue #65.
+ * filter beside the FTS match means what arXiv means. Any query the mirror
+ * cannot read as arXiv does is routed to the live API. See issues #65, #82.
  *
  * Also exports {@link expandCategoryOperands}, the live path's counterpart to
  * the `cat:` subtree expansion this translator applies — one lexer, so a `cat:`
@@ -44,15 +46,46 @@ export interface MirrorQuery {
 }
 
 /**
- * Why a query goes to the live API: `filter_not_conjunct` — a `cat:` or
- * `submittedDate:` operand sits under an `OR` or on the right of an `ANDNOT`,
- * where no filter beside the FTS match expresses it; `no_positive_term` — with
- * its filters lifted, the query or a parenthesized group in it keeps terms only
- * on the right of an `ANDNOT`, which FTS5 cannot match on their own
- * (`(cat:cs.LG ANDNOT survey) AND transformer` included); `unbalanced_parens` —
- * the grouping has no single reading.
+ * Why a query goes to the live API:
+ *
+ * - `empty_category` — a lifted `cat:` operand, or `cat:`-only `OR` set, whose
+ *   subtree names no code in the taxonomy (`cat:zzz.*`): its category group
+ *   would be empty, and an empty group filters nothing, so the mirror would
+ *   widen the search to every category. A lifted date window always keeps both
+ *   bounds, so it never needs this.
+ * - `empty_field_value` — a field prefix with nothing, or only whitespace, after
+ *   it (`ti:`, `ti: x`, `ti:""`): arXiv binds the next word or refuses the
+ *   query, and the mirror would drop the column or the filter.
+ * - `empty_phrase` — a quoted phrase with no words in it (`""`, `"  "`).
+ * - `empty_query` — no term, no category, and no date window is left to match,
+ *   which on the mirror would return every paper it holds.
+ * - `field_not_in_mirror` — an `rn:` (report number), `id:`, or
+ *   `lastUpdatedDate:` operand, or a `submittedDate:` that is not a whole
+ *   `[YYYYMMDDHHMM TO YYYYMMDDHHMM]` range: arXiv reads each from a field the
+ *   mirror does not index or as a filter the mirror cannot apply.
+ * - `filter_not_conjunct` — a `cat:` or `submittedDate:` operand sits under an
+ *   `OR` or on the right of an `ANDNOT`, where no filter beside the FTS match
+ *   expresses it.
+ * - `no_positive_term` — with its filters lifted, the query or a parenthesized
+ *   group in it keeps terms only on the right of an `ANDNOT`, which FTS5 cannot
+ *   match on their own (`(cat:cs.LG ANDNOT survey) AND transformer` included).
+ * - `stopword_term` — an operand that is one word arXiv's index drops
+ *   ({@link STOPWORDS}): arXiv matches almost no paper for it and the mirror
+ *   almost every paper, so beside `OR` (adjacency included) it would widen the
+ *   answer to every paper the rest of the query allows. It goes live wherever it
+ *   sits, beside `AND` too.
+ * - `unbalanced_parens` — the grouping has no single reading.
  */
-export type LiveRouteReason = 'filter_not_conjunct' | 'no_positive_term' | 'unbalanced_parens';
+export type LiveRouteReason =
+  | 'empty_category'
+  | 'empty_field_value'
+  | 'empty_phrase'
+  | 'empty_query'
+  | 'field_not_in_mirror'
+  | 'filter_not_conjunct'
+  | 'no_positive_term'
+  | 'stopword_term'
+  | 'unbalanced_parens';
 
 /** A query only the live API answers as written. */
 export interface LiveQuery {
@@ -63,8 +96,13 @@ export interface LiveQuery {
 /** Result of translating an arXiv-syntax query to mirror inputs. */
 export type TranslatedQuery = MirrorQuery | LiveQuery;
 
-/** Field prefixes the lexer recognizes. Anything else stays a bare term. */
+/** Field prefixes the lexer serves. Any other prefix stays a bare term, bar {@link UNSERVED_FIELDS}. */
 type Field = 'ti' | 'au' | 'abs' | 'cat' | 'co' | 'jr' | 'all';
+
+/** A field prefix that reaches the FTS index. */
+type TextField = Exclude<Field, 'cat'>;
+
+type Operator = 'and' | 'or' | 'andnot';
 
 /** Source span `[start, end)` every token carries, so a rewrite can splice
  * one operand out of the original string and leave the rest byte-identical. */
@@ -75,9 +113,10 @@ interface Span {
 
 type Token = Span &
   (
-    | { kind: 'and' | 'or' | 'andnot' | 'lparen' | 'rparen' }
+    | { kind: Operator | 'lparen' | 'rparen' }
     | { kind: 'daterange'; from: string; to: string }
-    | { kind: 'field'; field: Field; value: string; phrase: boolean }
+    | { kind: 'field'; field: Field; value: string }
+    | { kind: 'unserved' }
     | { kind: 'term'; value: string; phrase: boolean }
   );
 
@@ -88,22 +127,59 @@ type Token = Span &
  */
 const DATE_RANGE_PATTERN = /^submittedDate:\[\s*(\d{12})\s+TO\s+(\d{12})\s*\]/i;
 
-const FIELD_MAP: Record<string, Field> = {
-  ti: 'ti',
-  au: 'au',
-  abs: 'abs',
-  cat: 'cat',
-  co: 'co',
-  jr: 'jr',
-  all: 'all',
-};
+/** Keyed by caller text, so a `Map`: a `{}` lookup of `constructor` would reach the prototype. */
+const FIELD_MAP: ReadonlyMap<string, Field> = new Map(
+  (['ti', 'au', 'abs', 'cat', 'co', 'jr', 'all'] as const).map((field) => [field, field]),
+);
+
+/**
+ * Prefixes arXiv answers that the mirror cannot: `rn:` reads report numbers,
+ * which the mirror does not store, `id:` reads identifiers, and
+ * `lastUpdatedDate:` is a date filter on a column the mirror does not filter. A
+ * `submittedDate:` that {@link DATE_RANGE_PATTERN} did not take is no range the
+ * mirror can lift. Each one sends the query live rather than reaching FTS as
+ * literal text. Keys are lowercase, as the lexer lowercases the prefix.
+ */
+const UNSERVED_FIELDS: ReadonlySet<string> = new Set([
+  'rn',
+  'id',
+  'lastupdateddate',
+  'submitteddate',
+]);
+
+/**
+ * Words arXiv's index drops, each measured live on 2026-10-23 as `all:<word>`
+ * against `all:we` (2,685,496) and `all:a` (1,027,834, kept: author initials):
+ * `of` 213, `and` 634, `to` 775, `the` 9,144, `for` 370, `in` 1,680, `on` 312,
+ * `with` 305, `not` 7, `by` 115, `is` 26, `as` 196, `an` 8,381; `or` from
+ * `ti:quantum or ti:graph` (220,581) against `ti:quantum OR ti:graph` (219,678).
+ * The mirror's FTS index keeps every one (`of` matches over 3 million papers),
+ * so an operand that is one of them goes live. Lucene's other English stop
+ * words are unmeasured and stay terms.
+ */
+const STOPWORDS: ReadonlySet<string> = new Set([
+  'an',
+  'and',
+  'as',
+  'by',
+  'for',
+  'in',
+  'is',
+  'not',
+  'of',
+  'on',
+  'or',
+  'the',
+  'to',
+  'with',
+]);
 
 /**
  * Prefix → `papers_fts` column. Every entry here has to be an indexed column of
  * the FTS5 table (schema v3 indexes all five) — routing a prefix at a column
  * outside the index raises `no such column` at query time, not at build time.
  */
-const FTS_COLUMN: Record<Exclude<Field, 'cat' | 'all'>, string> = {
+const FTS_COLUMN: Record<Exclude<TextField, 'all'>, string> = {
   ti: 'title',
   au: 'authors',
   abs: 'abstract',
@@ -119,6 +195,11 @@ const ALL_COLUMNS: readonly string[] = Object.values(FTS_COLUMN);
 // Lexer
 // ---------------------------------------------------------------------------
 
+/**
+ * Operator words are case-sensitive, as on arXiv: `or` and `andnot` are search
+ * terms. `AND` followed by the bare word `NOT` is one `ANDNOT` token, the parse
+ * arXiv echoes for it.
+ */
 function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
   let i = 0;
@@ -149,35 +230,50 @@ function tokenize(input: string): Token[] {
     const fieldMatch = input.slice(i).match(/^([A-Za-z]+):/);
     if (fieldMatch) {
       const fieldName = (fieldMatch[1] ?? '').toLowerCase();
-      const field = FIELD_MAP[fieldName];
-      if (field) {
+      const field = FIELD_MAP.get(fieldName);
+      if (field || UNSERVED_FIELDS.has(fieldName)) {
         i += fieldMatch[0].length;
-        const { value, phrase, consumed } = consumeValue(input, i);
+        const { value, consumed } = consumeValue(input, i);
         i += consumed;
-        tokens.push({ kind: 'field', field, value, phrase, start, end: i });
+        tokens.push(
+          field
+            ? { kind: 'field', field, value, start, end: i }
+            : { kind: 'unserved', start, end: i },
+        );
         continue;
       }
     }
     // Bare word or quoted phrase
     const { value, phrase, consumed } = consumeValue(input, i);
     i += consumed;
-    if (value.length === 0) continue;
-    const upper = value.toUpperCase();
-    if (upper === 'AND' && !phrase) {
-      tokens.push({ kind: 'and', start, end: i });
-      continue;
+    if (!phrase && value === 'AND') {
+      const not = followingNot(input, i);
+      if (not !== undefined) {
+        i = not;
+        tokens.push({ kind: 'andnot', start, end: i });
+        continue;
+      }
     }
-    if (upper === 'OR' && !phrase) {
-      tokens.push({ kind: 'or', start, end: i });
-      continue;
-    }
-    if (upper === 'ANDNOT' && !phrase) {
-      tokens.push({ kind: 'andnot', start, end: i });
+    if (!phrase && (value === 'AND' || value === 'OR' || value === 'ANDNOT')) {
+      tokens.push({
+        kind: value === 'AND' ? 'and' : value === 'OR' ? 'or' : 'andnot',
+        start,
+        end: i,
+      });
       continue;
     }
     tokens.push({ kind: 'term', value, phrase, start, end: i });
   }
   return tokens;
+}
+
+/** The end of a bare `NOT` word that is the next token after `from`, if it is one. */
+function followingNot(input: string, from: number): number | undefined {
+  let i = from;
+  while (i < input.length && /\s/.test(input[i] ?? '')) i++;
+  if (input[i] === '"') return;
+  const { value, consumed } = consumeValue(input, i);
+  return value === 'NOT' ? i + consumed : undefined;
 }
 
 function consumeValue(
@@ -207,34 +303,118 @@ function consumeValue(
 // ---------------------------------------------------------------------------
 
 /**
- * One operand or parenthesized group, as it sits inside a conjunction. A `text`
- * operand is one FTS5 phrase, in the column its prefix names (any column when
- * it has none), or the `all:` disjunction across the columns.
+ * A node of the parsed query: an operand, a parenthesized group, or an operator
+ * with its two operands. A `text` operand is one FTS5 phrase, in the column its
+ * prefix names (any column when it has none), or the `all:` disjunction across
+ * the columns. `filters` and `catOnly` are settled when the node is built.
  */
-type Item =
-  | { kind: 'cat'; value: string }
-  | { kind: 'window'; from: string; to: string }
-  | { kind: 'text'; field?: Exclude<Field, 'cat'>; value: string }
-  | { kind: 'group'; group: Group };
-
-/** Items joined by `AND`, explicit or implicit — the tightest-binding operator. */
-interface Conjunction {
-  /** `explicit[i]`: an `AND` token joined `items[i]` to the item before it. */
-  explicit: boolean[];
-  items: Item[];
-}
-
-/** A parenthesized expression, or the whole query. */
-interface Group {
+type Node = {
   /** Only `cat:` operands, alone or in groups of their own, joined by `OR`: one category group. */
   catOnly: boolean;
-  conjunctions: Conjunction[];
-  /** Every item is a filter lifted out of the FTS expression, so the group emits nothing. */
-  empty: boolean;
-  /** The group holds a `cat:` or `submittedDate:` operand at any depth. */
+  /** The node holds a `cat:` or `submittedDate:` operand at any depth. */
   filters: boolean;
-  /** `ops[i]` joins `conjunctions[i]` to `conjunctions[i + 1]`. */
-  ops: ('or' | 'andnot')[];
+} & (
+  | { kind: 'cat'; value: string }
+  | { kind: 'window'; from: string; to: string }
+  | { kind: 'text'; field?: TextField; value: string }
+  | { kind: 'group'; child: Node }
+  | { kind: Operator; left: Node; right: Node }
+);
+
+type Join = Extract<Node, { kind: Operator }>;
+
+const join = (kind: Operator, left: Node, right: Node): Node => ({
+  kind,
+  left,
+  right,
+  filters: left.filters || right.filters,
+  catOnly: kind === 'or' && left.catOnly && right.catOnly,
+});
+
+const group = (child: Node): Node => ({
+  kind: 'group',
+  child,
+  filters: child.filters,
+  catOnly: child.catOnly,
+});
+
+/**
+ * Parse with arXiv's grammar into a tree. Each paren level is read as a flat
+ * chain of operands and operators, then folded from the right as the level
+ * closes, so `a op b op c` becomes `a op (b op c)`; adjacent operands are joined
+ * with `OR`. Iterative throughout: caller text can nest as deep as it is long.
+ *
+ * Operators are read tolerantly: one with no left operand, one
+ * straight after another (the earlier wins), and a trailing one are dropped,
+ * and an empty `()` contributes nothing.
+ */
+function parse(tokens: readonly Token[]): { root: Node | undefined } | LiveQuery {
+  /** A paren level being read: its operands, the operators between them, and the operator read since its last operand. */
+  interface Frame {
+    items: Node[];
+    ops: Operator[];
+    pending: Operator | undefined;
+  }
+  const stack: Frame[] = [{ items: [], ops: [], pending: undefined }];
+
+  const attach = (frame: Frame, item: Node) => {
+    if (frame.items.length > 0) frame.ops.push(frame.pending ?? 'or');
+    frame.items.push(item);
+    frame.pending = undefined;
+  };
+  const fold = ({ items, ops }: Frame): Node | undefined => {
+    let node = items.at(-1);
+    for (let i = items.length - 2; i >= 0; i--) {
+      node = join(ops[i] as Operator, items[i] as Node, node as Node);
+    }
+    return node;
+  };
+  const live = (reason: LiveRouteReason): LiveQuery => ({ route: 'live', reason });
+
+  for (const t of tokens) {
+    const frame = stack.at(-1) as Frame;
+    switch (t.kind) {
+      case 'lparen':
+        stack.push({ items: [], ops: [], pending: undefined });
+        break;
+      case 'rparen': {
+        if (stack.length === 1) return live('unbalanced_parens');
+        stack.pop();
+        const child = fold(frame);
+        if (child) attach(stack.at(-1) as Frame, group(child));
+        break;
+      }
+      case 'and':
+      case 'or':
+      case 'andnot':
+        if (frame.items.length > 0 && frame.pending === undefined) frame.pending = t.kind;
+        break;
+      case 'daterange':
+        attach(frame, { kind: 'window', from: t.from, to: t.to, filters: true, catOnly: false });
+        break;
+      case 'field':
+        if (t.value.trim().length === 0) return live('empty_field_value');
+        if (t.field !== 'cat' && STOPWORDS.has(t.value.trim().toLowerCase())) {
+          return live('stopword_term');
+        }
+        attach(
+          frame,
+          t.field === 'cat'
+            ? { kind: 'cat', value: t.value, filters: true, catOnly: true }
+            : { kind: 'text', field: t.field, value: t.value, filters: false, catOnly: false },
+        );
+        break;
+      case 'unserved':
+        return live('field_not_in_mirror');
+      case 'term':
+        if (t.value.trim().length === 0) return live('empty_phrase');
+        if (STOPWORDS.has(t.value.trim().toLowerCase())) return live('stopword_term');
+        attach(frame, { kind: 'text', value: t.value, filters: false, catOnly: false });
+        break;
+    }
+  }
+  if (stack.length > 1) return live('unbalanced_parens');
+  return { root: fold(stack[0] as Frame) };
 }
 
 /** What a mirror search applies beside the FTS match. */
@@ -243,220 +423,188 @@ interface Lifted {
   published: Bounds;
 }
 
-const isFilter = (item: Item): boolean =>
-  item.kind === 'cat' || item.kind === 'window' || (item.kind === 'group' && item.group.filters);
-
-/** Whether the item reaches the FTS expression: lifted filters and emptied groups do not. */
-const isKept = (item: Item): boolean =>
-  item.kind === 'text' || (item.kind === 'group' && !item.group.empty);
-
 /**
- * Parse with arXiv's precedence and lift each filter that is a conjunct of the
- * whole query. A group's first conjunction holds its conjuncts when the group
- * has no `OR`: its other conjunctions each sit on the right of an `ANDNOT`.
- * Filters are lifted as each group closes; a filter found anywhere else ends the
- * parse live, so a lift that turns out not to be a conjunct of the whole query
- * is never used. Iterative throughout: caller text can nest as deep as it is long.
+ * Lift each filter that is a conjunct of the whole query: every step from the
+ * root to it is either side of an `AND` or the left side of an `ANDNOT`, and
+ * parentheses are no step. A `cat:`-only `OR` set reached that way is one
+ * category group. A filter anywhere else routes the query live, so a lift is
+ * used only when the filter beside the match means what arXiv means.
  *
- * Operators are read as tolerantly as before: one with no left operand, one
- * straight after another (the earlier wins), and a trailing one are dropped,
- * and an empty `()` contributes nothing.
+ * Returns the lifted nodes and every operator and group the walk passed
+ * through, each before its operands, for {@link residual}.
  */
-function parse(tokens: readonly Token[]): { lifted: Lifted; root: Group } | LiveQuery {
+function lift(
+  root: Node,
+): { lifted: Lifted; removed: Set<Node>; visited: Node[] } | LiveRouteReason {
   const lifted: Lifted = { categoryGroups: [], published: {} };
-  const newGroup = (): Group => ({
-    catOnly: false,
-    conjunctions: [],
-    empty: false,
-    filters: false,
-    ops: [],
-  });
-  /** A group being read, and the operator read since its last item. */
-  interface Frame {
-    group: Group;
-    pending: 'and' | 'or' | 'andnot' | undefined;
-  }
-  const root = newGroup();
-  const stack: Frame[] = [{ group: root, pending: undefined }];
-
-  // An `OR` or `ANDNOT` is pending only after an item, so it always has a left operand.
-  const attach = (frame: Frame, item: Item) => {
-    const { group, pending } = frame;
-    frame.pending = undefined;
-    const last = group.conjunctions.at(-1);
-    if (pending === 'or' || pending === 'andnot') {
-      group.ops.push(pending);
-      group.conjunctions.push({ items: [item], explicit: [false] });
-    } else if (last) {
-      last.items.push(item);
-      last.explicit.push(pending === 'and');
-    } else {
-      group.conjunctions.push({ items: [item], explicit: [false] });
+  const removed = new Set<Node>();
+  const visited: Node[] = [];
+  const stack: { conjunct: boolean; node: Node }[] = [{ node: root, conjunct: true }];
+  for (let next = stack.pop(); next; next = stack.pop()) {
+    const { node, conjunct } = next;
+    if (!node.filters) continue;
+    if (!conjunct) return 'filter_not_conjunct';
+    if (node.catOnly) {
+      const codes = catOnlyCodes(node);
+      // An empty group is no filter at all downstream, so lifting it would widen the search.
+      if (codes.length === 0) return 'empty_category';
+      lifted.categoryGroups.push(codes);
+      removed.add(node);
+      continue;
     }
-  };
-
-  for (const t of tokens) {
-    const frame = stack.at(-1) as Frame;
-    switch (t.kind) {
-      case 'lparen':
-        stack.push({ group: newGroup(), pending: undefined });
+    switch (node.kind) {
+      case 'window':
+        lifted.published = intersectBounds(lifted.published, {
+          from: stampToIso(node.from),
+          to: stampToIso(node.to),
+        });
+        removed.add(node);
         break;
-      case 'rparen': {
-        if (stack.length === 1) return { route: 'live', reason: 'unbalanced_parens' };
-        stack.pop();
-        const reason = closeGroup(frame.group, lifted);
-        if (reason) return { route: 'live', reason };
-        if (frame.group.conjunctions.length > 0) {
-          attach(stack.at(-1) as Frame, { kind: 'group', group: frame.group });
-        }
+      case 'group':
+        visited.push(node);
+        stack.push({ node: node.child, conjunct });
         break;
-      }
-      case 'and':
+      // Not `catOnly`, so a filter below it is a disjunct of something else.
       case 'or':
+        return 'filter_not_conjunct';
+      case 'and':
       case 'andnot':
-        if (frame.group.conjunctions.length > 0 && frame.pending === undefined) {
-          frame.pending = t.kind;
-        }
-        break;
-      case 'daterange':
-        attach(frame, { kind: 'window', from: t.from, to: t.to });
-        break;
-      case 'field':
-        if (t.field === 'cat') attach(frame, { kind: 'cat', value: t.value });
-        else attach(frame, { kind: 'text', field: t.field, value: t.value });
-        break;
-      case 'term':
-        attach(frame, { kind: 'text', value: t.value });
+        visited.push(node);
+        // The left operand pops first, so category groups keep source order.
+        stack.push({ node: node.right, conjunct: node.kind === 'and' });
+        stack.push({ node: node.left, conjunct });
         break;
     }
   }
-  if (stack.length > 1) return { route: 'live', reason: 'unbalanced_parens' };
-  const reason = closeGroup(root, lifted);
-  if (reason) return { route: 'live', reason };
-  if (root.catOnly) lifted.categoryGroups.push(catOnlyCodes(root));
-  return { lifted, root };
+  return { lifted, removed, visited };
 }
 
-/**
- * Settle a group whose items have all closed: whether it holds filters, whether
- * it is one `cat:`-only `OR` set, and — taking it as a conjunct of the query —
- * lift its own conjunct filters into `lifted`. Returns the reason the query goes
- * live when a filter sits anywhere a lift would change what the query matches.
- */
-function closeGroup(group: Group, lifted: Lifted): LiveRouteReason | undefined {
-  group.filters = group.conjunctions.some((c) => c.items.some(isFilter));
-  if (!group.filters) return;
-  group.catOnly =
-    group.ops.every((op) => op === 'or') &&
-    group.conjunctions.every(
-      ({ items }) =>
-        items.length === 1 &&
-        (items[0]?.kind === 'cat' || (items[0]?.kind === 'group' && items[0].group.catOnly)),
-    );
-  // Lifted as one category group by whichever group finds it a conjunct.
-  if (group.catOnly) {
-    group.empty = true;
-    return;
-  }
-  if (group.ops.includes('or')) return 'filter_not_conjunct';
-  const [first, ...negated] = group.conjunctions;
-  if (!first || negated.some((c) => c.items.some(isFilter))) return 'filter_not_conjunct';
-  for (const item of first.items) {
-    if (item.kind === 'cat') {
-      lifted.categoryGroups.push(categorySubtree(item.value));
-    } else if (item.kind === 'window') {
-      lifted.published = intersectBounds(lifted.published, {
-        from: stampToIso(item.from),
-        to: stampToIso(item.to),
-      });
-    } else if (item.kind === 'group' && item.group.catOnly) {
-      lifted.categoryGroups.push(catOnlyCodes(item.group));
-    }
-  }
-  const kept = first.items.some(isKept);
-  group.empty = !kept;
-  return !kept && negated.length > 0 ? 'no_positive_term' : undefined;
-}
-
-/** The union of the subtrees a `cat:`-only `OR` group names, in source order. */
-function catOnlyCodes(group: Group): string[] {
+/** The union of the subtrees a `cat:`-only `OR` set names, in source order. */
+function catOnlyCodes(node: Node): string[] {
   const codes = new Set<string>();
-  const pending: Item[] = [];
-  const queue = ({ conjunctions }: Group) => {
-    for (let i = conjunctions.length - 1; i >= 0; i--) {
-      pending.push(conjunctions[i]?.items[0] as Item);
-    }
-  };
-  queue(group);
-  for (let item = pending.pop(); item; item = pending.pop()) {
-    if (item.kind === 'group') queue(item.group);
-    else if (item.kind === 'cat') for (const code of categorySubtree(item.value)) codes.add(code);
+  const pending: Node[] = [node];
+  for (let next = pending.pop(); next; next = pending.pop()) {
+    if (next.kind === 'group') pending.push(next.child);
+    else if (next.kind === 'or') pending.push(next.right, next.left);
+    else if (next.kind === 'cat') for (const code of categorySubtree(next.value)) codes.add(code);
   }
   return [...codes];
+}
+
+/**
+ * What a node leaves for the FTS expression once its filters are lifted:
+ * nothing, a positive expression, or `negated` — the terms on the right of an
+ * `ANDNOT` whose left operand was lifted whole, which FTS5 can only express
+ * beside a positive term (`x AND (cat:X ANDNOT r)` emits `x NOT r`).
+ */
+type Residual = { kind: 'empty' } | { kind: 'positive' | 'negated'; node: Node };
+
+/**
+ * The FTS tree left once the lifted filters are taken out, settled bottom-up
+ * over the nodes {@link lift} passed through (each after its operands), or the
+ * reason the query goes live: a parenthesized group, or the whole query, whose
+ * residual is negated alone.
+ */
+function residual(
+  root: Node,
+  removed: ReadonlySet<Node>,
+  visited: readonly Node[],
+): Residual | LiveRouteReason {
+  const settled = new Map<Node, Residual>();
+  const of = (node: Node): Residual =>
+    settled.get(node) ?? (removed.has(node) ? { kind: 'empty' } : { kind: 'positive', node });
+  for (let i = visited.length - 1; i >= 0; i--) {
+    const node = visited[i] as Node;
+    if (node.kind === 'group') {
+      const inner = of(node.child);
+      if (inner.kind === 'negated') return 'no_positive_term';
+      settled.set(
+        node,
+        inner.kind === 'empty'
+          ? inner
+          : { kind: 'positive', node: inner.node === node.child ? node : group(inner.node) },
+      );
+    } else if (node.kind === 'and' || node.kind === 'andnot') {
+      settled.set(node, combine(node, of(node.left), of(node.right)));
+    }
+  }
+  const top = of(root);
+  return top.kind === 'negated' ? 'no_positive_term' : top;
+}
+
+/** An `AND` or `ANDNOT` node's residual, from its operands' residuals. */
+function combine(node: Join, left: Residual, right: Residual): Residual {
+  // The right of an ANDNOT holds no filter, so it is always positive.
+  const r =
+    node.kind === 'andnot' && right.kind === 'positive'
+      ? { ...right, kind: 'negated' as const }
+      : right;
+  if (left.kind === 'empty') return r;
+  if (r.kind === 'empty') return left;
+  if (left.kind === 'positive' && r.kind === 'positive') {
+    return {
+      kind: 'positive',
+      node:
+        left.node === node.left && r.node === node.right ? node : join('and', left.node, r.node),
+    };
+  }
+  if (left.kind === 'positive' || r.kind === 'positive') {
+    const [kept, negated] = left.kind === 'positive' ? [left, r] : [r, left];
+    const unchanged =
+      node.kind === 'andnot' && kept.node === node.left && negated.node === node.right;
+    return { kind: 'positive', node: unchanged ? node : join('andnot', kept.node, negated.node) };
+  }
+  return { kind: 'negated', node: join('or', left.node, r.node) };
 }
 
 // ---------------------------------------------------------------------------
 // FTS5 emission
 // ---------------------------------------------------------------------------
 
-/** Whether an item's emitted form is parenthesized: a group, or an `all:` expansion. */
-const isParenthesized = (item: Item): boolean =>
-  item.kind === 'group' || (item.kind === 'text' && item.field === 'all');
+const FTS_OPERATOR: Record<Operator, string> = { and: ' AND ', or: ' OR ', andnot: ' NOT ' };
 
 /**
- * Emit the FTS5 expression for a parsed query, top-down with an explicit work
- * stack. Lifted filters and emptied groups are left out with the join that
- * held them. Two places need more than the source text:
- *
- * - FTS5 binds `NOT` tighter than `AND`, the reverse of arXiv, so a conjunction
- *   of two or more items on the right of an `ANDNOT` is parenthesized:
- *   `a ANDNOT b AND c` emits `"a" NOT ("b" AND "c")`.
- * - FTS5 honors an implicit `AND` only between bare phrases, so an implicit
- *   join beside a parenthesized form becomes an explicit `AND` (issue #13).
+ * Emit the FTS5 expression for a filter-free tree, top-down with an explicit
+ * work stack. Every operand of an operator that is itself an operator is
+ * parenthesized, so FTS5's own precedence (`NOT` over `AND` over `OR`) and its
+ * implicit `AND` never decide a grouping: `a ANDNOT b AND c` emits
+ * `"a" NOT ("b" AND "c")`, and adjacent `a b` emits `"a" OR "b"`.
  */
-function emitMatch(root: Group): string | undefined {
+function emitMatch(root: Node): string {
   const out: string[] = [];
-  const work: (string | Group)[] = [root];
+  const work: (string | Node)[] = [root];
+  const pushOperand = (node: Node) => {
+    if (node.kind === 'and' || node.kind === 'or' || node.kind === 'andnot') {
+      work.push(')', node, '(');
+    } else {
+      work.push(node);
+    }
+  };
   for (let next = work.pop(); next !== undefined; next = work.pop()) {
     if (typeof next === 'string') {
       out.push(next);
       continue;
     }
-    const pieces = groupPieces(next);
-    for (let i = pieces.length - 1; i >= 0; i--) work.push(pieces[i] as string | Group);
-  }
-  return out.length > 0 ? out.join('') : undefined;
-}
-
-/** One group's emitted pieces, in order; a nested group stays a `Group` for the work stack. */
-function groupPieces(group: Group): (string | Group)[] {
-  const pieces: (string | Group)[] = [];
-  for (const [index, conjunction] of group.conjunctions.entries()) {
-    const kept = conjunction.items.filter(isKept);
-    if (kept.length === 0) continue;
-    const op = index > 0 ? group.ops[index - 1] : undefined;
-    if (op) pieces.push(op === 'or' ? ' OR ' : ' NOT ');
-    const wrap = op === 'andnot' && kept.length > 1;
-    if (wrap) pieces.push('(');
-    let prev: Item | undefined;
-    let explicit = false;
-    for (const [i, item] of conjunction.items.entries()) {
-      explicit ||= conjunction.explicit[i] === true;
-      if (!isKept(item)) continue;
-      if (prev) {
-        pieces.push(explicit || isParenthesized(prev) || isParenthesized(item) ? ' AND ' : ' ');
-      }
-      if (item.kind === 'group') pieces.push('(', item.group, ')');
-      else if (item.kind === 'text') pieces.push(ftsOperand(item.field, item.value));
-      prev = item;
-      explicit = false;
+    switch (next.kind) {
+      case 'text':
+        out.push(ftsOperand(next.field, next.value));
+        break;
+      case 'group':
+        work.push(')', next.child, '(');
+        break;
+      case 'and':
+      case 'or':
+      case 'andnot':
+        pushOperand(next.right);
+        work.push(FTS_OPERATOR[next.kind]);
+        pushOperand(next.left);
+        break;
     }
-    if (wrap) pieces.push(')');
   }
-  return pieces;
+  return out.join('');
 }
 
-function ftsOperand(field: Exclude<Field, 'cat'> | undefined, raw: string): string {
+function ftsOperand(field: TextField | undefined, raw: string): string {
   const value = quoteFtsValue(raw);
   if (field === undefined) return value;
   if (field === 'all') return `(${ALL_COLUMNS.map((col) => `${col}:${value}`).join(' OR ')})`;
@@ -470,21 +618,36 @@ function ftsOperand(field: Exclude<Field, 'cat'> | undefined, raw: string): stri
 /**
  * Translate an arXiv-syntax query into an FTS5 MATCH expression plus the
  * structured filters that cannot ride in FTS — category groups and a
- * submitted-date window — or route it live. A `cat:` or `submittedDate:`
- * operand is lifted only when it is a conjunct of the whole query: reached from
- * the top through `AND` alone, or in the first operand of an `ANDNOT` on a
- * level with no `OR`. There a filter beside the match means exactly what arXiv
- * means; anywhere else (`t OR cat:X`, `t ANDNOT cat:X`) it cannot, and the query
- * goes live, as does one whose residual has no positive term. See issue #65.
+ * submitted-date window — or route it live. The query is read with arXiv's
+ * grammar (see the module header). A `cat:` or `submittedDate:` operand is
+ * lifted only when it is a conjunct of the whole query: every step from the top
+ * to it is either side of an `AND` or the left side of an `ANDNOT`. There a
+ * filter beside the match means exactly what arXiv means; anywhere else
+ * (`t OR cat:X`, `t cat:X`, `t ANDNOT cat:X`) it cannot, and the query goes
+ * live, as does one the mirror cannot read at all ({@link LiveRouteReason}).
+ * See issues #65, #82.
  */
 export function translateQuery(query: string): TranslatedQuery {
   const parsed = parse(tokenize(query));
   if ('route' in parsed) return parsed;
-  const matchExpr = emitMatch(parsed.root);
+  if (!parsed.root) return { route: 'live', reason: 'empty_query' };
+  const lifting = lift(parsed.root);
+  if (typeof lifting === 'string') return { route: 'live', reason: lifting };
+  const left = residual(parsed.root, lifting.removed, lifting.visited);
+  if (typeof left === 'string') return { route: 'live', reason: left };
+  const { lifted } = lifting;
+  if (
+    left.kind === 'empty' &&
+    lifted.categoryGroups.length === 0 &&
+    lifted.published.from === undefined &&
+    lifted.published.to === undefined
+  ) {
+    return { route: 'live', reason: 'empty_query' };
+  }
   return {
     route: 'mirror',
-    ...(matchExpr !== undefined && { matchExpr }),
-    ...parsed.lifted,
+    ...(left.kind === 'positive' && { matchExpr: emitMatch(left.node) }),
+    ...lifted,
   };
 }
 
@@ -519,10 +682,9 @@ export function expandCategoryOperands(query: string): string {
 /**
  * Encode a value as an FTS5 quoted token. Quoting handles whitespace,
  * punctuation, and FTS5 reserved characters in one stroke; double-quotes
- * inside the value are escaped per FTS5 syntax (`""`).
+ * inside the value are escaped per FTS5 syntax (`""`). The parser routes an
+ * empty or whitespace-only value live, so every value here has a word in it.
  */
 function quoteFtsValue(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return '""';
-  return `"${trimmed.replace(/"/g, '""')}"`;
+  return `"${value.trim().replace(/"/g, '""')}"`;
 }

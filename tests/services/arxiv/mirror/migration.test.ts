@@ -2,6 +2,7 @@
  * @fileoverview Tests for the v1→v2 mirror schema migration — date
  * normalization (RFC 2822 → ISO 8601), paper_categories junction population,
  * and migration idempotency. Also covers the v2→v3 index rebuild (issue #37),
+ * the v3→v4 junction backfill and date-index rebuild (issue #78),
  * the one-writer guard on migrating and creating a file (issue #71),
  * sort-order correctness (issue #18), and index-backed category COUNT
  * (issue #19).
@@ -15,7 +16,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MIRROR_SCHEMA_VERSION } from '@/services/arxiv/mirror/schema.js';
+import {
+  MIRROR_PRAGMA_STATEMENTS,
+  MIRROR_SCHEMA_STATEMENTS,
+  MIRROR_SCHEMA_VERSION,
+} from '@/services/arxiv/mirror/schema.js';
 import { MirrorStore, normalizeDateToIso, rawToRow } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
 
@@ -268,18 +273,18 @@ describe('v1→v2 migration', () => {
     expect(iso1).toMatch(ISO_RE);
   });
 
-  it('denormalizes updated into the junction and indexes (category, updated)', async () => {
+  it('denormalizes updated into the junction and indexes (category, updated, paper_id, published)', async () => {
     await buildV1Db();
     const store = await MirrorStore.open(dbPath);
     store.close();
 
     const { Database } = await import('bun:sqlite');
     const db = new Database(dbPath);
-    // Composite index present, in (category, updated) order.
+    // Composite index present, leading with (category, updated); v4 widened it (#78).
     const idxCols = db.prepare(`PRAGMA index_info(paper_categories_cat_updated_idx)`).all() as {
       name: string;
     }[];
-    expect(idxCols.map((c) => c.name)).toEqual(['category', 'updated']);
+    expect(idxCols.map((c) => c.name)).toEqual(['category', 'updated', 'paper_id', 'published']);
     // updated is denormalized into the junction as ISO 8601 (mirrors papers.updated).
     const jrow = db
       .prepare(
@@ -568,12 +573,12 @@ describe('v2→v3 migration (#37)', () => {
     };
 
     const store = await MirrorStore.open(dbPath);
-    expect(store.schemaVersion().current).toBe(3);
+    expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
     expect(await indexes()).not.toContain('paper_categories_paper_id_idx');
 
     store.ensureWriteIndex();
     expect(await indexes()).toContain('paper_categories_paper_id_idx');
-    expect(store.schemaVersion().current).toBe(3);
+    expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
     expect(idsFor(store, 'journal_ref:"Nature"')).toEqual(['2101.00001']);
     store.close();
   });
@@ -723,7 +728,11 @@ describe('v2→v3 migration (#37)', () => {
 
       // 40,000 rows in 5,000-row batches: one full rebuild, by one writer.
       expect(results.map((r) => r.rebuildBatches).sort((a, b) => a - b)).toEqual([0, 8]);
-      expect(await readFile()).toEqual({ integrity: 'ok', leases: [], version: 3 });
+      expect(await readFile()).toEqual({
+        integrity: 'ok',
+        leases: [],
+        version: MIRROR_SCHEMA_VERSION,
+      });
       expect(await ftsColumns()).toEqual([
         'title',
         'authors',
@@ -752,7 +761,7 @@ describe('v2→v3 migration (#37)', () => {
         data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 2 },
       });
       expect((failure as McpError).message).toMatch(
-        /from schema v2 to v3 by another writer \(pid 4242, .*changed nothing\. Run it again once that migration finishes\./,
+        /from schema v2 to v4 by another writer \(pid 4242, .*changed nothing\. Run it again once that migration finishes\./,
       );
       expect(batches).toBe(0);
       expect(await ftsColumns()).toEqual(['title', 'authors', 'abstract']);
@@ -769,7 +778,11 @@ describe('v2→v3 migration (#37)', () => {
       const store = await MirrorStore.open(dbPath);
       expect(idsFor(store, 'comment:"ICML"')).toEqual(['2101.00001']);
       store.close();
-      expect(await readFile()).toEqual({ integrity: 'ok', leases: [], version: 3 });
+      expect(await readFile()).toEqual({
+        integrity: 'ok',
+        leases: [],
+        version: MIRROR_SCHEMA_VERSION,
+      });
     });
 
     it('stops a writer whose lease another writer took over, before its next batch', async () => {
@@ -807,7 +820,11 @@ describe('v2→v3 migration (#37)', () => {
         (await MirrorStore.open(dbPath)).close();
       });
       expect(rebuilt).toBe(3);
-      expect(await readFile()).toEqual({ integrity: 'ok', leases: [], version: 3 });
+      expect(await readFile()).toEqual({
+        integrity: 'ok',
+        leases: [],
+        version: MIRROR_SCHEMA_VERSION,
+      });
     });
 
     it('drops its lease when the migration fails for another reason', async () => {
@@ -833,7 +850,11 @@ describe('v2→v3 migration (#37)', () => {
       fix.run('DROP TRIGGER fail_backfill');
       fix.close();
       (await MirrorStore.open(dbPath)).close();
-      expect(await readFile()).toEqual({ integrity: 'ok', leases: [], version: 3 });
+      expect(await readFile()).toEqual({
+        integrity: 'ok',
+        leases: [],
+        version: MIRROR_SCHEMA_VERSION,
+      });
     });
 
     it('names the migration, not the lock, when the busy wait runs out on a live lease', async () => {
@@ -883,6 +904,457 @@ describe('v2→v3 migration (#37)', () => {
         { version: MIRROR_SCHEMA_VERSION },
       ]);
       check.close();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3 → v4 migration (issue #78) — the junction's `published` column and the
+// date-order indexes the bounded category- and date-only searches read.
+// ---------------------------------------------------------------------------
+
+/** The three v3 date indexes v4 widens, verbatim, as a pre-migration fixture. */
+const V3_DATE_INDEX_SQL = [
+  'CREATE INDEX papers_published_idx ON papers(published)',
+  'CREATE INDEX papers_updated_idx ON papers(updated)',
+  'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated)',
+];
+
+/** The five date-order indexes as v4 defines them, by name. */
+const V4_DATE_INDEX_COLUMNS = {
+  paper_categories_cat_published_idx: ['category', 'published', 'paper_id'],
+  paper_categories_cat_updated_idx: ['category', 'updated', 'paper_id', 'published'],
+  papers_published_idx: ['published', 'updated'],
+  papers_updated_idx: ['updated', 'published'],
+  papers_revised_early_idx: ['published', 'updated'],
+};
+
+describe('v3→v4 migration (#78)', () => {
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-migration-v4-test-'));
+    dbPath = join(dir, 'mirror.db');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * A v3 mirror of `count` papers, each in three categories: the schema
+   * statements v4 left as they were, the v3 date indexes, rows written with raw
+   * SQL (so a large file builds in seconds) and junction rows without
+   * `published`, as a v3 writer left them, and schema_version 3.
+   */
+  async function buildV3Db(count: number): Promise<void> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    for (const sql of [
+      ...MIRROR_PRAGMA_STATEMENTS,
+      ...MIRROR_SCHEMA_STATEMENTS,
+      ...V3_DATE_INDEX_SQL,
+    ]) {
+      db.prepare(sql).run();
+    }
+    db.prepare(
+      `INSERT INTO schema_version(version, applied_at) VALUES (3, '2026-10-09T00:00:00.000Z')`,
+    ).run();
+    db.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+       INSERT INTO papers(id, version, title, authors, abstract, primary_category,
+                          categories, published, updated, latest_version)
+       SELECT printf('2401.%05d', i), '1', 'Paper ' || i, 'A. Author', 'Abstract ' || i, 'cs.LG',
+              'cs.LG math.AP stat.ML',
+              strftime('%Y-%m-%dT%H:%M:%fZ', '2024-01-01', '+' || i || ' hours'),
+              strftime('%Y-%m-%dT%H:%M:%fZ', '2024-01-01', '+' || (i + 24 * (i % 4)) || ' hours'),
+              strftime('%Y-%m-%dT%H:%M:%fZ', '2024-01-01', '+' || (i + 24 * (i % 4)) || ' hours')
+       FROM n`,
+    ).run(count);
+    for (const code of ['cs.LG', 'math.AP', 'stat.ML']) {
+      db.prepare(
+        `INSERT INTO paper_categories(category, paper_id, updated) SELECT ?, id, updated FROM papers`,
+      ).run(code);
+    }
+    db.close();
+  }
+
+  /** Record another writer's migration lease, last renewed at `renewedAt`. */
+  async function setLease(renewedAt: string): Promise<void> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.run(
+      `INSERT OR REPLACE INTO migration_lease(id, holder, pid, started_at, renewed_at)
+       VALUES (1, 'another-writer', 4242, '2026-01-01T00:00:00.000Z', ?)`,
+      [renewedAt],
+    );
+    db.close();
+  }
+
+  /** What a migration leaves behind, read on a separate connection. */
+  async function inspect(path = dbPath): Promise<{
+    junctionColumns: string[];
+    junctionRows: number;
+    leases: string[];
+    papers: number;
+    unfilled: number;
+    version: number | undefined;
+  }> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(path, { readonly: true });
+    const junctionColumns = (
+      db.query('PRAGMA table_info(paper_categories)').all() as { name: string }[]
+    ).map((c) => c.name);
+    const count = (sql: string) => (db.query(sql).get() as { n: number }).n;
+    const result = {
+      junctionColumns,
+      junctionRows: count('SELECT COUNT(*) AS n FROM paper_categories'),
+      leases: (db.query('SELECT holder FROM migration_lease').all() as { holder: string }[]).map(
+        (l) => l.holder,
+      ),
+      papers: count('SELECT COUNT(*) AS n FROM papers'),
+      // Junction rows whose `published` is not their paper's.
+      unfilled: junctionColumns.includes('published')
+        ? count(
+            `SELECT COUNT(*) AS n FROM paper_categories pc
+             LEFT JOIN papers p ON p.id = pc.paper_id
+             WHERE p.published IS NULL OR pc.published IS NOT p.published`,
+          )
+        : -1,
+      version: (db.query('SELECT version FROM schema_version').get() as { version: number })
+        ?.version,
+    };
+    db.close();
+    return result;
+  }
+
+  /**
+   * The definitions of every column, index, and trigger on `papers` and
+   * `paper_categories`, as SQLite reports them, plus the SQL it stores for each.
+   */
+  async function schemaOf(path: string): Promise<unknown> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(path, { readonly: true });
+    const out: Record<string, unknown> = {};
+    for (const table of ['papers', 'paper_categories']) {
+      out[`${table} columns`] = db.query(`PRAGMA table_xinfo(${table})`).all();
+      const indexes = db
+        .query(
+          `SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? ORDER BY name`,
+        )
+        .all(table) as { name: string; sql: string | null }[];
+      for (const { name, sql } of indexes) {
+        out[`${name} sql`] = sql;
+        out[`${name} columns`] = db.query(`PRAGMA index_xinfo(${name})`).all();
+      }
+      out[`${table} triggers`] = db
+        .query(
+          `SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name`,
+        )
+        .all(table);
+      out[`${table} sql`] = (
+        db.query(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table) as {
+          sql: string;
+        }
+      ).sql;
+    }
+    db.close();
+    return out;
+  }
+
+  async function indexColumns(name: string): Promise<string[]> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath, { readonly: true });
+    const cols = (db.query(`PRAGMA index_info(${name})`).all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    db.close();
+    return cols;
+  }
+
+  /** Count the v3→v4 backfill batch lines `fn` writes to stdout. */
+  async function countBackfillBatches(fn: () => Promise<unknown>): Promise<number> {
+    const writes = vi.spyOn(process.stdout, 'write');
+    try {
+      await fn();
+      return writes.mock.calls.filter(([chunk]) => String(chunk).includes('junction published'))
+        .length;
+    } finally {
+      writes.mockRestore();
+    }
+  }
+
+  it('starts from a v3 file: no junction published column, the v3 date indexes', async () => {
+    await buildV3Db(10);
+    expect((await inspect()).junctionColumns).toEqual(['category', 'paper_id', 'updated']);
+    expect(await indexColumns('paper_categories_cat_updated_idx')).toEqual(['category', 'updated']);
+    expect(await indexColumns('papers_published_idx')).toEqual(['published']);
+  });
+
+  it('reads a v3 file as not ready — migrating under a live lease, older otherwise — and serves it once a writer migrates it', async () => {
+    await buildV3Db(10);
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'older_schema', version: 3 });
+    await setLease(new Date().toISOString());
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'migrating', version: 3 });
+    await setLease('2000-01-01T00:00:00.000Z');
+
+    (await MirrorStore.open(dbPath)).close();
+
+    const opened = await MirrorStore.openReader(dbPath);
+    if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+    expect(
+      opened.store.search({
+        categoryGroups: [['math.AP', 'stat.ML'], ['cs.LG']],
+        publishedFrom: '2024-01-01T02:00:00.000Z',
+        limit: 3,
+        offset: 0,
+        sortBy: 'published',
+        sortOrder: 'ascending',
+      }),
+    ).toMatchObject({
+      total: 9,
+      totalIsLowerBound: false,
+      papers: [{ id: '2401.00002' }, { id: '2401.00003' }, { id: '2401.00004' }],
+    });
+    opened.store.close();
+  });
+
+  it('migrates a populated v3 file in place: every row kept, published backfilled in 5,000-row batches, the date indexes widened', async () => {
+    await buildV3Db(4_000);
+    const before = await inspect();
+    expect(before).toMatchObject({ papers: 4_000, junctionRows: 12_000, version: 3 });
+
+    const batches = await countBackfillBatches(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    expect(batches).toBe(3);
+    expect(await inspect()).toEqual({
+      junctionColumns: ['category', 'paper_id', 'updated', 'published'],
+      junctionRows: 12_000,
+      leases: [],
+      papers: 4_000,
+      unfilled: 0,
+      version: MIRROR_SCHEMA_VERSION,
+    });
+    for (const [name, columns] of Object.entries(V4_DATE_INDEX_COLUMNS)) {
+      expect(await indexColumns(name), name).toEqual(columns);
+    }
+    // The migrated file keeps writing `published` for the rows a harvest adds.
+    const store = await MirrorStore.open(dbPath);
+    store.applyBatch(
+      [
+        mkRecord({
+          paper_id: '2410.00001',
+          categories: 'cs.LG hep-th',
+          versions: [{ version: 'v1', date: '2024-10-01T12:00:00Z' }],
+        }),
+      ],
+      [],
+    );
+    store.close();
+    expect(await inspect()).toMatchObject({ junctionRows: 12_002, unfilled: 0 });
+  });
+
+  it('ends with the columns and index definitions a fresh file is created with', async () => {
+    await buildV3Db(100);
+    (await MirrorStore.open(dbPath)).close();
+    const freshPath = join(dir, 'fresh.db');
+    (await MirrorStore.open(freshPath)).close();
+
+    const fresh = await schemaOf(freshPath);
+    expect(await schemaOf(dbPath)).toEqual(fresh);
+    expect(fresh).toHaveProperty('paper_categories_cat_published_idx columns');
+    expect(fresh).toHaveProperty(['paper_categories triggers', 0, 'name']);
+  });
+
+  it('leaves each v4 index and the fill trigger as the schema check expects them', async () => {
+    await buildV3Db(100);
+    const store = await MirrorStore.open(dbPath);
+    const checked = store.checkSchemaObjects();
+    store.close();
+
+    expect(checked.map((o) => `${o.type} ${o.name}: ${o.status}`)).toEqual([
+      'index paper_categories_cat_published_idx: ok',
+      'index paper_categories_cat_updated_idx: ok',
+      'index papers_published_idx: ok',
+      'index papers_updated_idx: ok',
+      'index papers_revised_early_idx: ok',
+      'trigger paper_categories_published_fill: ok',
+    ]);
+  });
+
+  /**
+   * Write `id` as the v3 writer of 1.7.0 does — its own `applyBatch` statements,
+   * verbatim — to a file that is already v4, as after an image rollback: the
+   * paper upserts, then its junction rows name no `published`.
+   */
+  async function writeAsV3Writer(path: string, id: string, instant: string): Promise<void> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(path);
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO papers(id, version, title, authors, abstract,
+                            primary_category, categories, published, updated,
+                            latest_version, comment, journal_ref, doi)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           version = excluded.version,
+           title = excluded.title,
+           authors = excluded.authors,
+           abstract = excluded.abstract,
+           primary_category = excluded.primary_category,
+           categories = excluded.categories,
+           published = excluded.published,
+           updated = excluded.updated,
+           latest_version = excluded.latest_version,
+           comment = excluded.comment,
+           journal_ref = excluded.journal_ref,
+           doi = excluded.doi`,
+      ).run(
+        id,
+        '1',
+        'T',
+        'A',
+        'X',
+        'cs.LG',
+        'cs.LG cs.AI',
+        instant,
+        instant,
+        instant,
+        null,
+        null,
+        null,
+      );
+      db.prepare(`DELETE FROM paper_categories WHERE paper_id = ?`).run(id);
+      for (const code of ['cs.LG', 'cs.AI']) {
+        db.prepare(
+          `INSERT OR IGNORE INTO paper_categories(category, paper_id, updated) VALUES (?, ?, ?)`,
+        ).run(code, id, instant);
+      }
+    })();
+    db.close();
+  }
+
+  it.each([
+    ['created at v4', false],
+    ['migrated from v3', true],
+  ])(
+    'fills published for a junction row a v3 writer adds to a file %s',
+    async (_label, migrated) => {
+      if (migrated) await buildV3Db(10);
+      (await MirrorStore.open(dbPath)).close();
+
+      await writeAsV3Writer(dbPath, '2410.00001', '2024-10-01T12:00:00.000Z');
+      // A paper the v3 writer rewrites keeps its rows filled, too.
+      await writeAsV3Writer(dbPath, '2410.00001', '2024-10-02T12:00:00.000Z');
+      await writeAsV3Writer(dbPath, '2410.00002', '2024-10-03T12:00:00.000Z');
+
+      expect(await inspect()).toMatchObject({ unfilled: 0, version: MIRROR_SCHEMA_VERSION });
+      const opened = await MirrorStore.openReader(dbPath);
+      if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+      const page = opened.store.search({
+        categoryGroups: [['cs.LG', 'cs.AI']],
+        publishedFrom: '2024-09-01T00:00:00.000Z',
+        limit: 5,
+        offset: 0,
+        sortBy: 'published',
+        sortOrder: 'descending',
+      });
+      opened.store.close();
+      expect(page).toMatchObject({
+        total: 2,
+        papers: [{ id: '2410.00002' }, { id: '2410.00001', published: '2024-10-02T12:00:00.000Z' }],
+      });
+    },
+  );
+
+  it('changes nothing and names the holder when another writer holds a live lease', async () => {
+    await buildV3Db(10);
+    await setLease(new Date().toISOString());
+
+    const failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+
+    expect(failure).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 3 },
+    });
+    expect((failure as McpError).message).toMatch(/from schema v3 to v4 by another writer/);
+    expect(await inspect()).toMatchObject({
+      junctionColumns: ['category', 'paper_id', 'updated'],
+      leases: ['another-writer'],
+      version: 3,
+    });
+    expect(await indexColumns('papers_updated_idx')).toEqual(['updated']);
+  });
+
+  it('stops a writer whose lease another writer took over, and the next writer finishes the step from the start', async () => {
+    await buildV3Db(6_000);
+    // The first renewal — the commit of the step's first transaction — hands the lease away.
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    raw.run(`CREATE TRIGGER steal_lease AFTER UPDATE OF renewed_at ON migration_lease BEGIN
+      UPDATE migration_lease SET holder = 'another-writer', pid = 4242 WHERE id = 1;
+    END`);
+    raw.close();
+
+    let failure: unknown;
+    const batches = await countBackfillBatches(async () => {
+      failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+    });
+
+    expect(failure).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'migration_lease_lost', holderPid: 4242 },
+    });
+    expect(batches).toBe(0);
+    // The column the first transaction added stays; nothing after it ran.
+    expect(await inspect()).toMatchObject({
+      junctionColumns: ['category', 'paper_id', 'updated', 'published'],
+      leases: ['another-writer'],
+      version: 3,
+    });
+
+    const fix = new Database(dbPath);
+    fix.run('DROP TRIGGER steal_lease');
+    fix.close();
+    await setLease('2000-01-01T00:00:00.000Z');
+    const resumed = await countBackfillBatches(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    // 18,000 junction rows in 5,000-row batches.
+    expect(resumed).toBe(4);
+    expect(await inspect()).toMatchObject({
+      junctionRows: 18_000,
+      leases: [],
+      unfilled: 0,
+      version: MIRROR_SCHEMA_VERSION,
+    });
+    for (const [name, columns] of Object.entries(V4_DATE_INDEX_COLUMNS)) {
+      expect(await indexColumns(name), name).toEqual(columns);
+    }
+  });
+
+  it('backfills published for the junction rows a v1 file gains on its way to v4', async () => {
+    await buildV3Db(10);
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    raw.exec(`
+      UPDATE papers SET published = 'Wed, 31 Oct 2018 14:58:30 GMT';
+      DELETE FROM paper_categories;
+      DELETE FROM schema_version;
+      INSERT INTO schema_version(version, applied_at) VALUES (1, '2025-01-01T00:00:00.000Z');
+    `);
+    raw.close();
+
+    (await MirrorStore.open(dbPath)).close();
+
+    expect(await inspect()).toMatchObject({
+      junctionRows: 30,
+      unfilled: 0,
+      version: MIRROR_SCHEMA_VERSION,
     });
   });
 });

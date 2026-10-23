@@ -1,9 +1,12 @@
--- arxiv-mcp-server OAI-PMH mirror schema v3 (issues #18 + #19 + #37)
+-- arxiv-mcp-server OAI-PMH mirror schema v4 (issues #18 + #19 + #37 + #78)
 -- Review copy of schema.ts, which the writers' MirrorStore.open executes one
 -- statement at a time (all but the write-path index at the end of the
 -- paper_categories section): the PRAGMAs first, then everything after them in
--- one write transaction (issue #71). The server's query-only connection runs
--- none of it.
+-- one write transaction (issue #71). The v4 block in the paper_categories
+-- section runs in that transaction only when it creates the file; on a v3 file
+-- the same statements are the migration (migrateToV4 in store.ts), so the
+-- block's DDL never runs up front against an older file. The server's
+-- query-only connection runs none of it.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -50,8 +53,7 @@ CREATE TABLE IF NOT EXISTS papers (
 );
 
 CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_category);
-CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published);
-CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated);
+-- The date indexes on papers are defined in the v4 block below.
 
 -- ---------------------------------------------------------------------------
 -- papers_fts — full-text index over title, authors, abstract, comment, and
@@ -95,8 +97,10 @@ END;
 -- ---------------------------------------------------------------------------
 -- paper_categories — junction table for index-backed category filtering
 -- (issue #19). One row per (paper, category) pair; a paper with categories
--- "cs.LG cs.AI stat.ML" yields three rows. The paper's ISO `updated` is
--- denormalized in so a category browse can page in date order off the index.
+-- "cs.LG cs.AI stat.ML" yields three rows. The paper's ISO `updated` and, from
+-- v4, `published` are denormalized in so a category group can range and order
+-- on either date off the junction's indexes. The primary key answers whether a
+-- paper carries a code.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS paper_categories (
   category TEXT NOT NULL,
@@ -105,12 +109,52 @@ CREATE TABLE IF NOT EXISTS paper_categories (
   PRIMARY KEY (category, paper_id)
 );
 
--- Composite (category, updated): the leading column drives COUNT(*) and the
--- IN(...) membership lookups; the trailing column lets a single-category
--- browse page in updated order straight off the index -- no sort, no papers
--- scan, fast for common and rare categories alike (issue #19).
-CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx
-  ON paper_categories(category, updated);
+-- ---------------------------------------------------------------------------
+-- v4 (issue #78): the junction's `published` column, its fill trigger, and the
+-- date-order indexes. A search without a free-text term reads these in order or by
+-- range, so no statement reads a papers row it does not return or sorts more
+-- than 50,000 index entries. Each index is a drop and a create run in one
+-- transaction, so the dropped index's pages are reused.
+-- ---------------------------------------------------------------------------
+ALTER TABLE paper_categories ADD COLUMN published TEXT NOT NULL DEFAULT '';  -- ISO 8601, mirrors papers.published
+
+-- Fills `published` for a row a writer built for v3 inserts without it (a
+-- rollback writing to a v4 file), which would otherwise keep '' and drop out
+-- of every group search with a window. A v4 writer always supplies it.
+CREATE TRIGGER IF NOT EXISTS paper_categories_published_fill
+AFTER INSERT ON paper_categories WHEN NEW.published = '' BEGIN
+  UPDATE paper_categories SET published = (SELECT published FROM papers WHERE id = NEW.paper_id)
+  WHERE rowid = NEW.rowid;
+END;
+
+-- A group's capped count and its page under the cap, with a submission window
+-- tested in the index; its page in submission order at the cap, the paper ID
+-- breaking ties.
+DROP INDEX IF EXISTS paper_categories_cat_published_idx;
+CREATE INDEX paper_categories_cat_published_idx
+  ON paper_categories(category, published, paper_id);
+
+-- A group's page in update order at the cap, the window tested in the index,
+-- and the single-category browse, which pages in updated order straight off
+-- the index, the paper ID breaking ties -- no sort, no papers scan (issue #19).
+DROP INDEX IF EXISTS paper_categories_cat_updated_idx;
+CREATE INDEX paper_categories_cat_updated_idx
+  ON paper_categories(category, updated, paper_id, published);
+
+-- A submission window's capped count, and its page under the cap or in
+-- submission order.
+DROP INDEX IF EXISTS papers_published_idx;
+CREATE INDEX papers_published_idx ON papers(published, updated);
+
+-- A submission window's page in update order at the cap.
+DROP INDEX IF EXISTS papers_updated_idx;
+CREATE INDEX papers_updated_idx ON papers(updated, published);
+
+-- The papers arXiv dates a revision of before their first version (16 in the
+-- full mirror, math/0002124 among them). An update order at the cap starts its
+-- scan at the earliest such revision a window takes in, else at its opening.
+DROP INDEX IF EXISTS papers_revised_early_idx;
+CREATE INDEX papers_revised_early_idx ON papers(published, updated) WHERE updated < published;
 
 -- Write-path index (issue #50): each record write deletes the paper's junction
 -- rows by paper_id, and a tombstone's ON DELETE CASCADE looks them up the same

@@ -55,6 +55,13 @@ export interface SearchResult {
    */
   result_limit?: number;
   start: number;
+  /**
+   * Set when `total_results` is a floor rather than an exact count: the mirror
+   * stops counting a search without a free-text term at
+   * `MIRROR_SEARCH_MATCH_CAP`, unless it filters on one category code alone
+   * (issue #78). Absent on every exact count, the live path's included.
+   */
+  total_is_lower_bound?: true;
   total_results: number;
 }
 

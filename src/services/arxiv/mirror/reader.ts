@@ -13,8 +13,7 @@ import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { type JsonRpcErrorCode, McpError, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import type { MirrorReaderOpen, MirrorStore } from './store.js';
-import type { PaperRow } from './types.js';
+import type { MirrorReaderOpen, MirrorSearchPage, MirrorStore } from './store.js';
 
 /** What `MirrorStore.search` takes. */
 export type MirrorSearchOptions = Parameters<MirrorStore['search']>[0];
@@ -28,10 +27,11 @@ export interface ReadyMirror {
 /** Why a reader open could not serve the file, as `MirrorStore.openReader` reported it. */
 export type MirrorNotReady = Exclude<MirrorReaderOpen, { status: 'open' }>;
 
-/** The probe-then-search answer: a page with its total, or a term at the match cap. */
-export type WithinCapOutcome =
-  | { papers: PaperRow[]; status: 'searched'; total: number }
-  | { status: 'over_cap' };
+/**
+ * The probe-then-search answer: a page with its total and whether that total
+ * stopped at the match cap (issue #78), or a term at the match cap.
+ */
+export type WithinCapOutcome = ({ status: 'searched' } & MirrorSearchPage) | { status: 'over_cap' };
 
 /**
  * A mirror search's answer. `not_ready` means the worker's own open found the

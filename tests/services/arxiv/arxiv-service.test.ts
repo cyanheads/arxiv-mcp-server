@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { pdfParser } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -23,6 +23,7 @@ import {
   stripHtmlHead,
   stripLatexmlNoise,
 } from '@/services/arxiv/arxiv-service.js';
+import { extractInThread, extractInWorker } from '@/services/arxiv/pdf-text.js';
 import { PaperMetadataSchema } from '@/services/arxiv/types.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -1811,20 +1812,6 @@ describe('ArxivService.readContent', () => {
     expect(result.body_characters).toBe(text.length);
   });
 
-  it('fails a PDF pdf.js cannot parse with InternalError (pdf_text_extract_failed), once', async () => {
-    serveOnlyThePdf(new TextEncoder().encode('%PDF-1.4\nnot a document\n%%EOF\n'));
-
-    await expect(
-      getArxivService().readContent('2401.12345', {}, createMockContext()),
-    ).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InternalError,
-      message: 'Failed to extract text from PDF: Invalid PDF structure.',
-      data: { reason: 'pdf_text_extract_failed' },
-    });
-    // A document that does not parse would fail the same way again: no replay.
-    expect(mockFetch).toHaveBeenCalledTimes(4);
-  });
-
   it('keeps the request thread free while a long PDF extracts (#73)', async () => {
     // pdf.js loaded here first, so an extraction on this thread spends no turn loading it.
     await pdfParser.extractText(makeBookPdfBytes(1), { mergePages: true });
@@ -1970,6 +1957,209 @@ describe('ArxivService.readContent', () => {
       getArxivService().readContent('2401.12345', {}, createMockContext()),
     ).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
   }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // A PDF the parser cannot read fails as one with no text layer does (issue #81)
+  // -------------------------------------------------------------------------
+
+  const NO_TEXT_LAYER_MESSAGE =
+    "Paper '2401.12345v1' has no HTML render, and its PDF yielded no extractable text — the file is image-only (scanned) or carries no text layer. Download it at http://arxiv.org/pdf/2401.12345v1.";
+  const UNPARSEABLE_MESSAGE =
+    "Paper '2401.12345v1' has no HTML render, and its PDF could not be parsed — the file arXiv served is damaged, truncated, or not a PDF. Download it at http://arxiv.org/pdf/2401.12345v1.";
+  const AR5IV_OUTAGE_MESSAGE = 'ar5iv returned HTTP 502. (failed after 2 attempts)';
+
+  /** Bodies the PDF parser rejects, each one arXiv could serve where the PDF belongs. */
+  const UNPARSEABLE_PDFS = [
+    ['a file with no readable PDF structure', '%PDF-1.4\nnot a document\n%%EOF\n'],
+    ['a 0-byte body', ''],
+    [
+      'an HTML page served as the PDF',
+      '<!DOCTYPE html><html><head><title>arXiv</title></head><body><p>Service notice.</p></body></html>',
+    ],
+    ['a PDF header and nothing after it', '%PDF-1.7\n'],
+  ] as const;
+
+  const unparseablePdf = () =>
+    new Response(new TextEncoder().encode('%PDF-1.4\nnot a document\n%%EOF\n'), {
+      status: 200,
+      headers: { 'content-type': 'application/pdf' },
+    });
+
+  /** What the framework's PDF parser throws for a file it cannot read. */
+  const parseFailure = () =>
+    new McpError(
+      JsonRpcErrorCode.InternalError,
+      'Failed to extract text from PDF: Invalid PDF structure.',
+      { reason: 'pdf_text_extract_failed' },
+    );
+
+  describe.each([
+    ['in a worker', extractInWorker],
+    ['on the request thread', extractInThread],
+  ] as const)('a PDF the parser rejects, extracted %s', (_label, pdfTextExtractor) => {
+    beforeEach(() => {
+      initArxivService({ pdfTextExtractor });
+    });
+
+    it.each(UNPARSEABLE_PDFS)(
+      'fails %s with pdf_extraction_failed, paperId, and pdfUrl, once',
+      async (_shape, body) => {
+        serveOnlyThePdf(new TextEncoder().encode(body));
+
+        const error = await getArxivService()
+          .readContent('2401.12345', {}, createMockContext())
+          .catch((err: unknown) => err);
+
+        expect(error).toBeInstanceOf(McpError);
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          message: UNPARSEABLE_MESSAGE,
+          data: {
+            reason: 'pdf_extraction_failed',
+            paperId: '2401.12345v1',
+            pdfUrl: 'http://arxiv.org/pdf/2401.12345v1',
+          },
+        });
+        // A file that does not parse would fail the same way again: no replay.
+        expect(mockFetch).toHaveBeenCalledTimes(4);
+      },
+    );
+
+    it('keeps its own message for a PDF that parses but has no text layer', async () => {
+      serveOnlyThePdf(makePdfBytes(''));
+
+      await expect(
+        getArxivService().readContent('2401.12345', {}, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: NO_TEXT_LAYER_MESSAGE,
+        data: {
+          reason: 'pdf_extraction_failed',
+          paperId: '2401.12345v1',
+          pdfUrl: 'http://arxiv.org/pdf/2401.12345v1',
+        },
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('reports a held ar5iv 502 ahead of an unparseable PDF, after one replay', async () => {
+      const attempt = (): Response[] => [
+        new Response('Not Found', { status: 404 }),
+        new Response('Bad Gateway', { status: 502 }),
+        unparseablePdf(),
+      ];
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
+      for (const response of [...attempt(), ...attempt()]) {
+        mockFetch.mockResolvedValueOnce(response);
+      }
+
+      await expect(
+        getArxivService().readContent('2401.12345', {}, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: AR5IV_OUTAGE_MESSAGE,
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(7);
+    }, 30_000);
+  });
+
+  it('serves the ar5iv render the replay finds after an ar5iv 502 and an unparseable PDF', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('Bad Gateway', { status: 502 }))
+      .mockResolvedValueOnce(unparseablePdf())
+      // The replay: ar5iv is back and has the render.
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(
+        htmlResponse('<article><p>ar5iv render after the outage</p></article>'),
+      );
+
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
+
+    expect(result.source).toBe('ar5iv');
+    expect(result.content).toContain('ar5iv render after the outage');
+    expect(mockFetch).toHaveBeenCalledTimes(6);
+  }, 30_000);
+
+  it('fails pdf_extraction_failed when the replay finds ar5iv has no render and the PDF still does not parse', async () => {
+    mockFetch
+      .mockResolvedValueOnce(atomResponse(ATOM_SINGLE))
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('Bad Gateway', { status: 502 }))
+      .mockResolvedValueOnce(unparseablePdf())
+      // The replay: ar5iv answers that it has no render, so no failure is held.
+      .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
+      .mockResolvedValueOnce(new Response('', { status: 307 }))
+      .mockResolvedValueOnce(unparseablePdf());
+
+    await expect(
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: UNPARSEABLE_MESSAGE,
+      data: { reason: 'pdf_extraction_failed', pdfUrl: 'http://arxiv.org/pdf/2401.12345v1' },
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(7);
+  }, 30_000);
+
+  it('stays cancelled when the extraction rejects as unparseable after the caller cancels', async () => {
+    const controller = new AbortController();
+    const cancelled = new DOMException('The client cancelled the call.', 'AbortError');
+    initArxivService({
+      pdfTextExtractor: async () => {
+        controller.abort(cancelled);
+        throw parseFailure();
+      },
+    });
+    serveOnlyThePdf(makePdfBytes('never read'));
+
+    await expect(
+      getArxivService().readContent(
+        '2401.12345',
+        {},
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toBe(cancelled);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('matches an unparseable PDF on data.reason, never on the message', async () => {
+    // The parser's message without its reason is some other InternalError, not a verdict on the PDF.
+    const unreasoned = new McpError(
+      JsonRpcErrorCode.InternalError,
+      'Failed to extract text from PDF: Invalid PDF structure.',
+    );
+    initArxivService({
+      pdfTextExtractor: async () => {
+        throw unreasoned;
+      },
+    });
+    serveOnlyThePdf(makePdfBytes('never read'));
+
+    await expect(getArxivService().readContent('2401.12345', {}, createMockContext())).rejects.toBe(
+      unreasoned,
+    );
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('passes a missing PDF parser through as the configuration fault it is', async () => {
+    const missingPeer = new McpError(
+      JsonRpcErrorCode.ConfigurationError,
+      'Install "unpdf" to use PDF text extraction: bun add unpdf',
+    );
+    initArxivService({
+      pdfTextExtractor: async () => {
+        throw missingPeer;
+      },
+    });
+    serveOnlyThePdf(makePdfBytes('never read'));
+
+    await expect(getArxivService().readContent('2401.12345', {}, createMockContext())).rejects.toBe(
+      missingPeer,
+    );
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
 
   // -------------------------------------------------------------------------
   // ar5iv conversion-failure pages fall through to the PDF (issue #54)

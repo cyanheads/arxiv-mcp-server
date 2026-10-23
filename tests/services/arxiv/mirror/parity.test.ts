@@ -162,7 +162,7 @@ describe('mirror and live search contract parity', () => {
     { query: 'ti:transformer', expectedQuery: 'ti:transformer', ids: [0, 2], start: 9_990 },
     { query: 'ti:unfindable', expectedQuery: 'ti:unfindable', ids: [] },
     // Boolean operators around lifted operands keep arXiv's meaning (#65): each
-    // AND-ed cat: is its own filter, and AND binds tighter than ANDNOT.
+    // AND-ed cat: is its own filter, and every operator groups to the right (#82).
     { query: 'cat:cs AND cat:cs.CL', expectedQuery: 'cat:cs* AND cat:cs.CL', ids: [0] },
     // An OR-ed set of cat: operands is one filter: each code admits one paper,
     // and together they keep out the third paper the residual matches.
@@ -180,6 +180,14 @@ describe('mirror and live search contract parity', () => {
       query: 'ti:transformer AND cat:cs ANDNOT abs:language',
       expectedQuery: 'ti:transformer AND cat:cs* ANDNOT abs:language',
       ids: [2],
+    },
+    // arXiv's grammar (#82): adjacency is OR, and everything right of an ANDNOT
+    // is one operand.
+    { query: 'ti:transformer ti:dark', expectedQuery: 'ti:transformer ti:dark', ids: [0, 1, 2] },
+    {
+      query: 'ti:transformer ANDNOT abs:vision OR ti:dark',
+      expectedQuery: 'ti:transformer ANDNOT abs:vision OR ti:dark',
+      ids: [0],
     },
   ];
 

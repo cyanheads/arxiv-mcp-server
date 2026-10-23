@@ -27,10 +27,21 @@
  *     resolve on the mirror path the way they already do on the live API.
  *     FTS5 has no `ALTER TABLE`, so the migration drops and rebuilds the index
  *     and its sync triggers — see `migrateToV3` in `store.ts`.
+ *
+ * v4 changes (issue #78):
+ *   - `paper_categories.published`, the paper's submission instant, beside the
+ *     `updated` already there, so a category group ranges and orders on either
+ *     date inside the junction's indexes without reading `papers`. A trigger
+ *     fills it for a row a v3 writer inserts without it.
+ *   - `paper_categories(category, published, paper_id)` and the partial
+ *     `papers(published, updated) WHERE updated < published` are new, and three
+ *     date indexes widen: `paper_categories(category, updated, paper_id, published)`,
+ *     `papers(published, updated)`, `papers(updated, published)`. See
+ *     {@link MIRROR_V4_STATEMENTS}.
  * @module services/arxiv/mirror/schema
  */
 
-export const MIRROR_SCHEMA_VERSION = 3;
+export const MIRROR_SCHEMA_VERSION = 4;
 
 /**
  * The FTS5 index and its `papers` sync triggers. Split out of the main schema
@@ -92,8 +103,13 @@ export const MIRROR_PRAGMA_STATEMENTS: readonly string[] = [
 ];
 
 /**
- * The full schema a writer applies on every open, in order, inside one write
- * transaction (issue #71). Each entry is idempotent.
+ * The schema a writer applies on every open, in order, inside one write
+ * transaction (issue #71). Each entry is idempotent. It holds the v3 shape v4
+ * left as it was; what v4 adds or redefines is {@link MIRROR_V4_STATEMENTS},
+ * which a new file runs in the same transaction and an older one runs as its
+ * migration. Kept out of this list on purpose: against a v3 file, an index on
+ * the junction's `published` fails (no such column) and a redefined index under
+ * an existing name is skipped by `IF NOT EXISTS`.
  */
 export const MIRROR_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS schema_version (
@@ -128,24 +144,18 @@ export const MIRROR_SCHEMA_STATEMENTS: readonly string[] = [
   doi TEXT
 )`,
   'CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_category)',
-  'CREATE INDEX IF NOT EXISTS papers_published_idx ON papers(published)',
-  'CREATE INDEX IF NOT EXISTS papers_updated_idx ON papers(updated)',
   ...MIRROR_FTS_STATEMENTS,
   // Junction table: one row per (paper, category) pair, with the paper's ISO
-  // updated value denormalized in. Enables index-backed category filtering
-  // without a full-table scan or LIKE queries on the space-joined categories
-  // column.
+  // updated value (and, from v4, its published value) denormalized in. Enables
+  // index-backed category filtering without a full-table scan or LIKE queries
+  // on the space-joined categories column. The primary key answers whether a
+  // paper carries a code.
   `CREATE TABLE IF NOT EXISTS paper_categories (
   category TEXT NOT NULL,
   paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
   updated TEXT NOT NULL,
   PRIMARY KEY (category, paper_id)
 )`,
-  // Composite (category, updated): the leading column drives COUNT(*) and the
-  // IN(...) membership lookups; the trailing column lets a single-category
-  // browse page in updated order straight off the index — no sort, no papers
-  // scan, fast for common and rare categories alike (issue #19).
-  'CREATE INDEX IF NOT EXISTS paper_categories_cat_updated_idx ON paper_categories(category, updated)',
   `CREATE TABLE IF NOT EXISTS harvest_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   status TEXT NOT NULL,
@@ -157,6 +167,81 @@ export const MIRROR_SCHEMA_STATEMENTS: readonly string[] = [
   error_message TEXT
 )`,
   `INSERT OR IGNORE INTO harvest_state(id, status) VALUES (1, 'pending')`,
+];
+
+/**
+ * The junction's `published` column (v4, issue #78): the paper's submission
+ * instant, as `papers.published` holds it. Added to every file by this one
+ * statement, a new file's included, so new and migrated files define it alike.
+ */
+export const MIRROR_JUNCTION_PUBLISHED_SQL = `ALTER TABLE paper_categories ADD COLUMN published TEXT NOT NULL DEFAULT ''`;
+
+/**
+ * Fills the junction's `published` from `papers` for a row inserted without
+ * it: the insert of a writer built for v3, should one write to a v4 file after
+ * a rollback. Such a row would otherwise keep the column's `''` default and
+ * drop out of every group search with a window, unseen by `mirror:verify`. A
+ * v4 writer always supplies the value, so its inserts skip the trigger's body.
+ */
+export const MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL = `CREATE TRIGGER IF NOT EXISTS paper_categories_published_fill
+AFTER INSERT ON paper_categories WHEN NEW.published = '' BEGIN
+  UPDATE paper_categories SET published = (SELECT published FROM papers WHERE id = NEW.paper_id)
+  WHERE rowid = NEW.rowid;
+END`;
+
+/**
+ * The date-order indexes as v4 defines them, each a drop and a create that run
+ * in one transaction, so the dropped index's pages are reused (issue #78).
+ * Bounded term-less searches read them in order or by range:
+ *
+ * - `paper_categories(category, published, paper_id)` — a group's capped count
+ *   and its page under the cap, with a submission window tested in the index,
+ *   and its page in submission order at the cap, the paper ID breaking ties.
+ * - `paper_categories(category, updated, paper_id, published)` — a group's page
+ *   in update order at the cap and the single-code browse (issue #19), both in
+ *   index order with the paper ID breaking ties, the window tested in the index.
+ * - `papers(published, updated)` — a window's capped count, and its page under
+ *   the cap or in submission order.
+ * - `papers(updated, published)` — a window's page in update order at the cap.
+ * - `papers(published, updated) WHERE updated < published` — the papers arXiv
+ *   dates a revision of before their first version (16 in the full mirror), so
+ *   an update order at the cap starts its scan at the earliest such revision a
+ *   window takes in rather than at the window's opening.
+ */
+export const MIRROR_DATE_INDEXES: readonly (readonly [drop: string, create: string])[] = [
+  [
+    'DROP INDEX IF EXISTS paper_categories_cat_published_idx',
+    'CREATE INDEX paper_categories_cat_published_idx ON paper_categories(category, published, paper_id)',
+  ],
+  [
+    'DROP INDEX IF EXISTS paper_categories_cat_updated_idx',
+    'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated, paper_id, published)',
+  ],
+  [
+    'DROP INDEX IF EXISTS papers_published_idx',
+    'CREATE INDEX papers_published_idx ON papers(published, updated)',
+  ],
+  [
+    'DROP INDEX IF EXISTS papers_updated_idx',
+    'CREATE INDEX papers_updated_idx ON papers(updated, published)',
+  ],
+  [
+    'DROP INDEX IF EXISTS papers_revised_early_idx',
+    'CREATE INDEX papers_revised_early_idx ON papers(published, updated) WHERE updated < published',
+  ],
+];
+
+/**
+ * Everything v4 adds to the v3 shape of {@link MIRROR_SCHEMA_STATEMENTS}, in
+ * order. A new file runs it in the transaction that creates it; a v3 file runs
+ * the same statements as its migration, one transaction per index and its
+ * column backfilled between (`migrateToV4` in `store.ts`), so the two cannot
+ * drift.
+ */
+export const MIRROR_V4_STATEMENTS: readonly string[] = [
+  MIRROR_JUNCTION_PUBLISHED_SQL,
+  MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL,
+  ...MIRROR_DATE_INDEXES.flat(),
 ];
 
 /**
