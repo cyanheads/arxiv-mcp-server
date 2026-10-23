@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.7.1](changelog/1.7.x/1.7.1.md) — 2026-10-23
+
+arxiv_search_papers reads mirror queries with arXiv's grammar and sends forms the mirror cannot answer as arXiv does to the live API. Term-less mirror searches are index-driven under schema v4, with a lower-bound total. An unparseable PDF fails pdf_extraction_failed.
+
 ## [1.7.0](changelog/1.7.x/1.7.0.md) — 2026-10-21 · ⚠️ Breaking
 
 arxiv_read_paper extracts PDF text in a worker thread and now fails Timeout when extraction outlasts ARXIV_READ_TIMEOUT_MS. Mirror query errors and queries the mirror cannot answer as arXiv does go live; a hung arXiv API no longer times out reads the mirror can answer.

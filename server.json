@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/arxiv-mcp-server",
     "source": "github"
   },
-  "version": "1.7.0",
+  "version": "1.7.1",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/arxiv-mcp-server",
       "runtimeHint": "npx",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "environmentVariables": [
         {
           "name": "ARXIV_API_BASE_URL",
@@ -73,7 +73,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/arxiv-mcp-server",
       "runtimeHint": "npx",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "environmentVariables": [
         {
           "name": "MCP_TRANSPORT_TYPE",
