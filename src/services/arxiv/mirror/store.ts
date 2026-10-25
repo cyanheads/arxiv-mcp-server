@@ -1565,7 +1565,9 @@ const TEXT_COLUMNS = ['title', 'authors', 'abstract', 'comment', 'journal_ref', 
  * writes every `'` and `"` of arXiv's text as one of the two and no other
  * character as a numeric reference, so any other reference a row holds is
  * arXiv's own text (OAI sends it with its `&` escaped) and stays. The repaired
- * row is what the harvester now stores for the same record.
+ * row is what the harvester now stores for the same record, except where
+ * arXiv's own text holds a literal `&#39;` or `&#34;`: the old parser stored
+ * that exactly as it stored a quote, so the repair reads it as the character.
  *
  * Batched by rowid window, each window one transaction. The update touches only
  * the rows that hold one of the two, so every other row stays byte for byte,
