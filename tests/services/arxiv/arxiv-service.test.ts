@@ -4,7 +4,6 @@
  * @module services/arxiv/arxiv-service.test
  */
 
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
@@ -120,17 +119,6 @@ function servedPage(html: string, url: string): Response {
   return response;
 }
 
-/**
- * A captured arXiv HTML page from `tests/fixtures/arxiv-html/` (gzipped). The
- * `-headings` captures keep every heading of the article but none of its
- * paragraphs other than `\includepdf` placeholders; the rest keep the whole
- * article and the site footer after it.
- */
-function fixturePage(name: string): string {
-  const path = new URL(`../../fixtures/arxiv-html/${name}.html.gz`, import.meta.url);
-  return gunzipSync(readFileSync(path)).toString('utf8');
-}
-
 /** Single-entry Atom feed for an arbitrary versioned paper ID. */
 function atomFor(versionedId: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -148,13 +136,44 @@ function atomFor(versionedId: string): string {
 </feed>`;
 }
 
+/** Every value of `attr="…"` in `html`, in document order. */
+function attrValues(html: string, attr: string): string[] {
+  return [...html.matchAll(new RegExp(`\\s${attr}="([^"]*)"`, 'g'))].map((m) => m[1] ?? '');
+}
+
+/** An HTML fixture of the read-path corpus, `tests/corpus/<kind>/<fixture-id>/`. */
+type CorpusHtmlFixture =
+  | 'empty/arxiv-2411.15218v2'
+  | 'render/ar5iv-1906.00591'
+  | 'render/arxiv-2405.03599v3'
+  | 'render/arxiv-2409.09856v3';
+
+const corpusPages = new Map<CorpusHtmlFixture, string>();
+
+/** A corpus fixture's page as served: its `source.html.gz`, gunzipped once per run. */
+function corpusPage(fixture: CorpusHtmlFixture): string {
+  let page = corpusPages.get(fixture);
+  if (page === undefined) {
+    const path = new URL(`../../corpus/${fixture}/source.html.gz`, import.meta.url);
+    page = gunzipSync(readFileSync(path)).toString('utf8');
+    corpusPages.set(fixture, page);
+  }
+  return page;
+}
+
+/** `page` with `markup` added just before its last `</article>`. */
+function beforeArticleEnd(page: string, markup: string): string {
+  const end = page.lastIndexOf('</article>');
+  return `${page.slice(0, end)}${markup}${page.slice(end)}`;
+}
+
 /**
- * Serve fixture page `name` for `versionedId` on the requested HTML rung and
- * read it back through the real cleaning pipeline.
+ * Serve `html` for `versionedId` on the requested HTML rung and read it back
+ * through the real cleaning pipeline.
  */
-async function readFixture(
+async function readPage(
   versionedId: string,
-  name: string,
+  html: string,
   rung: 'arxiv_html' | 'ar5iv',
   options: { maxCharacters?: number | null; start?: number } = { maxCharacters: null },
 ) {
@@ -162,21 +181,487 @@ async function readFixture(
   if (rung === 'ar5iv') {
     mockFetch
       .mockResolvedValueOnce(new Response('Not Found', { status: 404 }))
-      .mockResolvedValueOnce(
-        servedPage(fixturePage(name), `https://ar5iv.labs.arxiv.org/html/${versionedId}`),
-      );
+      .mockResolvedValueOnce(servedPage(html, `https://ar5iv.labs.arxiv.org/html/${versionedId}`));
   } else {
-    mockFetch.mockResolvedValueOnce(
-      servedPage(fixturePage(name), `https://arxiv.org/html/${versionedId}`),
-    );
+    mockFetch.mockResolvedValueOnce(servedPage(html, `https://arxiv.org/html/${versionedId}`));
   }
   return getArxivService().readContent(versionedId, options, createMockContext());
 }
 
-/** Every value of `attr="…"` in `html`, in document order. */
-function attrValues(html: string, attr: string): string[] {
-  return [...html.matchAll(new RegExp(`\\s${attr}="([^"]*)"`, 'g'))].map((m) => m[1] ?? '');
+// ---------------------------------------------------------------------------
+// Synthetic LaTeXML pages: the markup a read-path behavior depends on, in the
+// shape arXiv's HTML rungs serve it, for behaviors no corpus fixture carries
+// ---------------------------------------------------------------------------
+
+/**
+ * `article` inside the page arxiv.org/html serves around a render, cut to its
+ * structure: the site header and license infobox before the article, the
+ * build-log footer (with its own `<h2>` and relative link) and the site footer
+ * after it. The shell's text and links stay out of a body only because
+ * `stripHtmlHead` cuts to the article.
+ */
+function nativePage(versionedId: string, article: string): string {
+  return `<!DOCTYPE html><html lang="en">
+<head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+<title>${versionedId}</title>
+<link rel="stylesheet" href="/static/browse/0.3.4/css/arxiv-html-papers-20260823.css" type="text/css">
+</head>
+<body>
+<header class="arxiv-html-header">
+  <nav class="html-header-nav">
+    <a class="header-button hover-effect desktop-only" href="https://info.arxiv.org/about/accessible_HTML.html" target="_blank">Why HTML?</a>
+    <a class="header-button" title="Back to abstract page" href="/abs/${versionedId}"><span class="desktop-only">Back to Abstract</span></a>
+    <a class="header-button" title="Download PDF" href="/pdf/${versionedId}" target="_blank"><span class="desktop-only">Download PDF</span></a>
+  </nav>
+</header><nav class="ltx_page_navbar">
+</nav>
+<div class="ltx_page_main">
+<div id="infobox" class="infobox">
+  <a id="license-tr" href="https://info.arxiv.org/help/license/index.html#licenses-available">
+    License: CC BY 4.0
+  </a>
+  <div id="watermark-tr">
+arXiv:${versionedId} [cs.LG] 01 Jan 2024</div>
+</div><div class="ltx_page_content">
+${article}
+</div>
+</div>
+<footer class="arxiv-html-footer">
+  <div class="ltx_page_logo">
+    Experimental support, please
+    <a href="./${versionedId}/__stdout.txt" class="ltx_ref" target="_blank" rel="nofollow">view the build logs</a>
+    for errors.
+  </div>
+  <div class="keyboard-glossary">
+    <h2>Instructions for reporting errors</h2>
+    <p>We are continuing to improve HTML versions of papers.</p>
+  </div>
+</footer><footer class="ds-site-footer">
+  <nav class="ds-site-footer-links" aria-label="Site navigation">
+    <a href="https://info.arxiv.org/about">About</a>
+    <a href="https://info.arxiv.org/help">Help</a>
+  </nav>
+  <svg role="presentation" height="1.25rem" viewBox="0 0 448 512"><path d="M0 0h448v512H0z"/></svg>
+</footer>
+</body>
+</html>`;
 }
+
+/**
+ * ar5iv's page around `article`, cut to its structure: the article inside
+ * `ltx_page_content`, then `trailing` (whatever ar5iv writes after that div),
+ * the nav footer, the page footer, and a script. `paperId` is unversioned, as
+ * ar5iv's own links are.
+ */
+function ar5ivPage(
+  paperId: string,
+  article: string,
+  { title = paperId, trailing = '' }: { title?: string; trailing?: string } = {},
+): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title> ${title} </title>
+<link media="all" rel="stylesheet" href="/assets/ar5iv.0.9.1.css">
+</head>
+<body>
+    <div class="ltx_page_main">
+      <div class="ltx_page_content">
+        ${article}
+      </div>
+      ${trailing}<div class="ar5iv-footer"><a href="/html/${paperId}" class="ar5iv-nav-button ar5iv-nav-button-prev">◄</a>
+    <a class="ar5iv-home-button" href="/"><img height="40" alt="ar5iv homepage" src="/assets/ar5iv.png"></a>
+    <a href="/feeling_lucky" class="ar5iv-text-button">Feeling<br>lucky?</a>
+    <a href="/log/${paperId}" class="ar5iv-text-button ar5iv-severity-ok">Conversion<br>report</a>
+    <a href="https://arxiv.org/abs/${paperId}" class="ar5iv-text-button arxiv-ui-theme">View&nbsp;original<br>on&nbsp;arXiv</a>
+</div><footer class="ltx_page_footer">
+<a class="ar5iv-footer-button" href="https://arxiv.org/help/license" target="_blank">Copyright</a>
+<a class="ar5iv-footer-button" href="https://arxiv.org/help/policies/privacy_policy" target="_blank">Privacy Policy</a>
+</footer>
+    </div>
+    <script>
+      var canMathML = typeof(MathMLElement) == "function";
+    </script>
+    </body>
+</html>`;
+}
+
+/** The `ltx_ERROR` span LaTeXML writes its fatal-error notice into. */
+const FATAL_NOTICE =
+  '<span class="ltx_ERROR">\nConversion to HTML had a Fatal error and exited abruptly. This document may be truncated or damaged.\n</span>';
+
+/**
+ * ar5iv's answer to an aborted conversion (#54): HTTP 200, an empty article
+ * closed inside `ltx_page_content`, then the notice in a second `ltx_document`
+ * that the page's last `</article>` closes, then the footer.
+ */
+function ar5ivFailurePage(paperId: string): string {
+  return ar5ivPage(paperId, '<article class="ltx_document">\n        </article>', {
+    title: 'No content available',
+    trailing: `\n<div class="ltx_document"><div class="ltx_para"><div class="ltx_p">${FATAL_NOTICE}</div></div></div>\n</article>\n`,
+  });
+}
+
+/** ar5iv's "No content available" page: HTTP 200 with an empty article (#57). */
+function ar5ivEmptyPage(paperId: string): string {
+  return ar5ivPage(paperId, '<article class="ltx_document">\n        </article>', {
+    title: 'No content available',
+  });
+}
+
+/**
+ * LaTeXML's rendering of a `pdfpages` `\includepdf` (#57): "See pages R of" and
+ * a link classed `ltx_ref` to the included file. arxiv.org writes the file name
+ * as an `https://` link; ar5iv leaves it relative.
+ */
+const includepdf = (pages: string, href: string) =>
+  `See pages ${pages} of <a href="${href}" title="" class="ltx_ref">${href.replace('https://', '')}</a>`;
+
+/** An article of `\includepdf` paragraphs, each `<div class="ltx_para">` holding one sentence run. */
+const includepdfArticle = (...paragraphs: string[]) =>
+  `<article class="ltx_document">\n${paragraphs
+    .map(
+      (run, i) =>
+        `<div id="p${i + 1}" class="ltx_para">\n<p id="p${i + 1}.1" class="ltx_p">${run}</p>\n</div>`,
+    )
+    .join('\n<div class="ltx_pagination ltx_role_newpage"></div>\n')}\n</article>`;
+
+/** Whole-paper `\includepdf` articles as arxiv.org/html serves them. */
+const NATIVE_INCLUDEPDF_ARTICLES = [
+  ['one included file', includepdfArticle(includepdf('1-last', 'https://main.pdf'))],
+  [
+    'three included files in one paragraph',
+    includepdfArticle(
+      ['part1', 'part2', 'part3']
+        .map((name) => includepdf('1-last', `https://${name}.pdf`))
+        .join(''),
+    ),
+  ],
+] as const;
+
+/** Whole-paper `\includepdf` articles as ar5iv serves them. */
+const AR5IV_INCLUDEPDF_ARTICLES = [
+  ['one included file', includepdfArticle(includepdf('1-last', 'main.pdf'))],
+  ['"See pages - of" one file', includepdfArticle(includepdf('-', 'supplement.pdf'))],
+  [
+    'two included files across a page break',
+    includepdfArticle(includepdf('1-last', 'main.pdf'), includepdf('1-last', 'supplement.pdf')),
+  ],
+  [
+    'one sentence per included page',
+    includepdfArticle(
+      Array.from({ length: 9 }, (_, i) => includepdf(String(i + 1), 'main.pdf')).join(''),
+    ),
+  ],
+] as const;
+
+/**
+ * A paper that is front matter and nine included parts, written for `href`:
+ * centered title and author lines, an abstract paragraph with inline math, a
+ * keyword block, each one styled text rather than a heading, then the
+ * `\includepdf` sentences and the `ltx_rdf` metadata LaTeXML closes with.
+ */
+const frontMatterArticle = (
+  href: (part: number) => string,
+) => `<article class="ltx_document ltx_leqno">
+<div id="id1" class="ltx_logical-block">
+<div id="p1" class="ltx_para">
+<p id="p1.1" class="ltx_p ltx_align_center"><span id="p1.1.1" class="ltx_text ltx_font_bold">Front-matter title line</span></p>
+<p id="p1.2" class="ltx_p ltx_align_center"><span id="p1.2.1" class="ltx_text" style="font-size:144%;">Author Name</span></p>
+</div>
+</div>
+<div class="ltx_pagination ltx_role_newpage"></div>
+<div id="p2" class="ltx_para">
+<p id="p2.1" class="ltx_p ltx_align_center"><span id="p2.1.1" class="ltx_text ltx_font_smallcaps" style="font-size:120%;">Front-matter abstract heading</span></p>
+</div>
+<div id="p3" class="ltx_para ltx_noindent">
+<p id="p3.1" class="ltx_p">Let <math id="p3.m1" class="ltx_Math" alttext="p&gt;0" display="inline" intent=":literal"><semantics><mrow><mi>p</mi><mo>&gt;</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">p&gt;0</annotation></semantics></math> be front-matter abstract text.</p>
+</div>
+<div id="id2" class="ltx_logical-block ltx_minipage ltx_align_middle" style="width:345.0pt;">
+<div id="p4" class="ltx_para">
+<p id="p4.1" class="ltx_p"><span id="p4.1.1" class="ltx_text ltx_font_bold" style="font-size:90%;">Keywords.<span id="p4.1.1.1" class="ltx_text ltx_font_medium"> front matter</span></span></p>
+</div>
+</div>
+<div class="ltx_pagination ltx_role_newpage"></div>
+<div id="p5" class="ltx_para">
+<p id="p5.1" class="ltx_p">${Array.from({ length: 9 }, (_, i) => includepdf('-', href(i + 1))).join('')}</p>
+</div><div class="ltx_rdf" about="" property="dcterms:creator" content="Author Name"></div>
+<div class="ltx_rdf" about="" property="dcterms:title" content="Front-matter title line"></div>
+
+</article>`;
+
+/**
+ * A thesis whose cover is an included PDF, its headings resized: LaTeXML gives
+ * a resized heading a `style` beside its class, and a font class among the
+ * title classes (#66). Each case is the article, the titles its outline lists
+ * in order with their levels, and one styled title.
+ */
+const STYLED_THESIS_ARTICLES = [
+  [
+    'sans-serif headings at 144% and 120%',
+    `<article class="ltx_document" lang="en">
+<div id="p1" class="ltx_para">
+<p id="p1.1" class="ltx_p">${includepdf('-', 'https://cover.pdf')}</p>
+</div>
+<div class="ltx_TOC"><h6 class="ltx_title ltx_title_contents">Contents</h6></div>
+<section id="Ch1" class="ltx_chapter">
+<h3 class="ltx_title ltx_title_chapter"><span class="ltx_tag ltx_tag_chapter">Chapter 1 </span>Introduction</h3>
+<section id="Ch1.S1" class="ltx_section">
+<h4 class="ltx_title ltx_font_sansserif ltx_title_section" style="font-size:144%;">1.1  Scope</h4>
+<div id="Ch1.S1.p1" class="ltx_para"><p id="Ch1.S1.p1.1" class="ltx_p">Body text.</p></div>
+<section id="Ch1.S1.SS1" class="ltx_subsection">
+<h5 class="ltx_title ltx_font_sansserif ltx_title_subsection" style="font-size:120%;">1.1.1  Detail</h5>
+<section id="Ch1.S1.SS1.SSS0.Px1" class="ltx_paragraph">
+<h6 class="ltx_title ltx_title_paragraph">Note</h6>
+<div id="Ch1.S1.SS1.SSS0.Px1.p1" class="ltx_para"><p id="Ch1.S1.SS1.SSS0.Px1.p1.1" class="ltx_p">Body text.</p></div>
+</section>
+</section>
+</section>
+</section>
+<section id="bib" class="ltx_bibliography">
+<h3 class="ltx_title ltx_title_bibliography">Bibliography</h3>
+</section>
+</article>`,
+    [
+      { level: 2, title: 'Chapter 1 Introduction' },
+      { level: 3, title: '1.1 Scope' },
+      { level: 4, title: '1.1.1 Detail' },
+      { level: 5, title: 'Note' },
+      { level: 2, title: 'Bibliography' },
+    ],
+    '1.1 Scope',
+  ],
+  [
+    'every heading at 90%',
+    `<article class="ltx_document">
+<div id="p1" class="ltx_para">
+<p id="p1.1" class="ltx_p">${includepdf('-', 'https://covers/front')}</p>
+</div>
+<section id="Sx1" class="ltx_section">
+<h4 class="ltx_title ltx_title_section" style="font-size:90%;">Abstract</h4>
+<div id="Sx1.p1" class="ltx_para"><p id="Sx1.p1.1" class="ltx_p">Body text.</p></div>
+</section>
+<div class="ltx_TOC"><h6 class="ltx_title ltx_title_contents">Contents</h6></div>
+<section id="Pt1" class="ltx_part">
+<h2 class="ltx_title ltx_title_part" style="font-size:90%;"><span class="ltx_tag ltx_tag_part">Part I </span>Introduction</h2>
+<section id="Ch1" class="ltx_chapter">
+<h3 class="ltx_title ltx_title_chapter" style="font-size:90%;"><span class="ltx_tag ltx_tag_chapter">Chapter 1 </span>Overview</h3>
+<section id="Ch1.S1" class="ltx_section">
+<h4 class="ltx_title ltx_title_section" style="font-size:90%;"><span class="ltx_tag ltx_tag_section">1 </span>Motivation</h4>
+<section id="Ch1.S1.SS1" class="ltx_subsection">
+<h5 class="ltx_title ltx_title_subsection" style="font-size:90%;"><span class="ltx_tag ltx_tag_subsection">1 </span>Setting</h5>
+<section id="Ch1.S1.SS1.SSS1" class="ltx_subsubsection">
+<h6 class="ltx_title ltx_title_subsubsection" style="font-size:90%;">Case</h6>
+<div id="Ch1.S1.SS1.SSS1.p1" class="ltx_para"><p id="Ch1.S1.SS1.SSS1.p1.1" class="ltx_p">Body text.</p></div>
+</section>
+</section>
+</section>
+</section>
+</section>
+<section id="bib" class="ltx_bibliography">
+<h3 class="ltx_title ltx_title_bibliography" style="font-size:80%;">Bibliography</h3>
+</section>
+</article>`,
+    [
+      { level: 3, title: 'Abstract' },
+      { level: 1, title: 'Part I Introduction' },
+      { level: 2, title: 'Chapter 1 Overview' },
+      { level: 3, title: '1 Motivation' },
+      { level: 4, title: '1 Setting' },
+      { level: 5, title: 'Case' },
+      { level: 2, title: 'Bibliography' },
+    ],
+    '1 Motivation',
+  ],
+] as const;
+
+/**
+ * A sectioned paper as both HTML rungs render it: title and abstract (which no
+ * outline lists), sections whose numbers sit in `ltx_tag` spans, a subsection
+ * with a run-in paragraph heading, a subsubsection, and the bibliography; a
+ * figure and an SVG object whose paths start with `assets`; a citation, the
+ * empty `mailto:` link LaTeXML writes for an author email, and an absolute
+ * code link.
+ */
+const sectionedArticle = (assets: string) => `<article class="ltx_document ltx_authors_1line">
+<h1 class="ltx_title ltx_title_document">Document title</h1>
+<div class="ltx_authors">
+<span class="ltx_creator ltx_role_author"><span class="ltx_personname">Author Name</span><span class="ltx_author_notes"><span class="ltx_author_notes_content">
+<span class="ltx_contact ltx_role_email"><span class="ltx_contact_name">Email: </span><a href="mailto:"><span id="id2" class="ltx_text ltx_font_typewriter">author@example.org</span></a>
+</span></span></span></span></div>
+<div class="ltx_abstract">
+<h6 class="ltx_title ltx_title_abstract">Abstract</h6>
+<p id="id1.id1" class="ltx_p">Abstract text.</p>
+</div>
+<section id="S1" class="ltx_section">
+<h2 class="ltx_title ltx_title_section"><span class="ltx_tag ltx_tag_section">1 </span>Introduction</h2>
+<div id="S1.p1" class="ltx_para"><p id="S1.p1.1" class="ltx_p">Body text <cite class="ltx_cite ltx_citemacro_citep">[<a href="#bib.bib1" title="" class="ltx_ref">1</a>]</cite>.</p></div>
+</section>
+<section id="S2" class="ltx_section">
+<h2 class="ltx_title ltx_title_section"><span class="ltx_tag ltx_tag_section">2 </span>Method</h2>
+<figure id="S2.F1" class="ltx_figure"><img src="${assets}Figures/x1.png" id="S2.F1.g1" class="ltx_graphics ltx_centering ltx_img_portrait" style="aspect-ratio:912/1344;" width="912" height="1344" alt="Refer to caption">
+<figcaption class="ltx_caption ltx_centering"><span class="ltx_tag ltx_tag_figure">Figure 1: </span>Caption text.</figcaption>
+</figure>
+<section id="S2.SS1" class="ltx_subsection">
+<h3 class="ltx_title ltx_title_subsection"><span class="ltx_tag ltx_tag_subsection">2.1 </span>Setup</h3>
+<section id="S2.SS1.SSS0.Px1" class="ltx_paragraph">
+<h5 class="ltx_title ltx_title_paragraph">First:</h5>
+<div id="S2.SS1.SSS0.Px1.p1" class="ltx_para"><p id="S2.SS1.SSS0.Px1.p1.1" class="ltx_p">Code at <a href="https://github.com/example/code" title="" class="ltx_ref ltx_url ltx_font_typewriter">https://github.com/example/code</a>.</p></div>
+</section>
+</section>
+<section id="S2.SS2" class="ltx_subsection">
+<h3 class="ltx_title ltx_title_subsection"><span class="ltx_tag ltx_tag_subsection">2.2 </span>Analysis</h3>
+<section id="S2.SS2.SSS1" class="ltx_subsubsection">
+<h4 class="ltx_title ltx_title_subsubsection"><span class="ltx_tag ltx_tag_subsubsection">2.2.1 </span>Bounds</h4>
+<figure id="S2.F2" class="ltx_figure"><object type="image/svg+xml" data="${assets}x2.svg" id="S2.F2.g1" class="ltx_graphics ltx_img_landscape" style="aspect-ratio:476/241;" width="476" height="241"></object>
+<figcaption class="ltx_caption"><span class="ltx_tag ltx_tag_figure">Figure 2: </span>Caption text.</figcaption>
+</figure>
+</section>
+</section>
+</section>
+<section id="bib" class="ltx_bibliography">
+<h2 class="ltx_title ltx_title_bibliography">References</h2>
+<ul class="ltx_biblist">
+<li id="bib.bib1" class="ltx_bibitem"><span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">[1]</span><span class="ltx_bibblock">A. Author. Cited work.</span></li>
+</ul>
+</section>
+</article>`;
+
+/** The outline `sectionedArticle` gives on either rung, as level and title. */
+const SECTIONED_OUTLINE = [
+  { level: 1, title: '1 Introduction' },
+  { level: 1, title: '2 Method' },
+  { level: 2, title: '2.1 Setup' },
+  { level: 4, title: 'First:' },
+  { level: 2, title: '2.2 Analysis' },
+  { level: 3, title: '2.2.1 Bounds' },
+  { level: 1, title: 'References' },
+];
+
+/** `sectionedArticle` as arxiv.org/html serves 2401.12345v1, its asset paths relative. */
+const SECTIONED_NATIVE_PAGE = nativePage('2401.12345v1', sectionedArticle('2401.12345v1/'));
+/** `sectionedArticle` as ar5iv serves 2401.12345, its asset paths root-relative. */
+const SECTIONED_AR5IV_PAGE = ar5ivPage('2401.12345', sectionedArticle('/html/2401.12345/assets/'));
+
+/**
+ * A paper with no `\section`: LaTeXML renders its subsections as `<h2>`. Its
+ * theorems carry `ltx_title_theorem` headings, and its bibliography an
+ * `ltx_ERROR undefined` span where a macro was undefined.
+ */
+const SUBSECTIONS_ONLY_ARTICLE = `<article class="ltx_document">
+<h1 class="ltx_title ltx_title_document">Document title</h1>
+<div class="ltx_abstract"><h6 class="ltx_title ltx_title_abstract">Abstract</h6>
+<p id="id1.id1" class="ltx_p">Abstract text.</p>
+</div>
+<section id="C0.S0.SSx1" class="ltx_subsection">
+<h2 class="ltx_title ltx_title_subsection">1</h2>
+
+</section>
+<div id="id38" class="ltx_para">
+<p id="id38.1" class="ltx_p">Body text with <math id="id38.1.1" class="ltx_Math" alttext="E" display="inline" intent=":literal"><semantics><mi>E</mi><annotation encoding="application/x-tex">E</annotation></semantics></math>.</p>
+</div>
+<div id="id39" class="ltx_theorem ltx_theorem_proclaim">
+<h6 class="ltx_title ltx_title_theorem">Theorem</h6>
+<div id="id39.1" class="ltx_para"><p id="id39.1.1" class="ltx_p">Theorem text.</p></div>
+</div>
+<section id="C0.S0.SSx2" class="ltx_subsection">
+<h2 class="ltx_title ltx_title_subsection">2</h2>
+
+</section>
+<section id="bib" class="ltx_bibliography">
+<h2 class="ltx_title ltx_title_bibliography">References</h2>
+
+<ul class="ltx_biblist">
+<li id="bibliography0.bibx1" class="ltx_bibitem"><span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">1</span>
+<span class="ltx_bibblock"><span id="bibliography0.bibx1.1" class="ltx_text ltx_bib_authors">A. Author</span>, <span id="bibliography0.bibx1.3" class="ltx_text">(<span id="bibliography0.bibx1.3.3.1" class="ltx_ERROR undefined">\\customcmd</span>Translated.</span>)</span></li>
+</ul>
+</section>
+</article>`;
+
+/**
+ * A legacy-ID paper's render: arxiv.org/html writes a figure path under the
+ * ID's last segment (`0601001v2/f1.png`), which resolves under the archive. Its
+ * appendix and bibliography sit inside the article.
+ */
+const LEGACY_FIGURE_ARTICLE = `<article class="ltx_document ltx_authors_1line">
+<section id="S1" class="ltx_section">
+<h2 class="ltx_title ltx_title_section"><span class="ltx_tag ltx_tag_section">I </span>Introduction</h2>
+<figure id="S1.F1" class="ltx_figure"><img src="0601001v2/f1.png" id="S1.F1.g1" class="ltx_graphics ltx_centering ltx_img_landscape" style="aspect-ratio:598/300;" width="598" height="300" alt="Refer to caption">
+<figcaption class="ltx_caption ltx_centering"><span class="ltx_tag ltx_tag_figure">Figure 1: </span>Caption text.</figcaption>
+</figure>
+</section>
+<section id="A1" class="ltx_appendix">
+<h2 class="ltx_title ltx_title_appendix"><span class="ltx_tag ltx_tag_appendix">Appendix A </span>Derivation
+</h2>
+<div id="A1.p1" class="ltx_para"><p id="A1.p1.1" class="ltx_p">Appendix text.</p></div>
+</section>
+<section id="bib" class="ltx_bibliography">
+<h2 class="ltx_title ltx_title_bibliography">References</h2>
+<ul class="ltx_biblist"><li id="bib.bib1" class="ltx_bibitem"><span class="ltx_bibblock">A. Author. Cited work.</span></li></ul>
+</section>
+</article>`;
+
+type HtmlRung = 'arxiv_html' | 'ar5iv';
+
+/** Pages that are renders, each with the rung that serves it: the corpus renders, then synthetic ones. */
+const RENDER_PAGES: ReadonlyArray<readonly [string, HtmlRung, string]> = [
+  ['corpus render/arxiv-2405.03599v3', 'arxiv_html', corpusPage('render/arxiv-2405.03599v3')],
+  ['corpus render/arxiv-2409.09856v3', 'arxiv_html', corpusPage('render/arxiv-2409.09856v3')],
+  ['corpus render/ar5iv-1906.00591', 'ar5iv', corpusPage('render/ar5iv-1906.00591')],
+  ['a sectioned paper', 'arxiv_html', SECTIONED_NATIVE_PAGE],
+  ['a sectioned paper', 'ar5iv', SECTIONED_AR5IV_PAGE],
+  [
+    'subsections as <h2> beside an undefined-macro error span',
+    'arxiv_html',
+    nativePage('2401.12345v1', SUBSECTIONS_ONLY_ARTICLE),
+  ],
+  [
+    'subsections as <h2> beside an undefined-macro error span',
+    'ar5iv',
+    ar5ivPage('2401.12345', SUBSECTIONS_ONLY_ARTICLE),
+  ],
+  [
+    'a legacy-ID paper with an appendix',
+    'arxiv_html',
+    nativePage('astro-ph/0601001v2', LEGACY_FIGURE_ARTICLE),
+  ],
+  ...STYLED_THESIS_ARTICLES.map(
+    ([name, article]) =>
+      [
+        `an included cover beside headings with ${name}`,
+        'arxiv_html',
+        nativePage('2401.12345v1', article),
+      ] as const,
+  ),
+];
+
+/** Pages whose article is `\includepdf` placeholders, at most beside front matter (#57). */
+const PLACEHOLDER_PAGES: ReadonlyArray<readonly [string, HtmlRung, string]> = [
+  ...NATIVE_INCLUDEPDF_ARTICLES.map(
+    ([name, article]) => [name, 'arxiv_html', nativePage('2401.12345v1', article)] as const,
+  ),
+  ...AR5IV_INCLUDEPDF_ARTICLES.map(
+    ([name, article]) => [name, 'ar5iv', ar5ivPage('2401.12345', article)] as const,
+  ),
+  [
+    'front matter beside nine included parts',
+    'arxiv_html',
+    nativePage(
+      '2401.12345v1',
+      frontMatterArticle((n) => `https://parts/part${n}.pdf`),
+    ),
+  ],
+  [
+    'front matter beside nine included parts',
+    'ar5iv',
+    ar5ivPage(
+      '2401.12345',
+      frontMatterArticle((n) => `parts/part${n}.pdf`),
+    ),
+  ],
+];
 
 /**
  * Build a minimal but genuinely parseable single-page PDF carrying `text`. Pass
@@ -1977,7 +2462,14 @@ describe('ArxivService.readContent', () => {
       '<!DOCTYPE html><html><head><title>arXiv</title></head><body><p>Service notice.</p></body></html>',
     ],
     ['a PDF header and nothing after it', '%PDF-1.7\n'],
+    ['a PDF truncated inside its content stream', truncatedPdf()],
   ] as const;
+
+  /** A well-formed one-page PDF cut off partway through its page text, before the xref and trailer. */
+  function truncatedPdf(): string {
+    const pdf = new TextDecoder().decode(makePdfBytes('The download stopped here'));
+    return pdf.slice(0, pdf.indexOf('stopped'));
+  }
 
   const unparseablePdf = () =>
     new Response(new TextEncoder().encode('%PDF-1.4\nnot a document\n%%EOF\n'), {
@@ -1988,7 +2480,7 @@ describe('ArxivService.readContent', () => {
   /** What the framework's PDF parser throws for a file it cannot read. */
   const parseFailure = () =>
     new McpError(
-      JsonRpcErrorCode.InternalError,
+      JsonRpcErrorCode.ValidationError,
       'Failed to extract text from PDF: Invalid PDF structure.',
       { reason: 'pdf_text_extract_failed' },
     );
@@ -2175,9 +2667,6 @@ describe('ArxivService.readContent', () => {
       );
   }
 
-  const FATAL_NOTICE =
-    '<span class="ltx_ERROR">\nConversion to HTML had a Fatal error and exited abruptly. This document may be truncated or damaged.\n</span>';
-
   it('serves an ar5iv page whose prose mentions a fatal error', async () => {
     serveAr5ivPage(
       '<article class="ltx_document"><p class="ltx_p">LaTeXML prints "Conversion to HTML had a Fatal error and exited abruptly" when the solver hits a Fatal error.</p></article>',
@@ -2201,15 +2690,14 @@ describe('ArxivService.readContent', () => {
     expect(result.content).toContain('Partial body text.');
   });
 
-  it('falls through the captured ar5iv conversion-failure page to the PDF', async () => {
-    serveAr5ivPage(fixturePage('ar5iv-hep-th_9711200v3'));
-    mockFetch.mockResolvedValueOnce(pdfResponse('Supergravity and the large N limit'));
+  it('falls through ar5iv’s conversion-failure page to the PDF', async () => {
+    serveAr5ivPage(ar5ivFailurePage('hep-th/9711200'));
+    mockFetch.mockResolvedValueOnce(pdfResponse('Text from the PDF'));
 
     const result = await getArxivService().readContent('hep-th/9711200v3', {}, createMockContext());
 
     expect(result.source).toBe('pdf_text');
-    expect(result.content).toContain('Supergravity and the large N limit');
-    expect(result.content).not.toContain('Fatal error');
+    expect(result.content).toBe('Text from the PDF');
     expect(String(mockFetch.mock.calls[3]?.[0])).toBe('https://arxiv.org/pdf/hep-th/9711200v3');
   });
 
@@ -2225,7 +2713,7 @@ describe('ArxivService.readContent', () => {
   });
 
   it('reports content_unavailable when ar5iv serves only a failure page and there is no PDF', async () => {
-    serveAr5ivPage(fixturePage('ar5iv-hep-th_9711200v3'));
+    serveAr5ivPage(ar5ivFailurePage('hep-th/9711200'));
     mockFetch.mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
 
     await expect(
@@ -2237,7 +2725,7 @@ describe('ArxivService.readContent', () => {
   });
 
   it('reports pdf_extraction_failed when ar5iv serves only a failure page and the PDF has no text', async () => {
-    serveAr5ivPage(fixturePage('ar5iv-hep-th_9711200v3'));
+    serveAr5ivPage(ar5ivFailurePage('hep-th/9711200'));
     mockFetch.mockResolvedValueOnce(pdfResponse(''));
 
     await expect(
@@ -2252,12 +2740,8 @@ describe('ArxivService.readContent', () => {
   // Pages that hold none of the paper fall through to the next rung (issue #57)
   // -------------------------------------------------------------------------
 
-  /** One rung's answer: a fixture page, an inline page, an HTTP status, or a PDF's text. */
-  type RungAnswer =
-    | { fixture: string }
-    | { html: string }
-    | { status: number }
-    | { pdfText: string };
+  /** One rung's answer: a page, an HTTP status, or a PDF's text. */
+  type RungAnswer = { html: string } | { status: number } | { pdfText: string };
 
   /**
    * Answer the arXiv API with `atomFor(versionedId)` and each content rung with
@@ -2286,7 +2770,7 @@ describe('ArxivService.readContent', () => {
       if (!answer) throw new Error(`Unexpected request: ${url}`);
       if ('status' in answer) return new Response('', { status: answer.status });
       if ('pdfText' in answer) return pdfResponse(answer.pdfText);
-      return servedPage('fixture' in answer ? fixturePage(answer.fixture) : answer.html, url.href);
+      return servedPage(answer.html, url.href);
     });
     return requested;
   }
@@ -2302,23 +2786,13 @@ describe('ArxivService.readContent', () => {
   const PLACEHOLDER_PARAGRAPH =
     '<div class="ltx_para"><p class="ltx_p">See pages - of <a href="https://supplement.pdf" title="" class="ltx_ref">supplement.pdf</a></p></div>';
 
+  // Which pages count as renders is tabled at `isConversionFailurePage` and
+  // `isPlaceholderRender`; these prove the chain stops at the rung that served one.
   it.each([
-    ['native-1706.03762v7', 'arxiv_html'],
-    ['native-math_9201201v1', 'arxiv_html'],
-    ['native-2405.03599v3-headings', 'arxiv_html'],
-    ['native-astro-ph_0603449v2-headings', 'arxiv_html'],
-    ['native-2102.10962v1-headings', 'arxiv_html'],
-    ['native-2206.14567-headings', 'arxiv_html'],
-    ['ar5iv-1706.03762v7', 'ar5iv'],
-    ['ar5iv-math_9201201v1', 'ar5iv'],
-    ['ar5iv-2411.15218v2-headings', 'ar5iv'],
-  ] as const)('serves the captured render %s from the rung it came from', async (name, rung) => {
-    const requested = serveRungs(
-      '2401.12345v1',
-      rung === 'arxiv_html'
-        ? { native: { fixture: name } }
-        : { native: { status: 404 }, ar5iv: { fixture: name } },
-    );
+    ['arxiv_html', { native: { html: SECTIONED_NATIVE_PAGE } }],
+    ['ar5iv', { native: { status: 404 }, ar5iv: { html: SECTIONED_AR5IV_PAGE } }],
+  ] as const)('serves a render from %s and requests no later rung', async (rung, rungs) => {
+    const requested = serveRungs('2401.12345v1', rungs);
 
     const result = await getArxivService().readContent('2401.12345v1', {}, createMockContext());
 
@@ -2326,152 +2800,120 @@ describe('ArxivService.readContent', () => {
     expect(requested).toEqual(wholeChain('2401.12345v1').slice(0, rung === 'arxiv_html' ? 1 : 2));
   });
 
-  it('reads 1412.6980 from its PDF when both HTML rungs serve only its \\includepdf placeholder', async () => {
-    const requested = serveRungs('1412.6980v9', {
-      native: { fixture: 'native-1412.6980' },
-      ar5iv: { fixture: 'ar5iv-1412.6980' },
-      pdf: { pdfText: 'ADAM: A METHOD FOR STOCHASTIC OPTIMIZATION' },
+  /** Both HTML rungs' page for a paper that is one `\includepdf`. */
+  const placeholderRungs = {
+    native: { html: nativePage('2401.12345v1', NATIVE_INCLUDEPDF_ARTICLES[0][1]) },
+    ar5iv: { html: ar5ivPage('2401.12345', AR5IV_INCLUDEPDF_ARTICLES[0][1]) },
+  };
+
+  it('reads the PDF when both HTML rungs serve only the paper’s \\includepdf placeholder', async () => {
+    const requested = serveRungs('2401.12345v1', {
+      ...placeholderRungs,
+      pdf: { pdfText: 'Text from the PDF' },
     });
 
-    const result = await getArxivService().readContent('1412.6980', {}, createMockContext());
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
 
     expect(result.source).toBe('pdf_text');
-    expect(result.content).toContain('ADAM: A METHOD FOR STOCHASTIC OPTIMIZATION');
-    expect(result.content).not.toContain('See pages');
-    expect(requested).toEqual(wholeChain('1412.6980v9'));
+    expect(result.content).toBe('Text from the PDF');
+    expect(requested).toEqual(wholeChain('2401.12345v1'));
   });
 
-  it('reads 2608.20066 from its PDF rather than the front matter both HTML rungs keep beside nine placeholders', async () => {
-    const requested = serveRungs('2608.20066v1', {
-      native: { fixture: 'native-2608.20066' },
-      ar5iv: { fixture: 'ar5iv-2608.20066' },
-      pdf: { pdfText: 'Part IX Exceptional-History Descent' },
+  it('moves past an arxiv.org/html placeholder page when ar5iv has no conversion', async () => {
+    const requested = serveRungs('2401.12345v1', {
+      native: placeholderRungs.native,
+      ar5iv: { status: 307 },
+      pdf: { pdfText: 'included paper text' },
     });
 
-    const result = await getArxivService().readContent('2608.20066', {}, createMockContext());
+    const result = await getArxivService().readContent('2401.12345v1', {}, createMockContext());
 
     expect(result.source).toBe('pdf_text');
-    expect(result.content).toContain('Part IX Exceptional-History Descent');
-    expect(result.content).not.toContain('Global Abstract');
-    expect(requested).toEqual(wholeChain('2608.20066v1'));
+    expect(result.content).toBe('included paper text');
+    expect(requested).toEqual(wholeChain('2401.12345v1'));
   });
 
-  it.each(['1709.01250v1', '2101.10578v1'])(
-    'moves past the arxiv.org/html placeholder page of %s',
-    async (id) => {
-      const requested = serveRungs(id, {
-        native: { fixture: `native-${id}` },
-        ar5iv: { status: 307 },
-        pdf: { pdfText: 'included paper text' },
-      });
-
-      const result = await getArxivService().readContent(id, {}, createMockContext());
-
-      expect(result.source).toBe('pdf_text');
-      expect(result.content).toContain('included paper text');
-      expect(requested).toEqual(wholeChain(id));
-    },
-  );
-
-  it.each(['1507.08011', '1606.03749', '1707.00406'])(
-    'moves past the ar5iv placeholder page of %s to the PDF',
-    async (id) => {
-      const requested = serveRungs(`${id}v1`, {
-        native: { status: 404 },
-        ar5iv: { fixture: `ar5iv-${id}` },
-        pdf: { pdfText: 'included paper text' },
-      });
-
-      const result = await getArxivService().readContent(id, {}, createMockContext());
-
-      expect(result.source).toBe('pdf_text');
-      expect(requested).toEqual(wholeChain(`${id}v1`));
-    },
-  );
-
-  it('moves past the empty article of ar5iv\'s "No content available" page to the PDF (1503.00739)', async () => {
-    const requested = serveRungs('1503.00739v1', {
+  it('moves past an ar5iv placeholder page to the PDF when arxiv.org/html has none', async () => {
+    const requested = serveRungs('2401.12345v1', {
       native: { status: 404 },
-      ar5iv: { fixture: 'ar5iv-1503.00739' },
-      pdf: { pdfText: 'paper text from the PDF' },
+      ar5iv: placeholderRungs.ar5iv,
+      pdf: { pdfText: 'included paper text' },
     });
 
-    const result = await getArxivService().readContent('1503.00739', {}, createMockContext());
+    const result = await getArxivService().readContent('2401.12345', {}, createMockContext());
 
     expect(result.source).toBe('pdf_text');
-    expect(result.content).toContain('paper text from the PDF');
-    expect(requested).toEqual(wholeChain('1503.00739v1'));
+    expect(result.content).toBe('included paper text');
+    expect(requested).toEqual(wholeChain('2401.12345v1'));
   });
 
-  it('moves past an arxiv.org/html article with no text to ar5iv (2411.15218v2)', async () => {
+  it('moves past an arxiv.org/html article with no text to ar5iv (corpus empty/arxiv-2411.15218v2)', async () => {
     const requested = serveRungs('2411.15218v2', {
-      native: { fixture: 'native-2411.15218v2' },
-      ar5iv: { fixture: 'ar5iv-2411.15218v2-headings' },
+      native: { html: corpusPage('empty/arxiv-2411.15218v2') },
+      ar5iv: { html: ar5ivPage('2411.15218', sectionedArticle('/html/2411.15218/assets/')) },
     });
 
     const result = await getArxivService().readContent('2411.15218v2', {}, createMockContext());
 
     expect(result.source).toBe('ar5iv');
-    expect(result.content).toContain('Suspected Undeclared Use of Artificial Intelligence');
-    expect(result.outline?.length).toBeGreaterThan(0);
+    expect(result.outline?.map(({ level, title }) => ({ level, title }))).toEqual(
+      SECTIONED_OUTLINE,
+    );
     expect(requested).toEqual(wholeChain('2411.15218v2').slice(0, 2));
   });
 
-  it('serves a thesis whose cover pages are included PDFs from arxiv.org/html (2102.10962v1)', async () => {
-    const requested = serveRungs('2102.10962v1', {
-      native: { fixture: 'native-2102.10962v1-headings' },
+  it('serves a thesis whose cover is an included PDF from arxiv.org/html', async () => {
+    const [, thesis] = STYLED_THESIS_ARTICLES[0];
+    const requested = serveRungs('2401.12345v1', {
+      native: { html: nativePage('2401.12345v1', thesis) },
     });
 
-    const result = await getArxivService().readContent('2102.10962v1', {}, createMockContext());
+    const result = await getArxivService().readContent('2401.12345v1', {}, createMockContext());
 
     expect(result.source).toBe('arxiv_html');
-    expect(result.content).toContain('COVER-THESIS-DPG-VOOR.pdf');
-    expect(result.content).toContain('Research Outline and Questions');
-    expect(requested).toEqual(['https://arxiv.org/html/2102.10962v1']);
+    expect(result.content).toContain('See pages - of <a href="https://cover.pdf"');
+    expect(result.content).toContain('1.1  Scope</h4>');
+    expect(requested).toEqual(['https://arxiv.org/html/2401.12345v1']);
   });
 
   it('serves a sectioned render with a placeholder paragraph added before </article>', async () => {
-    const native = fixturePage('native-1706.03762v7');
-    const end = native.lastIndexOf('</article>');
-    const requested = serveRungs('1706.03762v7', {
-      native: { html: `${native.slice(0, end)}${PLACEHOLDER_PARAGRAPH}${native.slice(end)}` },
+    const requested = serveRungs('2405.03599v3', {
+      native: {
+        html: beforeArticleEnd(corpusPage('render/arxiv-2405.03599v3'), PLACEHOLDER_PARAGRAPH),
+      },
     });
 
     const result = await getArxivService().readContent(
-      '1706.03762v7',
+      '2405.03599v3',
       { maxCharacters: null },
       createMockContext(),
     );
 
     expect(result.source).toBe('arxiv_html');
-    expect(result.content).toContain('supplement.pdf');
-    expect(requested).toEqual(['https://arxiv.org/html/1706.03762v7']);
+    expect(
+      result.content.endsWith(
+        '<div><p>See pages - of <a href="https://supplement.pdf" title="">supplement.pdf</a></p></div></article>',
+      ),
+    ).toBe(true);
+    expect(requested).toEqual(['https://arxiv.org/html/2405.03599v3']);
   });
 
   it('reports content_unavailable when both HTML rungs serve placeholders and there is no PDF', async () => {
-    serveRungs('1412.6980v9', {
-      native: { fixture: 'native-1412.6980' },
-      ar5iv: { fixture: 'ar5iv-1412.6980' },
-      pdf: { status: 404 },
-    });
+    serveRungs('2401.12345v1', { ...placeholderRungs, pdf: { status: 404 } });
 
     await expect(
-      getArxivService().readContent('1412.6980', {}, createMockContext()),
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'content_unavailable', pdfUrl: 'https://arxiv.org/pdf/1412.6980v9' },
+      data: { reason: 'content_unavailable', pdfUrl: 'https://arxiv.org/pdf/2401.12345v1' },
     });
   });
 
   it('reports pdf_extraction_failed when both HTML rungs serve placeholders and the PDF has no text', async () => {
-    serveRungs('1412.6980v9', {
-      native: { fixture: 'native-1412.6980' },
-      ar5iv: { fixture: 'ar5iv-1412.6980' },
-      pdf: { pdfText: '' },
-    });
+    serveRungs('2401.12345v1', { ...placeholderRungs, pdf: { pdfText: '' } });
 
     await expect(
-      getArxivService().readContent('1412.6980', {}, createMockContext()),
+      getArxivService().readContent('2401.12345', {}, createMockContext()),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'pdf_extraction_failed' },
@@ -2793,82 +3235,84 @@ describe('ArxivService.readContent', () => {
   });
 
   it('ends the body at </article>, dropping the arxiv.org site footer', async () => {
-    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html');
+    const page = corpusPage('render/arxiv-2409.09856v3');
+    const result = await readPage('2409.09856v3', page, 'arxiv_html');
 
-    expect(result.body_characters).toBe(9449);
+    expect(page).toContain('arxiv-html-footer');
+    expect(page).toContain('ds-funder-logo');
     expect(result.content.endsWith('</article>')).toBe(true);
     expect(result.content).not.toContain('arxiv-html-footer');
     expect(result.content).not.toContain('ds-funder-logo');
-    expect(result.total_characters).toBeLessThan(fixturePage('native-math_9201201v1').length);
+    expect(result.total_characters).toBe(
+      page.lastIndexOf('</article>') + 10 - page.indexOf('<article'),
+    );
   });
 
   it('ends the body at </article> on the ar5iv rung too', async () => {
-    const result = await readFixture('math/9201201v1', 'ar5iv-math_9201201v1', 'ar5iv');
+    const page = corpusPage('render/ar5iv-1906.00591');
+    const result = await readPage('1906.00591v1', page, 'ar5iv');
 
+    expect(page.slice(page.lastIndexOf('</article>'))).toMatch(/ar5iv-footer[\s\S]*<script/);
     expect(result.source).toBe('ar5iv');
-    expect(result.body_characters).toBe(9449);
     expect(result.content.endsWith('</article>')).toBe(true);
     expect(result.content).not.toContain('ar5iv-footer');
     expect(result.content).not.toContain('<script');
   });
 
   it('pages the last chunk of article content, not footer chrome', async () => {
-    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html', {
+    const page = corpusPage('render/arxiv-2409.09856v3');
+    // The cleaned body's length, as the fixture's expected.json records it.
+    const bodyCharacters = 486_432;
+    const result = await readPage('2409.09856v3', page, 'arxiv_html', {
       maxCharacters: 100_000,
-      start: 9000,
+      start: bodyCharacters - 5_000,
     });
 
+    expect(page.slice(page.lastIndexOf('</article>'))).toMatch(/<svg|<path/);
+    expect(result.body_characters).toBe(bodyCharacters);
+    expect(result.content).toHaveLength(5_000);
     expect(result.content.endsWith('</article>')).toBe(true);
     expect(result.content).not.toMatch(/<svg|<path/);
     expect(result.truncated).toBe(false);
   });
 
-  it('resolves relative figure src and object data against the served page URL', async () => {
-    const result = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
+  it.each([
+    ['relative', 'arxiv_html', SECTIONED_NATIVE_PAGE, 'https://arxiv.org/html/2401.12345v1/'],
+    [
+      'ar5iv root-relative',
+      'ar5iv',
+      SECTIONED_AR5IV_PAGE,
+      'https://ar5iv.labs.arxiv.org/html/2401.12345/assets/',
+    ],
+  ] as const)(
+    'resolves %s figure src and object data against the %s page URL',
+    async (_paths, rung, page, base) => {
+      const result = await readPage('2401.12345v1', page, rung);
 
-    const srcs = attrValues(result.content, 'src');
-    const datas = attrValues(result.content, 'data');
-    expect(srcs).toHaveLength(3);
-    expect(datas).toHaveLength(5);
-    expect(srcs).toContain('https://arxiv.org/html/1706.03762v7/Figures/ModalNet-21.png');
-    expect(datas).toContain('https://arxiv.org/html/1706.03762v7/making_more_difficult5_new.svg');
-    for (const value of [...srcs, ...datas]) {
-      expect(value.startsWith('https://arxiv.org/html/1706.03762v7/')).toBe(true);
-    }
-  });
+      expect(attrValues(result.content, 'src')).toEqual([`${base}Figures/x1.png`]);
+      expect(attrValues(result.content, 'data')).toEqual([`${base}x2.svg`]);
+    },
+  );
 
   it('leaves fragment, mailto, and absolute links as they are', async () => {
-    const result = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
+    const result = await readPage('2401.12345v1', SECTIONED_NATIVE_PAGE, 'arxiv_html');
 
-    const hrefs = attrValues(result.content, 'href');
-    expect(hrefs).toContain('#bib.bib13');
-    expect(hrefs.filter((h) => h.startsWith('#'))).toHaveLength(75);
-    expect(hrefs.filter((h) => h.startsWith('mailto:'))).toHaveLength(8);
-    expect(hrefs.filter((h) => h.startsWith('https://github.com/'))).toHaveLength(1);
-    expect(hrefs.every((h) => /^(#|mailto:|https:\/\/)/.test(h))).toBe(true);
-  });
-
-  it('resolves ar5iv root-relative asset paths against the ar5iv host', async () => {
-    const result = await readFixture('1706.03762v7', 'ar5iv-1706.03762v7', 'ar5iv');
-
-    const srcs = attrValues(result.content, 'src');
-    expect(srcs).toContain(
-      'https://ar5iv.labs.arxiv.org/html/1706.03762/assets/Figures/ModalNet-21.png',
-    );
-    for (const value of [...srcs, ...attrValues(result.content, 'data')]) {
-      expect(value.startsWith('https://ar5iv.labs.arxiv.org/html/1706.03762/assets/')).toBe(true);
-    }
+    expect(attrValues(result.content, 'href')).toEqual([
+      'mailto:',
+      '#bib.bib1',
+      'https://github.com/example/code',
+    ]);
   });
 
   it('resolves a legacy-ID figure under its archive and keeps appendix and bibliography', async () => {
-    const result = await readFixture(
-      'astro-ph/0603449v2',
-      'native-astro-ph_0603449v2-headings',
+    const result = await readPage(
+      'astro-ph/0601001v2',
+      nativePage('astro-ph/0601001v2', LEGACY_FIGURE_ARTICLE),
       'arxiv_html',
     );
 
     expect(attrValues(result.content, 'src')).toEqual([
-      'https://arxiv.org/html/astro-ph/0603449v2/f1.png',
+      'https://arxiv.org/html/astro-ph/0601001v2/f1.png',
     ]);
     expect(result.content).toContain('ltx_title_appendix');
     expect(result.content).toContain('ltx_title_bibliography');
@@ -2912,54 +3356,48 @@ describe('ArxivService.readContent', () => {
   // Section outline (issue #44)
   // -------------------------------------------------------------------------
 
-  it('outlines sectioning headings by tag depth, with offsets into the cleaned body', async () => {
-    const result = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
-    const outline = result.outline ?? [];
+  // Real-document outlines, starts included, are pinned by each corpus fixture's expected.json.
+  it.each([
+    ['arxiv_html', SECTIONED_NATIVE_PAGE],
+    ['ar5iv', SECTIONED_AR5IV_PAGE],
+  ] as const)(
+    'outlines sectioning headings by tag depth on %s, with offsets into the cleaned body',
+    async (rung, page) => {
+      const result = await readPage('2401.12345v1', page, rung);
+      const outline = result.outline ?? [];
 
-    expect(outline).toHaveLength(29);
-    expect(outline[0]).toMatchObject({ level: 1, title: '1 Introduction' });
-    expect(outline).toContainEqual(
-      expect.objectContaining({ level: 2, title: '3.1 Encoder and Decoder Stacks' }),
-    );
-    expect(outline).toContainEqual(expect.objectContaining({ level: 4, title: 'Encoder:' }));
-    expect(outline).toContainEqual(expect.objectContaining({ level: 1, title: 'References' }));
-    const counts: Record<number, number> = {};
-    for (const entry of outline) counts[entry.level] = (counts[entry.level] ?? 0) + 1;
-    expect(counts).toEqual({ 1: 9, 2: 12, 3: 3, 4: 5 });
-    for (const entry of outline) {
-      expect(result.content.startsWith(`<h${entry.level + 1}`, entry.start), entry.title).toBe(
-        true,
-      );
-    }
-    expect(result.outline_omitted_levels).toBeUndefined();
-  });
-
-  it('outlines the ar5iv render of a paper with the same titles and levels', async () => {
-    const native = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html');
-    const ar5iv = await readFixture('1706.03762v7', 'ar5iv-1706.03762v7', 'ar5iv');
-
-    const shape = (o: typeof native.outline) => o?.map(({ level, title }) => ({ level, title }));
-    expect(shape(ar5iv.outline)).toEqual(shape(native.outline));
-  });
+      expect(result.source).toBe(rung);
+      expect(outline.map(({ level, title }) => ({ level, title }))).toEqual(SECTIONED_OUTLINE);
+      for (const entry of outline) {
+        expect(result.content.startsWith(`<h${entry.level + 1}`, entry.start), entry.title).toBe(
+          true,
+        );
+      }
+      expect(result.outline_omitted_levels).toBeUndefined();
+    },
+  );
 
   it('reads from a heading when an outline entry start is passed back', async () => {
-    const first = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html', {
-      maxCharacters: 100_000,
-    });
-    const entry = first.outline?.find((e) => e.title === '3.2 Attention');
+    const page = corpusPage('render/arxiv-2405.03599v3');
+    const first = await readPage('2405.03599v3', page, 'arxiv_html', { maxCharacters: 100_000 });
+    const entry = first.outline?.find((e) => e.title === '0.2. The Betti setting');
     expect(entry).toBeDefined();
 
-    const jump = await readFixture('1706.03762v7', 'native-1706.03762v7', 'arxiv_html', {
+    const jump = await readPage('2405.03599v3', page, 'arxiv_html', {
       maxCharacters: 2_000,
       start: entry?.start ?? -1,
     });
-    expect(jump.content).toMatch(/^<h3 class="ltx_title ltx_title_subsection">.{0,40}3\.2 /);
+    expect(jump.content).toMatch(/^<h3 class="ltx_title ltx_title_subsection">.{0,40}0\.2\. /);
     expect(jump.outline).toBeUndefined();
     expect(jump.outline_omitted_levels).toBeUndefined();
   });
 
   it('levels headings by tag, so subsections rendered as <h2> are level 1', async () => {
-    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html');
+    const result = await readPage(
+      '2401.12345v1',
+      nativePage('2401.12345v1', SUBSECTIONS_ONLY_ARTICLE),
+      'arxiv_html',
+    );
 
     expect(result.outline).toEqual([
       { level: 1, title: '1', start: expect.any(Number) },
@@ -2969,26 +3407,33 @@ describe('ArxivService.readContent', () => {
   });
 
   it('leaves theorem, proof, abstract, and contents titles out of the outline', async () => {
-    const result = await readFixture('2405.03599v3', 'native-2405.03599v3-headings', 'arxiv_html');
+    const result = await readPage(
+      '2405.03599v3',
+      corpusPage('render/arxiv-2405.03599v3'),
+      'arxiv_html',
+    );
     const outline = result.outline ?? [];
     const classOf = (entry: (typeof outline)[number]) =>
       /^<h[1-6] class="([^"]*)">/.exec(result.content.slice(entry.start))?.[1] ?? '';
 
     expect(result.content).toContain('ltx_title_theorem');
     expect(result.content).toContain('ltx_title_proof');
+    // Counted as structure, the run-in theorem titles would pass the cap and drop a level.
+    expect(result.outline_omitted_levels).toBeUndefined();
     expect(outline).toHaveLength(183);
     for (const entry of outline) {
       expect(classOf(entry)).toMatch(/ltx_title_(section|subsection|subsubsection|bibliography)\b/);
     }
   });
 
-  it.each([
-    ['2102.10962v1', 'native-2102.10962v1-headings', 188, '1.1 Research Outline and Questions'],
-    ['2206.14567', 'native-2206.14567-headings', 187, '1 Motivation'],
-  ] as const)(
-    'outlines every structural heading of %s, the styled ones included (#66)',
-    async (id, fixture, count, styledTitle) => {
-      const result = await readFixture(id, fixture, 'arxiv_html');
+  it.each(STYLED_THESIS_ARTICLES)(
+    'outlines every structural heading of a thesis with %s, the styled ones included (#66)',
+    async (_name, article, expected, styledTitle) => {
+      const result = await readPage(
+        '2401.12345v1',
+        nativePage('2401.12345v1', article),
+        'arxiv_html',
+      );
       const outline = result.outline ?? [];
       const structuralOpeners = [
         ...result.content.matchAll(
@@ -2996,7 +3441,7 @@ describe('ArxivService.readContent', () => {
         ),
       ].map((match) => match.index);
 
-      expect(outline).toHaveLength(count);
+      expect(outline.map(({ level, title }) => ({ level, title }))).toEqual(expected);
       expect(outline.map((entry) => entry.start)).toEqual(structuralOpeners);
       for (const entry of outline) {
         expect(result.content.startsWith(`<h${entry.level + 1}`, entry.start), entry.title).toBe(
@@ -3036,11 +3481,11 @@ describe('ArxivService.readContent', () => {
   });
 
   it('omits the outline on any page past the first', async () => {
-    const result = await readFixture('math/9201201v1', 'native-math_9201201v1', 'arxiv_html', {
-      maxCharacters: 100,
-      start: 1,
-    });
+    const page = corpusPage('render/ar5iv-1906.00591');
+    const first = await readPage('1906.00591v1', page, 'ar5iv', { maxCharacters: 100 });
+    const result = await readPage('1906.00591v1', page, 'ar5iv', { maxCharacters: 100, start: 1 });
 
+    expect(first.outline).toHaveLength(15);
     expect(result).not.toHaveProperty('outline');
     expect(result).not.toHaveProperty('outline_omitted_levels');
     expect(result).not.toHaveProperty('outline_continues_at');
@@ -3118,23 +3563,22 @@ function expectLinear(unit: string, run: (input: string) => unknown): void {
 
 // Cost bounds are thread CPU; the wall-clock timeout only has to outlast a loaded machine.
 describe('HTML cleaning passes', { timeout: 30_000 }, () => {
-  it('collapses MathML on the captured pages exactly as the regex pass did', () => {
-    // SHA-256 of each page's collapseMathML output from the original
-    // `/<math\b([^>]*)>([\s\S]*?)<\/math>/g` implementation.
-    const expected: Record<string, string> = {
-      'ar5iv-1706.03762v7': 'd530895e13a1b41f7a731c15931389f45d9044c74bdc5705306567e293e631f7',
-      'ar5iv-math_9201201v1': '1c16c81e0d7f9fa45542187c58bf52e5637b2f4462562c3f360dc128bed7c29f',
-      'native-1706.03762v7': 'd791ea56609b14505ebbd8eb7f30e70e9e0e6e4535d59301251b264f6ac906aa',
-      'native-2405.03599v3-headings':
-        '3ee942b605da0e1e6ea7a9643e381dd7c9d7dda4e7f3e6d154d0e949f6cc52c7',
-      'native-astro-ph_0603449v2-headings':
-        'e60d831b28684156377261906b05f019dad906bdd12fbe066feb29629083cbed',
-      'native-math_9201201v1': '9b4c24faccf9c50b1688507d0ed215b95c74cfa0877692b1e33845362f430c29',
-    };
-    for (const [name, hash] of Object.entries(expected)) {
-      const collapsed = collapseMathML(fixturePage(name));
-      expect(createHash('sha256').update(collapsed).digest('hex'), name).toBe(hash);
-    }
+  it('collapses LaTeXML inline and display math to its TeX, leaving the markup around it as written', () => {
+    /** An inline `<math>` as LaTeXML writes it: presentation MathML, then the TeX annotation. */
+    const inline = (id: string, tex: string, mathml: string) =>
+      `<math id="${id}" class="ltx_Math" alttext="${tex}" display="inline" intent=":literal"><semantics>${mathml}<annotation encoding="application/x-tex">${tex}</annotation></semantics></math>`;
+    const paragraph = `<p id="S1.p1.1" class="ltx_p">Let ${inline('S1.p1.m1', 'p&gt;0', '<mrow><mi>p</mi><mo>&gt;</mo><mn>0</mn></mrow>')} and ${inline('S1.p1.m2', 'a&amp;b&lt;c', '<mi>a</mi>')} hold.</p>`;
+    const cell = (math: string) =>
+      `<table id="S1.E1" class="ltx_equation ltx_eqn_table">\n\n<tbody><tr class="ltx_equation ltx_eqn_row ltx_align_baseline">\n<td class="ltx_eqn_cell ltx_eqn_center_padleft"></td>\n<td class="ltx_eqn_cell ltx_align_center">${math}</td>\n<td class="ltx_eqn_cell ltx_eqn_center_padright"></td></tr></tbody>\n</table>`;
+    const display =
+      '<math id="S1.E1.m1" class="ltx_Math" alttext="\\frac{1}{2}" display="block" intent=":literal"><semantics><mfrac><mn>1</mn><mn>2</mn></mfrac><annotation encoding="application/x-tex">\\frac{1}{2}</annotation></semantics></math>';
+    // No annotation: the alttext stands in.
+    const alttextOnly =
+      '<math id="S1.p2.m1" class="ltx_Math" alttext="x_{1}" display="inline"><semantics><msub><mi>x</mi><mn>1</mn></msub></semantics></math>';
+
+    expect(collapseMathML(`${paragraph}\n${cell(display)}\n<p>${alttextOnly}</p>`)).toBe(
+      `<p id="S1.p1.1" class="ltx_p">Let $p>0$ and $a&b<c$ hold.</p>\n${cell('$$\\frac{1}{2}$$')}\n<p>$x_{1}$</p>`,
+    );
   });
 
   it('leaves an unclosed <math> element in place and still collapses the closed ones before it', () => {
@@ -3207,24 +3651,28 @@ describe('HTML cleaning passes', { timeout: 30_000 }, () => {
     expectLinear(' src="x', (s) => resolveRelativeUrls(`<img${s}>`, base));
   });
 
-  it('strips LaTeXML noise on the captured pages exactly as before', () => {
-    // SHA-256 of each whole page's stripLatexmlNoise output, recorded before the
-    // issue #52 change to the class/id passes.
-    const expected: Record<string, string> = {
-      'ar5iv-1706.03762v7': 'bc306220be20926dba00028a4f4aa542adda8dbc2a310e740bd8aeeca6c76566',
-      'ar5iv-hep-th_9711200v3': '7ba9559b5c5357b95b23bdfeaaba77b407e6b0b28d59aaf3245e14c3bf15d16d',
-      'ar5iv-math_9201201v1': 'ff0f05da6bb7c00f067fac54fab7796e256bf0b16e661079522c26f4f3e6047e',
-      'native-1706.03762v7': 'd27d29a5d3823418af9ff492eb1a93df44d933cdb3b834503e446ed90605f9fe',
-      'native-2405.03599v3-headings':
-        '4bd26d44c28c99c143343723443d14e1500a64396eff4c37b24e723a23e820e0',
-      'native-astro-ph_0603449v2-headings':
-        '5e5ddd3d87cd993a361cd792dfcddeaffbd0793fae287c81c37a22ba504d4172',
-      'native-math_9201201v1': 'c12f00dfcc75d3d1de2763395f22e45ff5c08160768ff1218ac7d6f76f5cb57e',
-    };
-    for (const [name, hash] of Object.entries(expected)) {
-      const stripped = stripLatexmlNoise(fixturePage(name));
-      expect(createHash('sha256').update(stripped).digest('hex'), name).toBe(hash);
-    }
+  it('strips LaTeXML class and id noise from a section as LaTeXML writes it, keeping structural classes', () => {
+    const section = `<section id="S1" class="ltx_section">
+<h2 class="ltx_title ltx_title_section"><span class="ltx_tag ltx_tag_section">1 </span>Introduction</h2>
+<div id="S1.p1" class="ltx_para">
+<p id="S1.p1.1" class="ltx_p">See <cite class="ltx_cite ltx_citemacro_citep">[<a href="#bib.bib1" title="" class="ltx_ref">1</a>]</cite>, where <math id="S1.p1.m1" class="ltx_Math" alttext="n" display="inline" intent=":literal"><semantics><mi>n</mi><annotation encoding="application/x-tex">n</annotation></semantics></math> is <span id="S1.p1.1.1" class="ltx_text ltx_font_italic" style="font-size:90%;">fixed</span>.<br class="ltx_break"></p>
+</div>
+<figure id="S1.F1" class="ltx_figure"><img src="x1.png" id="S1.F1.g1" class="ltx_graphics ltx_centering ltx_img_portrait" width="912" height="1344" alt="Refer to caption"></figure>
+</section>
+<section id="bib" class="ltx_bibliography">
+<h2 class="ltx_title ltx_title_bibliography">References</h2>
+</section>`;
+
+    expect(stripLatexmlNoise(section)).toBe(`<section class="ltx_section">
+<h2 class="ltx_title ltx_title_section"><span>1 </span>Introduction</h2>
+<div>
+<p>See <cite>[<a href="#bib.bib1" title="">1</a>]</cite>, where $n$ is <span style="font-size:90%;">fixed</span>.<br></p>
+</div>
+<figure><img src="x1.png" width="912" height="1344" alt="Refer to caption"></figure>
+</section>
+<section class="ltx_bibliography">
+<h2 class="ltx_title ltx_title_bibliography">References</h2>
+</section>`);
   });
 
   it('strips a noise attribute together with the whole whitespace run before it', () => {
@@ -3267,21 +3715,12 @@ describe('isConversionFailurePage', { timeout: 30_000 }, () => {
   const NOTICE =
     'Conversion to HTML had a Fatal error and exited abruptly. This document may be truncated or damaged.';
 
-  it('recognizes the captured ar5iv conversion-failure page', () => {
-    expect(isConversionFailurePage(fixturePage('ar5iv-hep-th_9711200v3'))).toBe(true);
+  it('recognizes ar5iv’s conversion-failure page, its footer text after the last </article>', () => {
+    expect(isConversionFailurePage(ar5ivFailurePage('hep-th/9711200'))).toBe(true);
   });
 
-  it('passes every captured render, including one with undefined-macro error spans', () => {
-    for (const name of [
-      'ar5iv-1706.03762v7',
-      'ar5iv-math_9201201v1',
-      'native-1706.03762v7',
-      'native-2405.03599v3-headings',
-      'native-astro-ph_0603449v2-headings',
-      'native-math_9201201v1',
-    ]) {
-      expect(isConversionFailurePage(fixturePage(name)), name).toBe(false);
-    }
+  it.each(RENDER_PAGES)('passes %s on %s', (_name, _rung, page) => {
+    expect(isConversionFailurePage(page)).toBe(false);
   });
 
   it('recognizes the notice inside an article with no other text', () => {
@@ -3323,25 +3762,16 @@ describe('isPlaceholderRender', { timeout: 30_000 }, () => {
   const PLACEHOLDER =
     '<div class="ltx_para"><p class="ltx_p">See pages - of <a href="supplement.pdf" title="" class="ltx_ref">supplement.pdf</a></p></div>';
 
-  it('recognizes every captured placeholder page on both rungs', () => {
-    for (const name of [
-      'native-1412.6980',
-      'native-1709.01250v1',
-      'native-2101.10578v1',
-      'native-2608.20066',
-      'ar5iv-1412.6980',
-      'ar5iv-1507.08011',
-      'ar5iv-1606.03749',
-      'ar5iv-1707.00406',
-      'ar5iv-2608.20066',
-    ]) {
-      expect(isPlaceholderRender(fixturePage(name)), name).toBe(true);
-    }
-  });
+  it.each(PLACEHOLDER_PAGES)(
+    'recognizes the placeholder page of %s on %s',
+    (_name, _rung, page) => {
+      expect(isPlaceholderRender(page)).toBe(true);
+    },
+  );
 
-  it('recognizes an article with no text', () => {
-    expect(isPlaceholderRender(fixturePage('native-2411.15218v2'))).toBe(true);
-    expect(isPlaceholderRender(fixturePage('ar5iv-1503.00739'))).toBe(true);
+  it('recognizes an article with no text, whatever text the page shell around it holds', () => {
+    expect(isPlaceholderRender(corpusPage('empty/arxiv-2411.15218v2'))).toBe(true);
+    expect(isPlaceholderRender(ar5ivEmptyPage('1503.00739'))).toBe(true);
     expect(
       isPlaceholderRender(
         '<article class="ltx_document">\n<div class="ltx_pagination ltx_role_newpage"></div>\n</article>',
@@ -3359,29 +3789,18 @@ describe('isPlaceholderRender', { timeout: 30_000 }, () => {
     ).toBe(true);
   });
 
-  it('passes every captured render, and the conversion-failure page its own check covers', () => {
-    for (const name of [
-      'ar5iv-1706.03762v7',
-      'ar5iv-2411.15218v2-headings',
-      'ar5iv-hep-th_9711200v3',
-      'ar5iv-math_9201201v1',
-      'native-1706.03762v7',
-      'native-2102.10962v1-headings',
-      'native-2206.14567-headings',
-      'native-2405.03599v3-headings',
-      'native-astro-ph_0603449v2-headings',
-      'native-math_9201201v1',
-    ]) {
-      expect(isPlaceholderRender(fixturePage(name)), name).toBe(false);
-    }
+  it.each(RENDER_PAGES)('passes %s on %s', (_name, _rung, page) => {
+    expect(isPlaceholderRender(page)).toBe(false);
+  });
+
+  it('passes the conversion-failure page, which its own check covers', () => {
+    expect(isPlaceholderRender(ar5ivFailurePage('hep-th/9711200'))).toBe(false);
   });
 
   it('passes a page with a structural heading whatever placeholders it holds', () => {
-    const native = fixturePage('native-1706.03762v7');
-    const end = native.lastIndexOf('</article>');
-    expect(isPlaceholderRender(`${native.slice(0, end)}${PLACEHOLDER}${native.slice(end)}`)).toBe(
-      false,
-    );
+    expect(
+      isPlaceholderRender(beforeArticleEnd(corpusPage('render/arxiv-2405.03599v3'), PLACEHOLDER)),
+    ).toBe(false);
     expect(
       isPlaceholderRender(
         `<article>${PLACEHOLDER}<h4 class="ltx_title ltx_title_section" style="font-size:144%;">1 Intro</h4></article>`,

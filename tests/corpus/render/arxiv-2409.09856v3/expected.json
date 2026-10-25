@@ -1,0 +1,296 @@
+{
+  "kind": "render",
+  "source": "arxiv_html",
+  "body_characters": 486432,
+  "total_characters": 1821385,
+  "pages": 5,
+  "body_sha256": "2f4e25a866c85b28ffb9eec87d8bbc416e4aa5b5bb2d7f9e4fecc7b906498521",
+  "outline_omitted_levels": [3],
+  "outline": [
+    {
+      "level": 1,
+      "title": "Introduction",
+      "start": 65378
+    },
+    {
+      "level": 2,
+      "title": "0.1. What was done in previous papers?",
+      "start": 67236
+    },
+    {
+      "level": 2,
+      "title": "0.2. What is done in this paper?",
+      "start": 77385
+    },
+    {
+      "level": 2,
+      "title": "0.3. Complications stemming from a non-trivial center",
+      "start": 87578
+    },
+    {
+      "level": 2,
+      "title": "0.4. What is not done in this paper?",
+      "start": 95190
+    },
+    {
+      "level": 2,
+      "title": "0.5. Contents",
+      "start": 107704
+    },
+    {
+      "level": 2,
+      "title": "0.6. Acknowledgements",
+      "start": 111916
+    },
+    {
+      "level": 1,
+      "title": "1. Summary of the preceding results",
+      "start": 113616
+    },
+    {
+      "level": 2,
+      "title": "1.1. The Langlands functor and its categorical properties",
+      "start": 114049
+    },
+    {
+      "level": 2,
+      "title": "1.2. Spectral properties",
+      "start": 116336
+    },
+    {
+      "level": 2,
+      "title": "1.3. Restriction to the irreducible locus",
+      "start": 119405
+    },
+    {
+      "level": 2,
+      "title": "1.4. Properties of ${\\mathcal{A}}_{G,\\operatorname{irred}}$",
+      "start": 124132
+    },
+    {
+      "level": 1,
+      "title": "2. Reduction to the case when $G$ is almost simple and simply-connected",
+      "start": 126431
+    },
+    {
+      "level": 2,
+      "title": "2.1. Compatibility between Langlands functors",
+      "start": 127523
+    },
+    {
+      "level": 2,
+      "title": "2.2. Proof of Proposition 2.1.6",
+      "start": 132577
+    },
+    {
+      "level": 2,
+      "title": "2.3. Changing the group",
+      "start": 159003
+    },
+    {
+      "level": 2,
+      "title": "2.4. Proof of Theorem 2.3.5",
+      "start": 167482
+    },
+    {
+      "level": 1,
+      "title": "3. Low genus cases",
+      "start": 190200
+    },
+    {
+      "level": 2,
+      "title": "3.1. What do we need to prove?",
+      "start": 190652
+    },
+    {
+      "level": 2,
+      "title": "3.2. The case of $g=0$",
+      "start": 191420
+    },
+    {
+      "level": 2,
+      "title": "3.3. The case $g=1$",
+      "start": 191910
+    },
+    {
+      "level": 1,
+      "title": "4. Calculation of the fundamental group",
+      "start": 196979
+    },
+    {
+      "level": 2,
+      "title": "4.1. The fundamental groupoid of $\\operatorname{Bun}_{{\\check{G}}}$",
+      "start": 198506
+    },
+    {
+      "level": 2,
+      "title": "4.2. Line bundles on $\\operatorname{Bun}_{\\check{G}}$",
+      "start": 202933
+    },
+    {
+      "level": 2,
+      "title": "4.3. The fundamental group of $\\operatorname{LS}_{\\check{G}}^{\\operatorname{irred}}$",
+      "start": 211087
+    },
+    {
+      "level": 1,
+      "title": "5. The core of the proof",
+      "start": 223684
+    },
+    {
+      "level": 2,
+      "title": "5.1. Action of the center",
+      "start": 224662
+    },
+    {
+      "level": 2,
+      "title": "5.2. Endomorphisms of the vacuum Poincaré object",
+      "start": 230530
+    },
+    {
+      "level": 2,
+      "title": "5.3. Algebraic geometry of $\\operatorname{LS}_{\\check{G}}$",
+      "start": 235324
+    },
+    {
+      "level": 2,
+      "title": "5.4. Structure of ${\\mathcal{A}}_{G,\\operatorname{irred}}$",
+      "start": 238174
+    },
+    {
+      "level": 2,
+      "title": "5.5. Proof of GLC",
+      "start": 241532
+    },
+    {
+      "level": 2,
+      "title": "5.6. Additional remarks",
+      "start": 260049
+    },
+    {
+      "level": 1,
+      "title": "6. The vacuum Poincaré object",
+      "start": 264424
+    },
+    {
+      "level": 2,
+      "title": "6.1. How to calculate those endomorphisms?",
+      "start": 265616
+    },
+    {
+      "level": 2,
+      "title": "6.2. Proof of Theorems 5.2.3 and 5.2.4",
+      "start": 267653
+    },
+    {
+      "level": 2,
+      "title": "6.3. Proof of Theorems 5.2.7 and 5.2.8",
+      "start": 283133
+    },
+    {
+      "level": 1,
+      "title": "7. Geometry of $\\operatorname{Bun}_{G}$",
+      "start": 286322
+    },
+    {
+      "level": 2,
+      "title": "7.1. Proof of Proposition 4.1.6",
+      "start": 287640
+    },
+    {
+      "level": 2,
+      "title": "7.2. Proof of Proposition 4.3.5",
+      "start": 294723
+    },
+    {
+      "level": 2,
+      "title": "7.3. Proof of Proposition 5.3.5",
+      "start": 298894
+    },
+    {
+      "level": 2,
+      "title": "7.4. Proof of Proposition 4.3.8",
+      "start": 312772
+    },
+    {
+      "level": 1,
+      "title": "8. 2-Fourier-Mukai transform of the automorphic category",
+      "start": 320081
+    },
+    {
+      "level": 2,
+      "title": "8.1. The notion of 2-Fourier-Mukai transform",
+      "start": 320858
+    },
+    {
+      "level": 2,
+      "title": "8.2. Some compatibilities",
+      "start": 336258
+    },
+    {
+      "level": 2,
+      "title": "8.3. The 2-Fourier-Mukai transform and Verdier duality",
+      "start": 345414
+    },
+    {
+      "level": 2,
+      "title": "8.4. Some further compatibilities",
+      "start": 355072
+    },
+    {
+      "level": 2,
+      "title": "8.5. Example: the usual Fourier-Mukai transform",
+      "start": 371081
+    },
+    {
+      "level": 2,
+      "title": "8.6. Two sheaves associated with automorphic category",
+      "start": 375427
+    },
+    {
+      "level": 2,
+      "title": "8.7. Proof of Theorem 8.6.8",
+      "start": 389125
+    },
+    {
+      "level": 2,
+      "title": "8.8. Proof of Proposition 8.7.7 (a)",
+      "start": 411955
+    },
+    {
+      "level": 2,
+      "title": "8.9. Proof of Proposition 8.7.7 (b)",
+      "start": 431667
+    },
+    {
+      "level": 2,
+      "title": "8.10. Geometric Langlands for non-pure inner forms",
+      "start": 452348
+    },
+    {
+      "level": 2,
+      "title": "8.11. An arithmetic variant",
+      "start": 460964
+    },
+    {
+      "level": 1,
+      "title": "Appendix A Review of (semi-)stability for $G$-bundles",
+      "start": 471362
+    },
+    {
+      "level": 2,
+      "title": "A.1. Definition of (semi-)stability",
+      "start": 471694
+    },
+    {
+      "level": 2,
+      "title": "A.2. A characterization of (semi-)stability",
+      "start": 475089
+    },
+    {
+      "level": 1,
+      "title": "References",
+      "start": 479319
+    }
+  ]
+}

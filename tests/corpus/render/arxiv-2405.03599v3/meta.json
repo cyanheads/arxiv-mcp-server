@@ -1,0 +1,16 @@
+{
+  "id": "arxiv-2405.03599v3",
+  "paperId": "2405.03599v3",
+  "title": "Proof of the geometric Langlands conjecture I: construction of the functor",
+  "url": "https://arxiv.org/html/2405.03599v3",
+  "rung": "arxiv_html",
+  "retrieved": "2026-10-25",
+  "license": {
+    "id": "CC-BY-4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0/",
+    "confirmedBy": "https://arxiv.org/abs/2405.03599v3"
+  },
+  "attribution": "Gaitsgory D, Raskin S. Proof of the geometric Langlands conjecture I: construction of the functor. arXiv:2405.03599v3. 2024.",
+  "sha256": "a4002f8e009d56a91cf6bfff5a847b31bb383d5a1720d530e8b638229b3d93ff",
+  "notes": "A multi-page cleaned body with an outline just under the cap; its theorem and proof titles are headings the outline leaves out."
+}

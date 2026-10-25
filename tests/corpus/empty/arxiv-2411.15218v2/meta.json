@@ -1,0 +1,16 @@
+{
+  "id": "arxiv-2411.15218v2",
+  "paperId": "2411.15218v2",
+  "title": "Academ-AI: documenting the undisclosed use of generative artificial intelligence in academic publishing",
+  "url": "https://arxiv.org/html/2411.15218v2",
+  "rung": "arxiv_html",
+  "retrieved": "2026-10-18",
+  "license": {
+    "id": "CC-BY-4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0/",
+    "confirmedBy": "https://arxiv.org/abs/2411.15218v2"
+  },
+  "attribution": "Glynn A. Academ-AI: documenting the undisclosed use of generative artificial intelligence in academic publishing. arXiv:2411.15218v2. 2024.",
+  "sha256": "4057b0ca3e70cade11e1c95ff00fb91b6c20f36742fa56731739c5530735b0b3",
+  "notes": "arxiv.org/html serves this version as an article with no text, which is no render. Captured on or before the retrieval date; the article is unchanged in the page served on 2026-10-25, which differs only in site header markup."
+}

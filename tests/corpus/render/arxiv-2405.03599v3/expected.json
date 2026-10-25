@@ -1,0 +1,926 @@
+{
+  "kind": "render",
+  "source": "arxiv_html",
+  "body_characters": 336901,
+  "total_characters": 1173251,
+  "pages": 4,
+  "body_sha256": "a31fc602731be8049e9ca10c52095f15761fb4f86b5b24a8f136dd713327da0e",
+  "outline_omitted_levels": [],
+  "outline": [
+    {
+      "level": 1,
+      "title": "Introduction",
+      "start": 41441
+    },
+    {
+      "level": 2,
+      "title": "0.1. The Langlands functor in the de Rham setting",
+      "start": 42101
+    },
+    {
+      "level": 3,
+      "title": "0.1.1.",
+      "start": 42352
+    },
+    {
+      "level": 3,
+      "title": "0.1.2.",
+      "start": 43699
+    },
+    {
+      "level": 3,
+      "title": "0.1.3.",
+      "start": 44542
+    },
+    {
+      "level": 3,
+      "title": "0.1.4.",
+      "start": 45702
+    },
+    {
+      "level": 3,
+      "title": "0.1.5.",
+      "start": 46798
+    },
+    {
+      "level": 3,
+      "title": "0.1.6.",
+      "start": 53011
+    },
+    {
+      "level": 3,
+      "title": "0.1.7.",
+      "start": 55741
+    },
+    {
+      "level": 2,
+      "title": "0.2. The Betti setting",
+      "start": 58578
+    },
+    {
+      "level": 3,
+      "title": "0.2.1.",
+      "start": 58761
+    },
+    {
+      "level": 3,
+      "title": "0.2.2.",
+      "start": 59308
+    },
+    {
+      "level": 3,
+      "title": "0.2.3.",
+      "start": 60618
+    },
+    {
+      "level": 3,
+      "title": "0.2.4.",
+      "start": 61906
+    },
+    {
+      "level": 3,
+      "title": "0.2.5.",
+      "start": 63213
+    },
+    {
+      "level": 2,
+      "title": "0.3. Comparison of the different versions of GLC",
+      "start": 63640
+    },
+    {
+      "level": 3,
+      "title": "0.3.1.",
+      "start": 64226
+    },
+    {
+      "level": 3,
+      "title": "0.3.2.",
+      "start": 66844
+    },
+    {
+      "level": 3,
+      "title": "0.3.3.",
+      "start": 67702
+    },
+    {
+      "level": 3,
+      "title": "0.3.4.",
+      "start": 70787
+    },
+    {
+      "level": 3,
+      "title": "0.3.5.",
+      "start": 71697
+    },
+    {
+      "level": 3,
+      "title": "0.3.6.",
+      "start": 72789
+    },
+    {
+      "level": 3,
+      "title": "0.3.7.",
+      "start": 74902
+    },
+    {
+      "level": 3,
+      "title": "0.3.8.",
+      "start": 75794
+    },
+    {
+      "level": 2,
+      "title": "0.4. Characteristic cycles of Hecke eigensheaves",
+      "start": 77083
+    },
+    {
+      "level": 2,
+      "title": "0.5. Contents",
+      "start": 78485
+    },
+    {
+      "level": 3,
+      "title": "0.5.1.",
+      "start": 78669
+    },
+    {
+      "level": 3,
+      "title": "0.5.2.",
+      "start": 79825
+    },
+    {
+      "level": 3,
+      "title": "0.5.3.",
+      "start": 83020
+    },
+    {
+      "level": 3,
+      "title": "0.5.4.",
+      "start": 85100
+    },
+    {
+      "level": 3,
+      "title": "0.5.5.",
+      "start": 88604
+    },
+    {
+      "level": 3,
+      "title": "0.5.6.",
+      "start": 89709
+    },
+    {
+      "level": 3,
+      "title": "0.5.7. Notations and conventions",
+      "start": 90324
+    },
+    {
+      "level": 2,
+      "title": "0.6. Acknowledgements",
+      "start": 90626
+    },
+    {
+      "level": 1,
+      "title": "1. Construction of the Langlands functor (de Rham context)",
+      "start": 92401
+    },
+    {
+      "level": 2,
+      "title": "1.1. The automorphic category",
+      "start": 93479
+    },
+    {
+      "level": 3,
+      "title": "1.1.1.",
+      "start": 93875
+    },
+    {
+      "level": 3,
+      "title": "1.1.2.",
+      "start": 94777
+    },
+    {
+      "level": 3,
+      "title": "1.1.3.",
+      "start": 95118
+    },
+    {
+      "level": 3,
+      "title": "1.1.4.",
+      "start": 95601
+    },
+    {
+      "level": 3,
+      "title": "1.1.5.",
+      "start": 96307
+    },
+    {
+      "level": 2,
+      "title": "1.2. The spectral action",
+      "start": 97975
+    },
+    {
+      "level": 3,
+      "title": "1.2.1.",
+      "start": 98471
+    },
+    {
+      "level": 3,
+      "title": "1.2.2.",
+      "start": 99103
+    },
+    {
+      "level": 3,
+      "title": "1.2.3.",
+      "start": 100181
+    },
+    {
+      "level": 3,
+      "title": "1.2.5.",
+      "start": 100979
+    },
+    {
+      "level": 2,
+      "title": "1.3. The vacuum Poincaré sheaf",
+      "start": 101641
+    },
+    {
+      "level": 3,
+      "title": "1.3.1.",
+      "start": 102446
+    },
+    {
+      "level": 3,
+      "title": "1.3.2.",
+      "start": 103405
+    },
+    {
+      "level": 3,
+      "title": "1.3.5.",
+      "start": 111867
+    },
+    {
+      "level": 3,
+      "title": "1.3.6.",
+      "start": 112605
+    },
+    {
+      "level": 3,
+      "title": "1.3.7.",
+      "start": 113921
+    },
+    {
+      "level": 3,
+      "title": "1.3.8.",
+      "start": 115096
+    },
+    {
+      "level": 2,
+      "title": "1.4. The coarse version of the functor",
+      "start": 116399
+    },
+    {
+      "level": 3,
+      "title": "1.4.1.",
+      "start": 117062
+    },
+    {
+      "level": 3,
+      "title": "1.4.2.",
+      "start": 117731
+    },
+    {
+      "level": 3,
+      "title": "1.4.5.",
+      "start": 120439
+    },
+    {
+      "level": 3,
+      "title": "1.4.6.",
+      "start": 121287
+    },
+    {
+      "level": 2,
+      "title": "1.5. The case $G=T$",
+      "start": 121983
+    },
+    {
+      "level": 3,
+      "title": "1.5.1.",
+      "start": 122101
+    },
+    {
+      "level": 3,
+      "title": "1.5.2.",
+      "start": 122933
+    },
+    {
+      "level": 3,
+      "title": "1.5.3.",
+      "start": 124457
+    },
+    {
+      "level": 3,
+      "title": "1.5.4.",
+      "start": 124929
+    },
+    {
+      "level": 2,
+      "title": "1.6. Statement of the main result",
+      "start": 125748
+    },
+    {
+      "level": 3,
+      "title": "1.6.1.",
+      "start": 126323
+    },
+    {
+      "level": 3,
+      "title": "1.6.3.",
+      "start": 127726
+    },
+    {
+      "level": 3,
+      "title": "1.6.4.",
+      "start": 128718
+    },
+    {
+      "level": 3,
+      "title": "1.6.6.",
+      "start": 130521
+    },
+    {
+      "level": 2,
+      "title": "1.7. Compatibility with the spectral action",
+      "start": 135914
+    },
+    {
+      "level": 3,
+      "title": "1.7.1.",
+      "start": 136848
+    },
+    {
+      "level": 2,
+      "title": "1.8. The bound on the right",
+      "start": 141638
+    },
+    {
+      "level": 3,
+      "title": "1.8.1.",
+      "start": 141973
+    },
+    {
+      "level": 3,
+      "title": "1.8.3.",
+      "start": 142677
+    },
+    {
+      "level": 1,
+      "title": "2. Proof of Theorem 1.6.2",
+      "start": 143486
+    },
+    {
+      "level": 2,
+      "title": "2.1. Strategy of the proof",
+      "start": 144771
+    },
+    {
+      "level": 3,
+      "title": "2.1.4.",
+      "start": 146960
+    },
+    {
+      "level": 2,
+      "title": "2.2. Proof of Proposition 2.1.1",
+      "start": 148930
+    },
+    {
+      "level": 3,
+      "title": "2.2.1.",
+      "start": 149778
+    },
+    {
+      "level": 3,
+      "title": "2.2.2.",
+      "start": 150855
+    },
+    {
+      "level": 3,
+      "title": "2.2.3.",
+      "start": 151912
+    },
+    {
+      "level": 3,
+      "title": "2.2.4.",
+      "start": 152768
+    },
+    {
+      "level": 3,
+      "title": "2.2.5.",
+      "start": 154505
+    },
+    {
+      "level": 3,
+      "title": "2.2.6.",
+      "start": 156432
+    },
+    {
+      "level": 3,
+      "title": "2.2.7.",
+      "start": 158163
+    },
+    {
+      "level": 2,
+      "title": "2.3. Proof of Theorem 2.1.2",
+      "start": 159010
+    },
+    {
+      "level": 3,
+      "title": "2.3.1.",
+      "start": 160116
+    },
+    {
+      "level": 3,
+      "title": "2.3.4.",
+      "start": 162366
+    },
+    {
+      "level": 3,
+      "title": "2.3.5.",
+      "start": 164712
+    },
+    {
+      "level": 3,
+      "title": "2.3.6.",
+      "start": 165650
+    },
+    {
+      "level": 3,
+      "title": "2.3.7.",
+      "start": 167012
+    },
+    {
+      "level": 2,
+      "title": "2.4. Proof of Proposition 2.3.2",
+      "start": 171060
+    },
+    {
+      "level": 3,
+      "title": "2.4.1.",
+      "start": 171389
+    },
+    {
+      "level": 3,
+      "title": "2.4.2.",
+      "start": 171922
+    },
+    {
+      "level": 3,
+      "title": "2.4.3.",
+      "start": 173349
+    },
+    {
+      "level": 3,
+      "title": "2.4.4.",
+      "start": 174665
+    },
+    {
+      "level": 3,
+      "title": "2.4.5.",
+      "start": 175507
+    },
+    {
+      "level": 3,
+      "title": "2.4.6.",
+      "start": 176743
+    },
+    {
+      "level": 3,
+      "title": "2.4.7.",
+      "start": 177502
+    },
+    {
+      "level": 2,
+      "title": "2.5. Proof of Proposition 1.8.2",
+      "start": 178348
+    },
+    {
+      "level": 3,
+      "title": "2.5.1.",
+      "start": 178722
+    },
+    {
+      "level": 3,
+      "title": "2.5.3.",
+      "start": 180512
+    },
+    {
+      "level": 3,
+      "title": "2.5.4.",
+      "start": 181961
+    },
+    {
+      "level": 3,
+      "title": "2.5.5.",
+      "start": 183648
+    },
+    {
+      "level": 1,
+      "title": "3. Geometric Langlands functor in the Betti context",
+      "start": 184877
+    },
+    {
+      "level": 2,
+      "title": "3.1. The category with nilpotent singular support",
+      "start": 185641
+    },
+    {
+      "level": 3,
+      "title": "3.1.1.",
+      "start": 185958
+    },
+    {
+      "level": 3,
+      "title": "3.1.2.",
+      "start": 187209
+    },
+    {
+      "level": 3,
+      "title": "3.1.3.",
+      "start": 187950
+    },
+    {
+      "level": 2,
+      "title": "3.2. The Hecke action in the Betti context",
+      "start": 189508
+    },
+    {
+      "level": 3,
+      "title": "3.2.1.",
+      "start": 189649
+    },
+    {
+      "level": 3,
+      "title": "3.2.2.",
+      "start": 190561
+    },
+    {
+      "level": 2,
+      "title": "3.3. The vacuum Poincaré sheaf in the Betti context",
+      "start": 192192
+    },
+    {
+      "level": 3,
+      "title": "3.3.1.",
+      "start": 192958
+    },
+    {
+      "level": 3,
+      "title": "3.3.3.",
+      "start": 194219
+    },
+    {
+      "level": 3,
+      "title": "3.3.5.",
+      "start": 197151
+    },
+    {
+      "level": 3,
+      "title": "3.3.7.",
+      "start": 199628
+    },
+    {
+      "level": 3,
+      "title": "3.3.8.",
+      "start": 200288
+    },
+    {
+      "level": 2,
+      "title": "3.4. Construction of the functor",
+      "start": 202196
+    },
+    {
+      "level": 3,
+      "title": "3.4.1.",
+      "start": 202552
+    },
+    {
+      "level": 3,
+      "title": "3.4.2.",
+      "start": 203694
+    },
+    {
+      "level": 3,
+      "title": "3.4.3.",
+      "start": 204684
+    },
+    {
+      "level": 3,
+      "title": "3.4.5.",
+      "start": 206072
+    },
+    {
+      "level": 3,
+      "title": "3.4.6.",
+      "start": 207763
+    },
+    {
+      "level": 2,
+      "title": "3.5. Comparsion of de Rham and Betti versions of GLC",
+      "start": 208539
+    },
+    {
+      "level": 3,
+      "title": "3.5.1.",
+      "start": 209383
+    },
+    {
+      "level": 3,
+      "title": "3.5.3.",
+      "start": 210380
+    },
+    {
+      "level": 3,
+      "title": "3.5.4.",
+      "start": 213120
+    },
+    {
+      "level": 3,
+      "title": "3.5.5.",
+      "start": 214286
+    },
+    {
+      "level": 1,
+      "title": "4. Proof of Theorem 3.4.4",
+      "start": 216595
+    },
+    {
+      "level": 2,
+      "title": "4.1. Reduction steps",
+      "start": 217506
+    },
+    {
+      "level": 3,
+      "title": "4.1.1.",
+      "start": 218537
+    },
+    {
+      "level": 3,
+      "title": "4.1.2.",
+      "start": 220272
+    },
+    {
+      "level": 3,
+      "title": "4.1.3.",
+      "start": 221507
+    },
+    {
+      "level": 3,
+      "title": "4.1.4.",
+      "start": 222585
+    },
+    {
+      "level": 2,
+      "title": "4.2. Applications of Riemann-Hilbert",
+      "start": 226429
+    },
+    {
+      "level": 3,
+      "title": "4.2.1. Proof of Proposition 4.1.6",
+      "start": 227037
+    },
+    {
+      "level": 3,
+      "title": "4.2.4.",
+      "start": 233206
+    },
+    {
+      "level": 3,
+      "title": "4.2.5.",
+      "start": 236018
+    },
+    {
+      "level": 2,
+      "title": "4.3. Proof of Proposition 4.1.5",
+      "start": 240638
+    },
+    {
+      "level": 3,
+      "title": "4.3.1.",
+      "start": 241342
+    },
+    {
+      "level": 3,
+      "title": "4.3.3.",
+      "start": 242898
+    },
+    {
+      "level": 3,
+      "title": "4.3.5.",
+      "start": 246301
+    },
+    {
+      "level": 3,
+      "title": "4.3.6.",
+      "start": 247620
+    },
+    {
+      "level": 2,
+      "title": "4.4. Proof of Lemma 4.3.2",
+      "start": 248680
+    },
+    {
+      "level": 3,
+      "title": "4.4.1.",
+      "start": 249135
+    },
+    {
+      "level": 3,
+      "title": "4.4.2.",
+      "start": 250657
+    },
+    {
+      "level": 3,
+      "title": "4.4.3.",
+      "start": 252040
+    },
+    {
+      "level": 1,
+      "title": "5. Restricted vs full GLC",
+      "start": 253489
+    },
+    {
+      "level": 2,
+      "title": "5.1. The de Rham context",
+      "start": 254442
+    },
+    {
+      "level": 3,
+      "title": "5.1.2.",
+      "start": 255593
+    },
+    {
+      "level": 3,
+      "title": "5.1.4.",
+      "start": 257534
+    },
+    {
+      "level": 3,
+      "title": "5.1.5.",
+      "start": 260765
+    },
+    {
+      "level": 3,
+      "title": "5.1.6.",
+      "start": 263584
+    },
+    {
+      "level": 3,
+      "title": "5.1.9.",
+      "start": 267382
+    },
+    {
+      "level": 3,
+      "title": "5.1.11.",
+      "start": 268744
+    },
+    {
+      "level": 2,
+      "title": "5.2. Full vs tempered Langlands",
+      "start": 269447
+    },
+    {
+      "level": 3,
+      "title": "5.2.1.",
+      "start": 269925
+    },
+    {
+      "level": 3,
+      "title": "5.2.2.",
+      "start": 271488
+    },
+    {
+      "level": 2,
+      "title": "5.3. Proof of Proposition 5.2.3",
+      "start": 273047
+    },
+    {
+      "level": 3,
+      "title": "5.3.1.",
+      "start": 273783
+    },
+    {
+      "level": 3,
+      "title": "5.3.2.",
+      "start": 276199
+    },
+    {
+      "level": 3,
+      "title": "5.3.3.",
+      "start": 277368
+    },
+    {
+      "level": 3,
+      "title": "5.3.4.",
+      "start": 279690
+    },
+    {
+      "level": 2,
+      "title": "5.4. Proof of Proposition 5.2.4",
+      "start": 281833
+    },
+    {
+      "level": 3,
+      "title": "5.4.1.",
+      "start": 282655
+    },
+    {
+      "level": 3,
+      "title": "5.4.2.",
+      "start": 283363
+    },
+    {
+      "level": 3,
+      "title": "5.4.4.",
+      "start": 288036
+    },
+    {
+      "level": 3,
+      "title": "5.4.5.",
+      "start": 290907
+    },
+    {
+      "level": 2,
+      "title": "5.5. The Betti context",
+      "start": 292733
+    },
+    {
+      "level": 3,
+      "title": "5.5.1.",
+      "start": 293329
+    },
+    {
+      "level": 3,
+      "title": "5.5.4.",
+      "start": 296419
+    },
+    {
+      "level": 3,
+      "title": "5.5.5.",
+      "start": 298490
+    },
+    {
+      "level": 1,
+      "title": "6. The structure of Hecke eigensheaves",
+      "start": 300642
+    },
+    {
+      "level": 2,
+      "title": "6.1. Statement of the main result",
+      "start": 301142
+    },
+    {
+      "level": 3,
+      "title": "6.1.1. The Hecke eigensheaf",
+      "start": 301274
+    },
+    {
+      "level": 3,
+      "title": "6.1.2.",
+      "start": 304239
+    },
+    {
+      "level": 2,
+      "title": "6.2. Characteristic cycles for eigensheaves",
+      "start": 320705
+    },
+    {
+      "level": 3,
+      "title": "6.2.1. Idea of the proof",
+      "start": 321372
+    },
+    {
+      "level": 2,
+      "title": "6.3. Proof of Theorem 6.2.2",
+      "start": 323826
+    },
+    {
+      "level": 3,
+      "title": "6.3.1. Review of microstalks",
+      "start": 324719
+    },
+    {
+      "level": 3,
+      "title": "6.3.3. Microstalks and the Langlands equivalence",
+      "start": 328435
+    },
+    {
+      "level": 3,
+      "title": "6.3.4.",
+      "start": 329720
+    },
+    {
+      "level": 1,
+      "title": "References",
+      "start": 332788
+    }
+  ]
+}

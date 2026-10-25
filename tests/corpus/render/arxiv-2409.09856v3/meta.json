@@ -1,0 +1,16 @@
+{
+  "id": "arxiv-2409.09856v3",
+  "paperId": "2409.09856v3",
+  "title": "Proof of the geometric Langlands conjecture V: the multiplicity one theorem",
+  "url": "https://arxiv.org/html/2409.09856v3",
+  "rung": "arxiv_html",
+  "retrieved": "2026-10-25",
+  "license": {
+    "id": "CC-BY-4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0/",
+    "confirmedBy": "https://arxiv.org/abs/2409.09856v3"
+  },
+  "attribution": "Gaitsgory D, Raskin S. Proof of the geometric Langlands conjecture V: the multiplicity one theorem. arXiv:2409.09856v3. 2024.",
+  "sha256": "f464ab682bcd17c257c07f9a23ace80ba779c56ccc732160b284f5b17abd0d83",
+  "notes": "A cleaned body several pages long whose structural headings pass the outline cap, so the deepest level is dropped."
+}
