@@ -116,7 +116,7 @@
     "depcheck": "^1.4.7",
     "ignore": "^7.0.13",
     "markdown-it": "^15.0.3",
-    "tsc-alias": "^1.9.8",
+    "tsc-alias": "^1.9.9",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }
