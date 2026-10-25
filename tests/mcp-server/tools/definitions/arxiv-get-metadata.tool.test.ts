@@ -8,6 +8,7 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import type { PaperLookupResult, PaperMetadata } from '@/services/arxiv/types.js';
+import { COMMONMARK_PRESETS, readCommonMarkText } from '../../../helpers/commonmark-text.js';
 
 vi.mock('@/services/arxiv/arxiv-service.js', () => ({
   getArxivService: vi.fn(),
@@ -280,6 +281,79 @@ describe('arxivGetMetadata', () => {
     expect(text).toContain(
       'Remaining IDs (not looked up; pass as paper_ids in the next call): ["2401.12355"]',
     );
+  });
+
+  // formatPaper()'s encoding is tabled in security.test.ts; one escaped title
+  // proves this tool routes papers through it. The not_found lines are this
+  // tool's own: an id and a detail, with and without the detail, and
+  // remaining_ids read back from content[] as structuredContent carries them.
+  it('reads back every paper, not_found entry, and remaining ID as structuredContent carries it (#87)', async () => {
+    const paper: PaperMetadata = {
+      ...MOCK_PAPER,
+      id: 'astro-ph/9705060v1',
+      title: 'Line strength indices Hb, <Fe>, and Mg2',
+    };
+    mockGetPapers.mockResolvedValue({
+      papers: [paper],
+      not_found: [
+        {
+          id: '2401.00002',
+          reason: 'live_lookup_failed',
+          detail: 'arXiv API returned *HTTP 503* <html> [retry](x)',
+        },
+        { id: '2401.00010', reason: 'not_in_arxiv' },
+      ],
+    });
+    const ids = Array.from({ length: 9 }, (_, i) => `2401.${String(i + 10).padStart(5, '0')}`);
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['*bad* [x](y) <b>', 'astro-ph/9705060', '2401.00002', ...ids],
+    });
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = arxivGetMetadata.output.parse(result.structuredContent);
+    expect(output.papers).toEqual([paper]);
+    expect(output.remaining_ids).toEqual(['2401.00018']);
+    const [invalid] = output.not_found ?? [];
+    expect(output.not_found).toEqual([
+      {
+        id: '*bad* [x](y) <b>',
+        reason: 'invalid_id',
+        detail: expect.stringMatching(/^Not an arXiv ID\. Use /),
+      },
+      {
+        id: '2401.00002',
+        reason: 'live_lookup_failed',
+        detail: 'arXiv API returned *HTTP 503* <html> [retry](x)',
+      },
+      { id: '2401.00010', reason: 'not_in_arxiv' },
+    ]);
+    const block = result.content[0];
+    const text = block?.type === 'text' ? block.text : '';
+    for (const preset of COMMONMARK_PRESETS) {
+      expect(readCommonMarkText(text, preset), preset).toBe(
+        [
+          'Found 1 of 4 papers. Looked up the first 10 well-formed IDs; 1 more ID is listed under Remaining IDs below.',
+          `⟨strong⟩${paper.title}⟨/strong⟩\narXiv:${paper.id} | cs.AI | 2024-01-22\nAlice`,
+          '⟨blockquote_open⟩',
+          paper.abstract,
+          '⟨blockquote_close⟩',
+          `Published: ${paper.published} | Updated: ${paper.updated}\nAbstract: ⟨a href=${paper.abstract_url}⟩${paper.abstract_url}⟨/a⟩\nPDF: ⟨a href=${paper.pdf_url}⟩${paper.pdf_url}⟨/a⟩`,
+          'Not found:',
+          '⟨bullet_list_open⟩',
+          '⟨list_item_open⟩',
+          `*bad* [x](y) <b> (invalid_id): ${invalid?.detail}`,
+          '⟨list_item_close⟩',
+          '⟨list_item_open⟩',
+          '2401.00002 (live_lookup_failed): arXiv API returned *HTTP 503* <html> [retry](x)',
+          '⟨list_item_close⟩',
+          '⟨list_item_open⟩',
+          '2401.00010 (not_in_arxiv)',
+          '⟨list_item_close⟩',
+          '⟨bullet_list_close⟩',
+          'Remaining IDs (not looked up; pass as paper_ids in the next call): ["2401.00018"]',
+        ].join('\n\n'),
+      );
+    }
   });
 
   it('fails invalid_id without a lookup when no ID is well-formed (#41)', async () => {

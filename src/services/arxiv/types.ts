@@ -4,6 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 
 /** Shared schema for paper metadata — used by search, get_metadata, and resource outputs. */
 export const PaperMetadataSchema = z
@@ -210,25 +211,40 @@ export interface PaperContent {
   truncated: boolean;
 }
 
-/** Format a PaperMetadata into a readable text block. Shared by search and get_metadata tools. */
+/**
+ * Format a PaperMetadata into a Markdown block. Shared by search and get_metadata tools.
+ * Every upstream string goes through `escapeMarkdownInline`, so a CommonMark parse
+ * reads it back as `structuredContent` carries it (issue #87). The abstract is a
+ * quote of its own, set off by blank lines: a labelled line directly after it
+ * would join the quote as a lazy continuation line. The abstract and PDF URLs
+ * render as links whose text is the URL itself.
+ */
 export function formatPaper(p: PaperMetadata): string {
+  const esc = escapeMarkdownInline;
   const cats = [p.primary_category, ...p.categories.filter((c) => c !== p.primary_category)]
     .filter(Boolean)
     .join(', ');
-  const published = p.published?.split('T')[0];
-  const updated = p.updated?.split('T')[0];
+  const published = esc(p.published?.split('T')[0] ?? '');
+  const updated = esc(p.updated?.split('T')[0] ?? '');
   const dateStr =
     published && updated && updated !== published
       ? `${published} (updated ${updated})`
       : published || updated;
-  const meta = [`arXiv:${p.id}`, cats, dateStr].filter(Boolean).join(' | ');
+  const meta = [`arXiv:${esc(p.id)}`, esc(cats), dateStr].filter(Boolean).join(' | ');
 
-  const lines = [`**${p.title}**`, meta, p.authors.join(', '), '', p.abstract];
-  if (p.comment) lines.push(`\nComment: ${p.comment}`);
-  if (p.journal_ref) lines.push(`Journal: ${p.journal_ref}`);
-  if (p.doi) lines.push(`DOI: ${p.doi}`);
-  lines.push(`Published: ${p.published} | Updated: ${p.updated}`);
-  lines.push(`Abstract: ${p.abstract_url}`);
-  lines.push(`PDF: ${p.pdf_url}`);
+  const lines = [
+    `**${esc(p.title)}**`,
+    meta,
+    esc(p.authors.join(', ')),
+    '',
+    `> ${esc(p.abstract).replaceAll('\n', '\n> ')}`,
+    '',
+  ];
+  if (p.comment) lines.push(`Comment: ${esc(p.comment)}`);
+  if (p.journal_ref) lines.push(`Journal: ${esc(p.journal_ref)}`);
+  if (p.doi) lines.push(`DOI: ${esc(p.doi)}`);
+  lines.push(`Published: ${esc(p.published)} | Updated: ${esc(p.updated)}`);
+  lines.push(`Abstract: ${markdownLink(p.abstract_url, p.abstract_url)}`);
+  lines.push(`PDF: ${markdownLink(p.pdf_url, p.pdf_url)}`);
   return lines.join('\n');
 }

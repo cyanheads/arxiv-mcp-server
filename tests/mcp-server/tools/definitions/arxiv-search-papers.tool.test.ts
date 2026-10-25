@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import type { PaperMetadata, SearchResult } from '@/services/arxiv/types.js';
+import { COMMONMARK_PRESETS, readCommonMarkText } from '../../../helpers/commonmark-text.js';
 
 vi.mock('@/services/arxiv/arxiv-service.js', () => ({
   getArxivService: vi.fn(),
@@ -312,6 +313,55 @@ describe('arxivSearchPapers', () => {
     const blocks = arxivSearchPapers.format?.({ papers: [] }) ?? [];
     const text = (blocks[0] as { text: string }).text;
     expect(text).toBe('');
+  });
+
+  // formatPaper()'s encoding is tabled in security.test.ts, through this tool;
+  // this pins the rest of the page: each paper set off by a rule, and the query
+  // echo reading back from content[] as structuredContent carries it.
+  it('sets each paper off by a rule and reads back the query echo (#87)', async () => {
+    const commented: PaperMetadata = {
+      ...MOCK_PAPER,
+      title: 'A commented paper',
+      comment: '12 pages',
+    };
+    const query = 'ti:"Sgr A*" AND [x](y)';
+    mockSearch.mockResolvedValue({
+      ...MOCK_RESULT,
+      total_results: 2,
+      papers: [commented, MOCK_PAPER],
+      effective_query: query,
+    });
+    const result = await runToolContract(arxivSearchPapers, { query });
+
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const structured = result.structuredContent as {
+      papers: PaperMetadata[];
+      effectiveQuery: string;
+    };
+    expect(structured.papers).toEqual([commented, MOCK_PAPER]);
+    expect(structured.effectiveQuery).toBe(query);
+    const [papers, trailer] = result.content.map((c) => (c.type === 'text' ? c.text : ''));
+    const meta = 'cs.CL, cs.AI | 2024-01-22 (updated 2024-01-23)';
+    for (const preset of COMMONMARK_PRESETS) {
+      expect(readCommonMarkText(papers ?? '', preset), preset).toBe(
+        [
+          `⟨strong⟩${commented.title}⟨/strong⟩\narXiv:${commented.id} | ${meta}\nAlice, Bob`,
+          '⟨blockquote_open⟩',
+          commented.abstract,
+          '⟨blockquote_close⟩',
+          `Comment: 12 pages\nPublished: ${commented.published} | Updated: ${commented.updated}\nAbstract: ⟨a href=${commented.abstract_url}⟩${commented.abstract_url}⟨/a⟩\nPDF: ⟨a href=${commented.pdf_url}⟩${commented.pdf_url}⟨/a⟩`,
+          '⟨hr⟩',
+          `⟨strong⟩${MOCK_PAPER.title}⟨/strong⟩\narXiv:${MOCK_PAPER.id} | ${meta}\nAlice, Bob`,
+          '⟨blockquote_open⟩',
+          MOCK_PAPER.abstract,
+          '⟨blockquote_close⟩',
+          `Published: ${MOCK_PAPER.published} | Updated: ${MOCK_PAPER.updated}\nAbstract: ⟨a href=${MOCK_PAPER.abstract_url}⟩${MOCK_PAPER.abstract_url}⟨/a⟩\nPDF: ⟨a href=${MOCK_PAPER.pdf_url}⟩${MOCK_PAPER.pdf_url}⟨/a⟩`,
+        ].join('\n\n'),
+      );
+      expect(readCommonMarkText(trailer ?? '', preset), preset).toBe(
+        `⟨strong⟩Query:⟨/strong⟩ ${query}\n⟨strong⟩Total Found:⟨/strong⟩ 2\n⟨strong⟩Page Start:⟨/strong⟩ 0`,
+      );
+    }
   });
 });
 

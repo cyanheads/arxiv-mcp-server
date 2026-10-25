@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 import { normalizePaperId, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
 import {
@@ -13,25 +14,49 @@ import {
   PaperContentSourceSchema,
 } from '@/services/arxiv/types.js';
 
-/** Outline as text: one line per heading, indented by level, with its level and start. */
+/**
+ * `title` as ATX heading text that reads back as written: escaped inline, and a
+ * trailing run of `#` after a space escaped too, since a heading strips such a
+ * run as its closing sequence ("C #" would read as "C").
+ */
+function headingText(title: string): string {
+  const text = escapeMarkdownInline(title);
+  let run = text.length;
+  while (run > 0 && text[run - 1] === '#') run--;
+  return run < text.length && (text[run - 1] === ' ' || text[run - 1] === '\t')
+    ? `${text.slice(0, run)}\\${text.slice(run)}`
+    : text;
+}
+
+/**
+ * Outline as text: one list item per heading, nested under the nearest
+ * shallower heading before it, with its level and start. Nesting follows the
+ * open headings rather than the level number: a list item indented 4 columns
+ * past its parent's content is not a sub-item but a continuation of the
+ * parent's text, so a jump such as level 1 to level 4 would merge two entries.
+ * Each cap notice takes a blank line before it, for the same reason: a line
+ * right after the last item continues that item's text.
+ */
 function formatOutline(
   outline: OutlineEntry[],
   omittedLevels: number[] | undefined,
   continuesAt: number | undefined,
 ): string {
   const topLevel = Math.min(...outline.map((entry) => entry.level));
+  const open: number[] = [];
+  const items = outline.map((entry) => {
+    while (open.length > 0 && (open.at(-1) ?? 0) >= entry.level) open.pop();
+    const indent = '  '.repeat(open.length);
+    open.push(entry.level);
+    return `${indent}- ${escapeMarkdownInline(entry.title)} (level ${entry.level}, start=${entry.start})`;
+  });
   const lines =
     outline.length === 0
       ? ['Outline: none']
-      : [
-          "Outline (pass an entry's start to read from that heading):",
-          ...outline.map(
-            (entry) =>
-              `${'  '.repeat(entry.level - topLevel)}- ${entry.title} (level ${entry.level}, start=${entry.start})`,
-          ),
-        ];
+      : ["Outline (pass an entry's start to read from that heading):", ...items];
   if (omittedLevels?.length) {
     lines.push(
+      '',
       `[Outline capped at 200 entries: ${omittedLevels
         .toSorted((a, b) => a - b)
         .map((level) => `level ${level}`)
@@ -40,6 +65,7 @@ function formatOutline(
   }
   if (continuesAt !== undefined) {
     lines.push(
+      '',
       `[Outline cut at 200 entries: more level ${topLevel} headings follow. Read on with start=${continuesAt} to reach them.]`,
     );
   }
@@ -231,13 +257,15 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
   },
 
   format: (result) => {
+    const paperId = escapeMarkdownInline(result.paper_id);
+    const pdfUrl = markdownLink(result.pdf_url, result.pdf_url);
     const lines = [
-      `# ${result.title}`,
+      `# ${headingText(result.title)}`,
       // Raw integer values in the header so both character counts are discoverable
       // by text-only clients (format-parity) without locale formatting interfering.
-      `arXiv:${result.paper_id} | Source: ${result.source} | Raw: ${result.total_characters} chars | Body: ${result.body_characters} chars${result.truncated ? ' (truncated)' : ''}`,
-      `Abstract: ${result.abstract_url}`,
-      `PDF: ${result.pdf_url}`,
+      `arXiv:${paperId} | Source: ${result.source} | Raw: ${result.total_characters} chars | Body: ${result.body_characters} chars${result.truncated ? ' (truncated)' : ''}`,
+      `Abstract: ${markdownLink(result.abstract_url, result.abstract_url)}`,
+      `PDF: ${pdfUrl}`,
     ];
     if (result.source === 'pdf_text') {
       lines.push(
@@ -246,7 +274,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     }
     if (result.revision_unconfirmed) {
       lines.push(
-        `\n[Revision unconfirmed: ar5iv keeps one render per paper, so this body may be another revision than arXiv:${result.paper_id}. The PDF at ${result.pdf_url} is exactly arXiv:${result.paper_id}.]`,
+        `\n[Revision unconfirmed: ar5iv keeps one render per paper, so this body may be another revision than arXiv:${paperId}. The PDF at ${pdfUrl} is exactly arXiv:${paperId}.]`,
       );
     }
     const sliceEnd = result.start + result.content.length;
@@ -269,7 +297,17 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
         formatOutline(result.outline, result.outline_omitted_levels, result.outline_continues_at),
       );
     }
-    lines.push('', result.content);
+    // The body goes out byte-for-byte in a fence, so start, body_characters, and
+    // outline offsets keep indexing what a parse reads back (#87). An empty
+    // slice has nothing to fence.
+    if (result.content !== '') {
+      lines.push(
+        '',
+        markdown()
+          .codeBlock(result.content, result.source === 'pdf_text' ? 'text' : 'html')
+          .build(),
+      );
+    }
     return [{ type: 'text' as const, text: lines.join('\n') }];
   },
 });

@@ -28,7 +28,9 @@ describe('formatPaper', () => {
     expect(text).toContain('2024-01-22');
     expect(text).toContain('Alice, Bob');
     expect(text).toContain('Test abstract text.');
-    expect(text).toContain('PDF: https://arxiv.org/pdf/2401.12345v1');
+    expect(text).toContain(
+      'PDF: [https://arxiv.org/pdf/2401.12345v1](<https://arxiv.org/pdf/2401.12345v1>)',
+    );
   });
 
   it('includes optional fields when present', () => {

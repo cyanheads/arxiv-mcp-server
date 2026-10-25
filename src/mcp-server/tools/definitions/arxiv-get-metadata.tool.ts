@@ -5,7 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { partialResult, partialResultSchema } from '@cyanheads/mcp-ts-core/utils';
+import {
+  escapeMarkdownInline,
+  partialResult,
+  partialResultSchema,
+} from '@cyanheads/mcp-ts-core/utils';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
 import { normalizePaperId, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
 import {
@@ -241,10 +245,12 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       parts.push(result.papers.map(formatPaper).join('\n\n---\n\n'));
     }
     if (result.not_found && result.not_found.length > 0) {
+      // An invalid_id entry carries the caller's string as sent, and a detail can
+      // carry upstream text: both are escaped to read back as written (#87).
       const lines = result.not_found.map((entry) =>
         entry.detail
-          ? `- ${entry.id} (${entry.reason}): ${entry.detail}`
-          : `- ${entry.id} (${entry.reason})`,
+          ? `- ${escapeMarkdownInline(entry.id)} (${entry.reason}): ${escapeMarkdownInline(entry.detail)}`
+          : `- ${escapeMarkdownInline(entry.id)} (${entry.reason})`,
       );
       // An extra blank line sets the list off from the paper blocks above it.
       parts.push(`${result.papers.length > 0 ? '\n' : ''}Not found:\n${lines.join('\n')}`);

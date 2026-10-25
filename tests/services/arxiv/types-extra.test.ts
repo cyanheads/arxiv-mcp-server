@@ -128,12 +128,16 @@ describe('formatPaper edge cases', () => {
 
   it('includes PDF URL always (required for attribution)', () => {
     const text = formatPaper(BASE_PAPER);
-    expect(text).toContain('PDF: https://arxiv.org/pdf/2401.12345v1');
+    expect(text).toContain(
+      'PDF: [https://arxiv.org/pdf/2401.12345v1](<https://arxiv.org/pdf/2401.12345v1>)',
+    );
   });
 
   it('includes abstract URL always', () => {
     const text = formatPaper(BASE_PAPER);
-    expect(text).toContain('Abstract: https://arxiv.org/abs/2401.12345v1');
+    expect(text).toContain(
+      'Abstract: [https://arxiv.org/abs/2401.12345v1](<https://arxiv.org/abs/2401.12345v1>)',
+    );
   });
 
   it('handles abstract with newlines (normalized to single space)', () => {
