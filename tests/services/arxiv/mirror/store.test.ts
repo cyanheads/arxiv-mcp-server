@@ -8,7 +8,7 @@
 
 import { Database } from 'bun:sqlite';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, fstatSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, fstatSync, readdirSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
@@ -21,11 +21,12 @@ import { fromWireError, toWireError } from '@/services/arxiv/mirror/reader.js';
 import {
   MIRROR_FTS_DROP_STATEMENTS,
   MIRROR_FTS_STATEMENTS,
+  MIRROR_PAPER_ID_INDEX,
   MIRROR_PRAGMA_STATEMENTS,
   MIRROR_SCHEMA_STATEMENTS,
   MIRROR_SCHEMA_VERSION,
   MIRROR_V4_STATEMENTS,
-  MIRROR_WRITE_INDEX_SQL,
+  MIRROR_V5_STATEMENTS,
 } from '@/services/arxiv/mirror/schema.js';
 import {
   isDriverError,
@@ -67,73 +68,6 @@ function holdWriteLock(path: string): { release: () => void } {
       holder.close();
     },
   };
-}
-
-/**
- * Hold `path`'s write lock from a separate process, resolving once it holds it.
- * The process keeps the lock until `letGo(ms)` is called, then lets go `ms`
- * later; `releasedAt` settles with the epoch ms it read just before letting go.
- * `letGo` signals through a file, written synchronously, because a busy wait
- * sleeps this thread: only another process can release the lock while this one
- * waits, and only a signal sent before the wait starts reaches it. A process
- * that never sees the signal (a test that failed and removed its directory)
- * exits after 15 s.
- */
-async function holdWriteLockElsewhere(
-  path: string,
-): Promise<{ letGo: (ms: number) => void; releasedAt: Promise<number> }> {
-  const goPath = `${path}.go`;
-  const child = spawn(
-    process.execPath,
-    [
-      '-e',
-      `const { Database } = require('bun:sqlite');
-       const { existsSync, readFileSync } = require('node:fs');
-       const db = new Database(process.env.LOCK_PATH);
-       db.run('BEGIN IMMEDIATE');
-       console.log('LOCKED');
-       const giveUp = setTimeout(() => process.exit(3), 15000);
-       const poll = setInterval(() => {
-         if (!existsSync(process.env.GO_PATH)) return;
-         clearInterval(poll);
-         clearTimeout(giveUp);
-         setTimeout(() => {
-           const at = Date.now();
-           db.run('COMMIT');
-           db.close();
-           console.log('RELEASED ' + at);
-         }, Number(readFileSync(process.env.GO_PATH, 'utf8')));
-       }, 5);`,
-    ],
-    {
-      env: { ...process.env, LOCK_PATH: path, GO_PATH: goPath },
-      stdio: ['ignore', 'pipe', 'inherit'],
-    },
-  );
-  let out = '';
-  const exited = new Promise<string>((resolve, reject) => {
-    child.stdout?.on('data', (chunk: Buffer) => {
-      out += chunk.toString();
-    });
-    child.once('error', reject);
-    child.once('close', (code) =>
-      code === 0 ? resolve(out) : reject(new Error(`lock holder exited ${code}`)),
-    );
-  });
-  await new Promise<void>((resolve, reject) => {
-    child.stdout?.on('data', () => {
-      if (out.includes('LOCKED')) resolve();
-    });
-    exited.catch(reject);
-  });
-  const releasedAt = exited.then((text) => {
-    const at = /RELEASED (\d+)/.exec(text)?.[1];
-    if (at === undefined) throw new Error(`lock holder never released: ${text}`);
-    return Number(at);
-  });
-  // A test that fails before awaiting it has its own failure to report.
-  releasedAt.catch(() => undefined);
-  return { letGo: (ms) => writeFileSync(goPath, String(ms)), releasedAt };
 }
 
 /**
@@ -600,20 +534,22 @@ describe('MirrorStore', () => {
     expect(result.results.length).toBeGreaterThan(0);
   });
 
-  // `mirror:verify` checks each v4 index and the fill trigger against the schema
-  // module: a file can record v4 and still lack one, and no open recreates it.
-  describe('v4 schema objects', () => {
-    const V4_OBJECTS = [
+  // `mirror:verify` checks each index and the fill trigger the schema defines
+  // against the schema module: a file can record its version and still lack
+  // one, and no open recreates it.
+  describe('schema objects', () => {
+    const SCHEMA_OBJECTS = [
       'index paper_categories_cat_published_idx',
       'index paper_categories_cat_updated_idx',
       'index papers_published_idx',
       'index papers_updated_idx',
       'index papers_revised_early_idx',
+      'index paper_categories_paper_id_idx',
       'trigger paper_categories_published_fill',
     ];
     const statuses = () =>
       store.checkSchemaObjects().map((o) => `${o.type} ${o.name}: ${o.status}`);
-    const allOk = V4_OBJECTS.map((object) => `${object}: ok`);
+    const allOk = SCHEMA_OBJECTS.map((object) => `${object}: ok`);
     const runOnFile = (...statements: string[]) => {
       const db = new Database(dbPath);
       for (const sql of statements) db.run(sql);
@@ -631,6 +567,9 @@ describe('MirrorStore', () => {
         'CREATE INDEX paper_categories_cat_published_idx ON paper_categories(category, paper_id, published)',
         'DROP TRIGGER paper_categories_published_fill',
         'CREATE TRIGGER paper_categories_published_fill AFTER INSERT ON paper_categories BEGIN SELECT 1; END',
+        // The definition the harvest runner built before v5 (#50).
+        'DROP INDEX paper_categories_paper_id_idx',
+        'CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id)',
       );
       const damaged = [
         'index paper_categories_cat_published_idx: differs',
@@ -638,6 +577,7 @@ describe('MirrorStore', () => {
         'index papers_published_idx: ok',
         'index papers_updated_idx: missing',
         'index papers_revised_early_idx: ok',
+        'index paper_categories_paper_id_idx: differs',
         'trigger paper_categories_published_fill: differs',
       ];
       expect(statuses()).toEqual(damaged);
@@ -659,70 +599,27 @@ describe('MirrorStore', () => {
     });
   });
 
-  // Issue #50 — the write path's index on paper_categories(paper_id) is built
-  // by the harvest runner through ensureWriteIndex, never by open.
-  describe('write-path index (#50)', () => {
-    async function junctionIndexes(): Promise<string[]> {
-      const { Database } = await import('bun:sqlite');
+  // The junction's (paper_id, category) index: the write path's lookups by
+  // paper_id (#50) and a term-less search's probe into each other group (#85).
+  // The schema owns it from v5, so a new file holds it from its first commit.
+  describe('paper_id index', () => {
+    it('is in a new file from its first commit, as the schema defines it', () => {
       const db = new Database(dbPath, { readonly: true });
-      const rows = db.prepare(`PRAGMA index_list(paper_categories)`).all() as { name: string }[];
+      const stored = db
+        .query(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`)
+        .get('paper_categories_paper_id_idx') as { sql: string } | null;
+      const columns = (
+        db.query(`PRAGMA index_info(paper_categories_paper_id_idx)`).all() as { name: string }[]
+      ).map((c) => c.name);
       db.close();
-      return rows.map((r) => r.name).sort();
-    }
 
-    it('is not built by open, and ensureWriteIndex adds it idempotently', async () => {
-      expect(await junctionIndexes()).not.toContain('paper_categories_paper_id_idx');
-
-      store.ensureWriteIndex();
-      store.ensureWriteIndex();
-
-      expect(await junctionIndexes()).toEqual([
-        'paper_categories_cat_published_idx',
-        'paper_categories_cat_updated_idx',
-        'paper_categories_paper_id_idx',
-        'sqlite_autoindex_paper_categories_1',
-      ]);
+      expect(columns).toEqual(['paper_id', 'category']);
+      expect(stored?.sql).toBe(MIRROR_PAPER_ID_INDEX[1]);
+      expect(MIRROR_V5_STATEMENTS).toEqual(MIRROR_PAPER_ID_INDEX);
       expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
     });
 
-    it('leaves every search result and count unchanged', () => {
-      store.applyBatch(
-        [
-          mkRecord({ paper_id: 'a', title: 'Protein folding', categories: 'cs.LG stat.ML' }),
-          mkRecord({ paper_id: 'b', title: 'Protein design', categories: 'cs.LG' }),
-          mkRecord({ paper_id: 'c', title: 'Dark matter', categories: 'astro-ph.CO stat.ML' }),
-        ],
-        [],
-      );
-      const shapes = [
-        { categoryGroups: [['cs.LG']] },
-        { categoryGroups: [['cs.LG', 'astro-ph.CO']] },
-        { categoryGroups: [['cs.LG'], ['stat.ML']] },
-        { categoryGroups: [['stat.ML']], sortBy: 'published' as const },
-        { matchExpr: '"protein"', categoryGroups: [['cs.LG']] },
-        { matchExpr: '"protein"' },
-      ];
-      const runAll = () =>
-        shapes.map((s) =>
-          store.search({
-            limit: 10,
-            offset: 0,
-            sortBy: 'updated',
-            sortOrder: 'descending',
-            ...s,
-          }),
-        );
-
-      const before = runAll();
-      store.ensureWriteIndex();
-      const after = runAll();
-
-      expect(after).toEqual(before);
-      expect(before.map((r) => r.total)).toEqual([2, 3, 1, 2, 2, 2]);
-    });
-
-    it('keeps record rewrites and tombstone cascades exact with the index in place', () => {
-      store.ensureWriteIndex();
+    it('keeps record rewrites and tombstone cascades exact', () => {
       store.applyBatch([mkRecord({ paper_id: 'x', categories: 'cs.LG stat.ML' })], []);
       store.applyBatch([mkRecord({ paper_id: 'x', categories: 'math.AP' })], []);
       const count = (cat: string) =>
@@ -738,35 +635,6 @@ describe('MirrorStore', () => {
       store.applyBatch([], [{ paper_id: 'x' }]);
       expect(count('math.AP')).toBe(0);
     });
-
-    // Issue #64 — the index build must surface a held write lock, never report
-    // success without the index.
-    it('waits out a write lock another process holds briefly, then builds the index', async () => {
-      const holder = await holdWriteLockElsewhere(dbPath);
-      const calledAt = Date.now();
-      holder.letGo(250);
-      store.ensureWriteIndex();
-      const returnedAt = Date.now();
-      const releasedAt = await holder.releasedAt;
-
-      // The lock was still held when the call began, and the call returned only
-      // once the other process had let go of it.
-      expect(releasedAt).toBeGreaterThan(calledAt);
-      expect(returnedAt).toBeGreaterThanOrEqual(releasedAt);
-      expect(await junctionIndexes()).toContain('paper_categories_paper_id_idx');
-    });
-
-    it('fails, without the index, when the write lock outlasts the 5 s busy wait', async () => {
-      const lock = holdWriteLock(dbPath);
-      const started = performance.now();
-      const code = sqliteCode(() => store.ensureWriteIndex());
-      const waitedMs = performance.now() - started;
-      lock.release();
-
-      expect(code).toBe('SQLITE_BUSY');
-      expect(waitedMs).toBeGreaterThanOrEqual(4_900);
-      expect(await junctionIndexes()).not.toContain('paper_categories_paper_id_idx');
-    }, 15_000);
   });
 
   // Issue #64 — the mirror's SQL runs one statement at a time on both drivers,
@@ -780,7 +648,7 @@ describe('MirrorStore', () => {
         ...MIRROR_PRAGMA_STATEMENTS,
         ...MIRROR_SCHEMA_STATEMENTS,
         ...MIRROR_V4_STATEMENTS,
-        MIRROR_WRITE_INDEX_SQL,
+        ...MIRROR_V5_STATEMENTS,
         ...MIRROR_FTS_DROP_STATEMENTS,
         ...MIRROR_FTS_STATEMENTS,
       ]) {
@@ -1731,10 +1599,38 @@ describe('MirrorStore.search without a free-text term (#78)', () => {
       }
     });
 
-    it('is a whole archive beside one code, since each candidate then costs one probe', () => {
-      // stat.ML's 54,001 rows would each probe every code under cs; cs's
-      // 80,001 rows each probe stat.ML alone.
-      expect(driverOf(shape('two groups by submission'))).toEqual(CS);
+    it('is the group with fewer junction rows beside a whole archive, in either operand order (#85)', () => {
+      // Both pass the cap; stat.ML holds 54,001 rows and cs 80,001 across its
+      // codes. Each stat.ML candidate costs one seek into cs however many codes
+      // cs holds, so the code count no longer decides.
+      expect(driverOf(shape('two groups by submission'))).toEqual(['stat.ML']);
+      expect(driverOf(shape('two groups by relevance'))).toEqual(['stat.ML']);
+    });
+
+    it('is the same group whichever order the operands come in (#85)', () => {
+      for (const groups of [
+        [['q-fin.ST'], ['stat.ML']],
+        [['stat.ML'], ['q-fin.ST']],
+      ]) {
+        expect(driverOf({ label: 'swapped', groups, sortBy: 'relevance' })).toEqual(['stat.ML']);
+      }
+    });
+
+    // Issue #85 — a group with no row in the window ends the search at 0
+    // before any group is counted.
+    it.each([
+      [[['cs.LG'], ['q-bio.BM']]],
+      [[['q-bio.BM'], ['cs.LG']]],
+      [[CS, ['stat.ML'], ['q-bio.BM']]],
+    ])('answers %j with 0, counting no other group’s rows', (groups) => {
+      const s: Shape = { label: 'empty', groups, sortBy: 'relevance' };
+      let page: ReturnType<MirrorStore['search']> | undefined;
+      const runs = boundBy(() => {
+        page = store.search(optionsFor(s, 0));
+      });
+      expect(page).toEqual({ papers: [], total: 0, totalIsLowerBound: false });
+      expect(runs.length).toBeGreaterThan(0);
+      expect(runs.filter(({ sql }) => /COUNT\(\*\)/.test(sql))).toEqual([]);
     });
 
     it.each([
@@ -1749,6 +1645,87 @@ describe('MirrorStore.search without a free-text term (#78)', () => {
           expect(planOf(dbPath, sql).join('\n'), sql).not.toMatch(/TEMP B-TREE FOR DISTINCT/);
         }
       }
+    });
+  });
+
+  // Issue #85 — every other group costs one covering seek per candidate: its
+  // primary-key entry for one code, else the paper's entries in
+  // paper_categories_paper_id_idx (paper_id, category), never one seek per code.
+  describe('the probe into each other group', () => {
+    // SQLite plans an EXISTS probe as `SEARCH pc EXISTS …` where it folds the
+    // probe into the outer loop and as a correlated subquery's `SEARCH pc …`
+    // elsewhere: the same one seek either way, so both read as one.
+    const seekOf = (line: string) => line.replace(/^SEARCH pc EXISTS /, 'SEARCH pc ');
+    const PK_SEEK =
+      'SEARCH pc USING COVERING INDEX sqlite_autoindex_paper_categories_1 (category=? AND paper_id=?)';
+    const PAPER_SEEK = 'SEARCH pc USING COVERING INDEX paper_categories_paper_id_idx (paper_id=?)';
+    const PROBED: Shape[] = [
+      { label: 'cs beside stat.ML, at the cap', groups: [CS, ['stat.ML']], sortBy: 'updated' },
+      {
+        label: 'cs beside stat.ML in a window, by submission',
+        groups: [['stat.ML'], CS],
+        from: 0,
+        to: 20_000,
+        sortBy: 'published',
+      },
+      {
+        label: 'cs and stat.ML beside math.AP, under the cap',
+        groups: [CS, ['stat.ML'], ['math.AP']],
+        sortBy: 'relevance',
+      },
+    ];
+
+    it.each(PROBED.map((s) => [s.label, s] as const))(
+      'seeks a several-code group once per candidate, by paper, in every count and page: %s',
+      (_label, s) => {
+        const { ids } = reference(s);
+        const atCap = ids.length >= MIRROR_SEARCH_MATCH_CAP;
+        const oneCodeOthers = s.groups.filter((g) => g.length === 1).length - 1;
+        for (const offset of atCap ? [0, 10_000] : [0, 10]) {
+          let page: string[] = [];
+          const probing = preparedBy(() => {
+            page = store.search(optionsFor(s, offset)).papers.map((p) => p.id);
+          }).filter((sql) => /paper_categories pc\b/.test(sql));
+          expect(page).toEqual(ids.slice(offset, offset + 10));
+          // The capped count and the page.
+          expect(probing.length).toBeGreaterThanOrEqual(2);
+          for (const sql of probing) {
+            const plan = planOf(dbPath, sql);
+            // One read of the driver per arm: the count and an under-cap page
+            // read it once, a page at the cap once per driver code.
+            const arms = plan.filter((l) => /^SEARCH d USING /.test(l)).length;
+            expect(arms, plan.join('\n')).toBeGreaterThan(0);
+            // Each arm probes cs with one seek by paper, and each one-code group
+            // with one seek on its primary-key entry: nothing else.
+            expect(
+              plan
+                .filter((l) => /^SEARCH pc /.test(l))
+                .map(seekOf)
+                .sort(),
+              plan.join('\n'),
+            ).toEqual(
+              [
+                ...Array(arms).fill(PAPER_SEEK),
+                ...Array(arms * oneCodeOthers).fill(PK_SEEK),
+              ].sort(),
+            );
+          }
+        }
+      },
+    );
+
+    it('reads an under-cap page in update order with no window from the index holding updated', () => {
+      const s = SHAPES.find((x) => x.label === 'two groups meeting under the cap') as Shape;
+      const { ids } = reference(s);
+      expect(ids.length).toBeLessThan(MIRROR_SEARCH_MATCH_CAP);
+      let papers: string[] = [];
+      const pageSql = preparedBy(() => {
+        papers = store.search(optionsFor(s, 10)).papers.map((p) => p.id);
+      }).find((sql) => /ORDER BY/.test(sql) && !isPageFetch(sql));
+      expect(papers).toEqual(ids.slice(10, 20));
+      expect(planOf(dbPath, pageSql ?? '')).toContain(
+        'SEARCH d USING COVERING INDEX paper_categories_cat_updated_idx (category=?)',
+      );
     });
   });
 });
@@ -1820,7 +1797,6 @@ describe('MirrorStore.openReader (#55)', () => {
     expect(sqliteCode(() => store.applyBatch([mkRecord({ paper_id: '2401.00002' })], []))).toBe(
       'SQLITE_READONLY',
     );
-    expect(sqliteCode(() => store.ensureWriteIndex())).toBe('SQLITE_READONLY');
     expect(store.readHarvestState().status).toBe('complete');
     expect(store.countPapers()).toBe(1);
     store.close();

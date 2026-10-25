@@ -38,10 +38,19 @@
  *     date indexes widen: `paper_categories(category, updated, paper_id, published)`,
  *     `papers(published, updated)`, `papers(updated, published)`. See
  *     {@link MIRROR_V4_STATEMENTS}.
+ *
+ * v5 changes (issues #88, #85):
+ *   - The text columns of `papers` hold `'` and `"` where a pre-v5 harvester
+ *     stored OAI's `&#39;` and `&#34;` undecoded; the migration repairs them in
+ *     place (`repairQuoteReferences` in `store.ts`).
+ *   - `paper_categories(paper_id, category)` joins the schema under the name
+ *     the harvest runner gave its `(paper_id)` index, so a term-less search
+ *     probes a group of any size with one seek per candidate. See
+ *     {@link MIRROR_PAPER_ID_INDEX}.
  * @module services/arxiv/mirror/schema
  */
 
-export const MIRROR_SCHEMA_VERSION = 4;
+export const MIRROR_SCHEMA_VERSION = 5;
 
 /**
  * The FTS5 index and its `papers` sync triggers. Split out of the main schema
@@ -245,18 +254,33 @@ export const MIRROR_V4_STATEMENTS: readonly string[] = [
 ];
 
 /**
- * Write-path index on `paper_categories(paper_id)` (issue #50). Every record
- * write deletes the paper's junction rows by `paper_id`, and a tombstone's
- * `ON DELETE CASCADE` looks them up the same way; neither existing index leads
- * with `paper_id`, so without this one each lookup scans the whole junction.
+ * The junction's index by paper, as v5 defines it, a drop and a create that run
+ * in one transaction (issue #85). It serves two lookups:
  *
- * Kept out of {@link MIRROR_SCHEMA_STATEMENTS} on purpose: only the harvest
- * looks junction rows up by `paper_id`, and building this index over a
- * full-corpus junction takes seconds, which no other open should pay. The
- * harvest runner ensures it before its first page instead
- * (`MirrorStore.ensureWriteIndex`). Reads never filter the junction by
- * `paper_id`, so a file without it serves identically, and the schema version
- * does not change.
+ * - the write path's (issue #50): every record write deletes the paper's
+ *   junction rows by `paper_id`, and a tombstone's `ON DELETE CASCADE` looks
+ *   them up the same way;
+ * - a term-less search's probe into a group of several codes: one seek on the
+ *   candidate's `paper_id` reads its few entries, `category` included, and
+ *   tests them against the group's list, where the primary key would cost a
+ *   seek per code.
+ *
+ * Before v5 the harvest runner built it as `(paper_id)` outside the schema
+ * version, so a harvested v4 file holds that definition and a store-created one
+ * none; the v5 migration ends both at this one (`migrateToV5` in `store.ts`).
+ * The name stays, and with it every write-path plan; a pre-v5 writer's
+ * `CREATE INDEX IF NOT EXISTS` of that name finds it and changes nothing.
  */
-export const MIRROR_WRITE_INDEX_SQL =
-  'CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx ON paper_categories(paper_id)';
+export const MIRROR_PAPER_ID_INDEX: readonly [drop: string, create: string] = [
+  'DROP INDEX IF EXISTS paper_categories_paper_id_idx',
+  'CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id, category)',
+];
+
+/**
+ * Everything v5 adds to the shape {@link MIRROR_V4_STATEMENTS} leaves, in order:
+ * a new file runs it in the transaction that creates it, a v4 file the same
+ * statements as its migration's second part, so the two define it alike. Kept
+ * out of the up-front list for the reason v4's are: a redefined index under an
+ * existing name is skipped by `IF NOT EXISTS`.
+ */
+export const MIRROR_V5_STATEMENTS: readonly string[] = [...MIRROR_PAPER_ID_INDEX];

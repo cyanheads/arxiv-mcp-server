@@ -18,6 +18,7 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { httpErrorFromResponse, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { ENTITY_ACTION, EntityDecoder } from '@nodable/entities';
 import { XMLParser } from 'fast-xml-parser';
 import type { ArxivRawRecord, ArxivRawVersion, ArxivTombstone, OaiPage } from './types.js';
 
@@ -325,11 +326,32 @@ function transportCause(err: unknown): string | undefined {
 // Parser
 // ---------------------------------------------------------------------------
 
+/**
+ * A new entity decoder for an arXiv feed parser: this module's OAI parser and
+ * the live Atom parser in `ArxivService` each take one, so the two decode alike
+ * (issue #88). It resolves the five XML named references and every numeric one,
+ * decimal or hex, in the parser's single pass. OAI sends each `'` and `"` of
+ * arXiv's text as `&#39;` and `&#34;`, while a reference arXiv's own text holds
+ * arrives with its `&` escaped (`&amp;#8722;`) and so stays as written. Never
+ * decode a parsed value again: a second pass turns that literal `&#8722;` into
+ * `−`.
+ *
+ * Entities a document declares are left as written: neither feed declares any,
+ * and a decoder passed to the parser stands in for the one that would screen
+ * them. The decoder's expansion limits stay unset: every reference it resolves
+ * becomes text shorter than the reference, so no document grows under it, and
+ * the decode is one linear scan.
+ */
+export function newArxivEntityDecoder(): EntityDecoder {
+  return new EntityDecoder({ numericAllowed: true, onInputEntity: () => ENTITY_ACTION.BLOCK });
+}
+
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
   parseTagValue: false,
   trimValues: true,
+  entityDecoder: newArxivEntityDecoder(),
   isArray: (_name, jpath) =>
     typeof jpath === 'string' &&
     ['OAI-PMH.ListRecords.record', 'OAI-PMH.ListRecords.record.metadata.arXivRaw.version'].includes(

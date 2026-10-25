@@ -1,11 +1,11 @@
 /**
  * @fileoverview Tests for the mirror harvest runner — where a run starts
  * (saved resumption token vs. `from=last_datestamp`), what it persists as it
- * goes, the write-path index it ensures before the first page (#50), the
+ * goes, the write-path index its lookups by paper_id use (#50, #85), the
  * deadline that stops it after a whole page (#39), which writes keep the token
  * for a later run (#62), the stalled token recovery that fails a run (#59), the
  * outage wait only `init` runs (#61), the run on a file another writer is
- * migrating (#71), `mirror:verify` on a file missing a v4 index or trigger,
+ * migrating (#71), `mirror:verify` on a file missing an index or trigger,
  * and the mirror scripts run from an installed package (#75).
  * Drives the real `MirrorStore` on a temp file; only `fetch` (the OAI endpoint)
  * is stubbed, except in the real-process blocks, which run the mirror scripts
@@ -339,57 +339,33 @@ describe('runHarvest', () => {
   // -------------------------------------------------------------------------
 
   describe('write-path index on paper_categories(paper_id)', () => {
-    it('is absent from a file MirrorStore.open created and full-scans per write', async () => {
+    it('serves every lookup by paper_id in a file MirrorStore.open created (#85)', async () => {
       const store = await MirrorStore.open(config.mirrorPath);
       expect(store.schemaVersion().current).toBe(MIRROR_SCHEMA_VERSION);
       store.close();
 
-      for (const plan of writePathPlans(config.mirrorPath)) {
-        expect(plan).toMatch(/^SCAN paper_categories/);
-      }
+      for (const plan of writePathPlans(config.mirrorPath)) expect(plan).toMatch(INDEXED_LOOKUP);
     });
 
-    it('is built before the first page of a fresh init', async () => {
-      // The first fetch fails, so only work done before the first page can
-      // have built the index.
+    it('is the schema’s, so a run changes no schema object before its first page (#85)', async () => {
+      (await MirrorStore.open(config.mirrorPath)).close();
+      // SQLite's schema cookie, which every CREATE or DROP advances.
+      const cookie = () => {
+        const db = new Database(config.mirrorPath, { readonly: true });
+        const { schema_version } = db.query('PRAGMA schema_version').get() as {
+          schema_version: number;
+        };
+        db.close();
+        return schema_version;
+      };
+      const before = cookie();
+      // The first fetch fails, so everything the run did came before its first page.
       serve({ body: 'Bad request', status: 400 });
 
       await expect(runHarvest(makeCtx(), { mode: 'init' })).rejects.toThrow(/HTTP 400/);
 
+      expect(cookie()).toBe(before);
       for (const plan of writePathPlans(config.mirrorPath)) expect(plan).toMatch(INDEXED_LOOKUP);
-    });
-
-    it('is added to a populated current-schema file by the next refresh', async () => {
-      const store = await MirrorStore.open(config.mirrorPath);
-      store.applyBatch(
-        [
-          {
-            paper_id: '2606.00001',
-            identifier: 'oai:arXiv.org:2606.00001',
-            datestamp: '2026-06-01',
-            title: 'Existing paper',
-            authors: 'A. Author',
-            abstract: 'Already harvested.',
-            categories: 'cs.LG',
-            versions: [{ version: 'v1', date: '2026-06-01T00:00:00Z' }],
-          },
-        ],
-        [],
-      );
-      store.writeHarvestState({
-        status: 'complete',
-        last_datestamp: '2026-06-01',
-        completed_at: 'c',
-      });
-      store.close();
-      serve(listRecords([]));
-
-      await runHarvest(makeCtx(), { mode: 'refresh' });
-
-      for (const plan of writePathPlans(config.mirrorPath)) expect(plan).toMatch(INDEXED_LOOKUP);
-      expect((await openStore(config.mirrorPath)).schemaVersion().current).toBe(
-        MIRROR_SCHEMA_VERSION,
-      );
     });
   });
 
@@ -1173,7 +1149,7 @@ describe('runHarvest', () => {
   });
 
   // -------------------------------------------------------------------------
-  // mirror:verify against the schema's v4 indexes and trigger (#78)
+  // mirror:verify against the schema's indexes and trigger (#78, #85)
   // -------------------------------------------------------------------------
 
   describe('mirror:verify script (real process)', () => {
@@ -1217,7 +1193,7 @@ describe('runHarvest', () => {
       return row?.sql ?? null;
     }
 
-    it('passes a current file, listing each v4 index and the fill trigger as ok', async () => {
+    it('passes a current file, listing each index and the fill trigger as ok', async () => {
       await currentFileAfter();
 
       const { code, stderr, stdout } = await runVerify();
@@ -1229,6 +1205,7 @@ describe('runHarvest', () => {
         'index papers_published_idx',
         'index papers_updated_idx',
         'index papers_revised_early_idx',
+        'index paper_categories_paper_id_idx',
         'trigger paper_categories_published_fill',
       ]) {
         expect(stdout).toContain(`  ${object}: ok\n`);
@@ -1255,8 +1232,8 @@ describe('runHarvest', () => {
           'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated)',
         ],
         name: 'paper_categories_cat_updated_idx',
-        listed: 'index paper_categories_cat_updated_idx: differs from schema v4',
-        failure: 'index paper_categories_cat_updated_idx differs from schema v4',
+        listed: 'index paper_categories_cat_updated_idx: differs from schema v5',
+        failure: 'index paper_categories_cat_updated_idx differs from schema v5',
         restore: [
           'DROP INDEX IF EXISTS paper_categories_cat_updated_idx;',
           'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated, paper_id, published);',
@@ -1269,11 +1246,25 @@ describe('runHarvest', () => {
           'CREATE INDEX papers_revised_early_idx ON papers(published, updated)',
         ],
         name: 'papers_revised_early_idx',
-        listed: 'index papers_revised_early_idx: differs from schema v4',
-        failure: 'index papers_revised_early_idx differs from schema v4',
+        listed: 'index papers_revised_early_idx: differs from schema v5',
+        failure: 'index papers_revised_early_idx differs from schema v5',
         restore: [
           'DROP INDEX IF EXISTS papers_revised_early_idx;',
           'CREATE INDEX papers_revised_early_idx ON papers(published, updated) WHERE updated < published;',
+        ],
+      },
+      {
+        label: 'the paper_id index as the harvest runner built it before v5',
+        damage: [
+          'DROP INDEX paper_categories_paper_id_idx',
+          'CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id)',
+        ],
+        name: 'paper_categories_paper_id_idx',
+        listed: 'index paper_categories_paper_id_idx: differs from schema v5',
+        failure: 'index paper_categories_paper_id_idx differs from schema v5',
+        restore: [
+          'DROP INDEX IF EXISTS paper_categories_paper_id_idx;',
+          'CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id, category);',
         ],
       },
       {

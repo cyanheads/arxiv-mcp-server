@@ -1,5 +1,6 @@
 /**
- * @fileoverview Tests for the OAI-PMH parser, tombstone handling, and
+ * @fileoverview Tests for the OAI-PMH parser, its character-reference decoding
+ * and the live Atom parser's matching decode (#88), tombstone handling, and
  * `harvestPages`' failed-fetch path: recovery from a rejected resumption token
  * and its progress guard (#50, #59), and the init-only wait through an
  * upstream outage (#61), and an error response whose body stalls or drops
@@ -12,12 +13,16 @@
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetServerConfig } from '@/config/server-config.js';
+import { ArxivService } from '@/services/arxiv/arxiv-service.js';
 import {
   type HarvesterOptions,
   harvestPages,
   parseListRecords,
 } from '@/services/arxiv/mirror/harvester.js';
+import { rawToRow } from '@/services/arxiv/mirror/store.js';
 
 // A test that reaches `fetch` without stubbing it fails instead of going out.
 beforeEach(() => {
@@ -150,6 +155,117 @@ describe('parseListRecords', () => {
       expect(err).toBeInstanceOf(McpError);
       expect((err as McpError).data?.code).toBe('badResumptionToken');
       expect((err as McpError).data?.reason).toBe('token_rejected');
+    }
+  });
+});
+
+describe('parseListRecords — character references (#88)', () => {
+  /** A one-record page whose `arXivRaw` holds `fields`, each value written into the XML as is. */
+  const pageWith = (fields: Record<string, string>, doctype = '') =>
+    `<?xml version="1.0" encoding="UTF-8"?>${doctype}
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>oai:arXiv.org:adap-org/9905005</identifier>
+        <datestamp>2024-01-22</datestamp>
+      </header>
+      <metadata>
+        <arXivRaw>
+          <id>adap-org/9905005</id>
+          ${Object.entries(fields)
+            .map(([tag, value]) => `<${tag}>${value}</${tag}>`)
+            .join('\n          ')}
+          <categories>adap-org</categories>
+          <version version="v1"><date>Mon, 10 May 1999 12:00:00 GMT</date></version>
+        </arXivRaw>
+      </metadata>
+    </record>
+  </ListRecords>
+</OAI-PMH>`;
+
+  const titleOf = (raw: string, doctype?: string) =>
+    parseListRecords(pageWith({ title: `a${raw}b` }, doctype)).records[0]?.title;
+
+  // OAI encodes every quote of arXiv's text as a numeric reference; arXiv's own
+  // literal references arrive with their `&` escaped, as `&amp;#NNN;`.
+  it.each([
+    ['decimal apostrophe', '&#39;', "a'b"],
+    ['decimal quotation mark', '&#34;', 'a"b'],
+    ['hex, lowercase x', '&#x27;', "a'b"],
+    ['hex, uppercase X', '&#X22;', 'a"b'],
+    ['decimal outside ASCII', '&#8722;', 'a−b'],
+    ['hex astral', '&#x1D49C;', 'a\u{1D49C}b'],
+    ['decimal astral', '&#119964;', 'a\u{1D49C}b'],
+    ['a decimal reference in the source text', '&amp;#39;', 'a&#39;b'],
+    ['a non-ASCII reference in the source text', '&amp;#8722;', 'a&#8722;b'],
+    ['a named reference in the source text', '&amp;amp;', 'a&amp;b'],
+    ['the five XML named references', '&lt;&gt;&amp;&quot;&apos;', 'a<>&"\'b'],
+    ['a TeX accent beside a quote reference', 'J\\&#39;anos', "aJ\\'anosb"],
+  ])('decodes %s in one pass: %s', (_form, raw, expected) => {
+    expect(titleOf(raw)).toBe(expected);
+  });
+
+  it('decodes the references in every field the mirror stores', () => {
+    const [record] = parseListRecords(
+      pageWith({
+        title: 'Agents&#39; interactions',
+        authors: 'J. O&#39;Neil',
+        abstract: 'A &#34;quoted&#34; claim',
+        comments: 'ICGA&#39;97',
+        'journal-ref': 'Proc. &#34;X&#34;',
+        doi: '10.1/a&#34;b',
+      }),
+    ).records;
+    expect(record && rawToRow(record)).toMatchObject({
+      title: "Agents' interactions",
+      authors: "J. O'Neil",
+      abstract: 'A "quoted" claim',
+      comment: "ICGA'97",
+      journal_ref: 'Proc. "X"',
+      doi: '10.1/a"b',
+    });
+  });
+
+  it('leaves a reference to an entity the document declares as written', () => {
+    expect(titleOf('&e;', '<!DOCTYPE OAI-PMH [<!ENTITY e "declared">]>')).toBe('a&e;b');
+  });
+
+  it('decodes a reference on the live Atom path as the OAI parse does', async () => {
+    vi.stubEnv('ARXIV_MIRROR_ENABLED', 'false');
+    vi.stubEnv('ARXIV_REQUEST_DELAY_MS', '0');
+    resetServerConfig();
+    const raw = 'Agents&#39; &#x22;X&#x22; &amp;#8722; &amp;amp;';
+    const fetchAtom = vi.fn(
+      async () =>
+        new Response(
+          `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/adap-org/9905005v1</id>
+    <title>${raw}</title>
+    <summary>s</summary>
+    <author><name>A</name></author>
+    <category term="adap-org" />
+    <published>1999-05-10T12:00:00Z</published>
+    <updated>1999-05-10T12:00:00Z</updated>
+  </entry>
+</feed>`,
+          { status: 200, headers: { 'content-type': 'application/atom+xml' } },
+        ),
+    );
+    vi.stubGlobal('fetch', fetchAtom);
+    try {
+      const { papers } = await new ArxivService().getPapers(
+        ['adap-org/9905005'],
+        createMockContext(),
+      );
+      expect(fetchAtom).toHaveBeenCalledOnce();
+      expect(papers.map((p) => p.title)).toEqual(['Agents\' "X" &#8722; &amp;']);
+      expect(papers[0]?.title).toBe(parseListRecords(pageWith({ title: raw })).records[0]?.title);
+    } finally {
+      vi.unstubAllEnvs();
+      resetServerConfig();
     }
   });
 });

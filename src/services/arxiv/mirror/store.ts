@@ -16,6 +16,12 @@
  *   - `paper_categories.published` and the date-order indexes that bound every
  *     search without a free-text term (see {@link MirrorStore.search}).
  *
+ * Schema v5 (issues #88, #85):
+ *   - The quote references a pre-v5 harvester stored undecoded are repaired in
+ *     the text columns.
+ *   - `paper_categories(paper_id, category)` joins the schema, so a term-less
+ *     search probes each other group with one seek per candidate.
+ *
  * Writers own the file (issue #55). `MirrorStore.open` is the writers' open
  * (`runHarvest`, `mirror:verify`): it creates the file, applies the schema, and
  * runs the in-place migrations an existing DB still needs, in order, before
@@ -44,11 +50,12 @@ import {
   MIRROR_FTS_STATEMENTS,
   MIRROR_JUNCTION_PUBLISHED_SQL,
   MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL,
+  MIRROR_PAPER_ID_INDEX,
   MIRROR_PRAGMA_STATEMENTS,
   MIRROR_SCHEMA_STATEMENTS,
   MIRROR_SCHEMA_VERSION,
   MIRROR_V4_STATEMENTS,
-  MIRROR_WRITE_INDEX_SQL,
+  MIRROR_V5_STATEMENTS,
 } from './schema.js';
 import type { ArxivRawRecord, HarvestState, PaperRow } from './types.js';
 
@@ -62,11 +69,12 @@ export const MIRROR_SEARCH_MATCH_CAP = 50_000;
 
 /**
  * Most junction rows a term-less search over two or more category groups
- * counts per group to break a tie at the match cap between groups with as many
- * codes (issue #78): enough to tell apart all but the largest single codes, at
- * about 8 ms per group on a full-size mirror.
+ * counts per group to break a tie between groups that each reach the match cap
+ * (issues #78, #85): past every single code of a full-size mirror (`cs.LG`,
+ * the largest, holds 295,038), so the fewer rows drive whichever operand comes
+ * first. Groups past it all are told apart by their code count.
  */
-const DRIVER_ROWS_COUNTED = 4 * MIRROR_SEARCH_MATCH_CAP;
+const DRIVER_ROWS_COUNTED = 6 * MIRROR_SEARCH_MATCH_CAP;
 
 /** A page of matches and their count, as {@link MirrorStore.search} answers. */
 export interface MirrorSearchPage {
@@ -98,23 +106,28 @@ const PAPER_COLUMNS = `papers.id, papers.version, papers.title, papers.authors,
 const placeholders = (values: readonly unknown[]) => values.map(() => '?').join(', ');
 
 /**
- * Whether the paper `paperId` names carries a code from `group`: one lookup
- * per code on the junction's primary key, so the group's list is never read.
- * A term-less search probes its candidates with it; a term's matches are tested
- * by {@link listsCodeFrom} instead. Binds the group's codes, in order.
+ * Whether the paper `paperId` names carries a code from `group`, at one
+ * covering seek whatever the group's size, so the group's list is never read
+ * (issue #85): a lone code's primary-key entry, else the paper's few entries in
+ * `paper_categories_paper_id_idx` (paper_id, category), tested against the
+ * group. The `+` keeps the list off the index; without it SQLite expands the
+ * `IN` into one primary-key seek per code, 41 for `cat:cs`. A term-less search
+ * probes its candidates with it; a term's matches are tested by
+ * {@link listsCodeFrom} instead. Binds the group's codes, in order.
  */
 function carriesCodeFrom(group: readonly string[], paperId: string): string {
-  return `EXISTS (SELECT 1 FROM paper_categories pc
-    WHERE pc.category IN (${placeholders(group)}) AND pc.paper_id = ${paperId})`;
+  return group.length === 1
+    ? `EXISTS (SELECT 1 FROM paper_categories pc WHERE pc.category = ? AND pc.paper_id = ${paperId})`
+    : `EXISTS (SELECT 1 FROM paper_categories pc INDEXED BY paper_categories_paper_id_idx
+        WHERE pc.paper_id = ${paperId} AND +pc.category IN (${placeholders(group)}))`;
 }
 
 /**
  * Whether the `papers` row lists a code from `group` as a whole token of its
  * space-separated `categories`, the list `applyBatch` writes the paper's
  * junction rows from, so the answer is the junction's. The test reads nothing
- * beyond the row the term path already reads for each match; a junction probe
- * would cost a lookup per code per match (41 for `cat:cs`), slower near the
- * match cap than reading the group's whole list (issue #84). A code holding a
+ * beyond the row the term path already reads for each match, where a junction
+ * probe would add a seek per match, and before v5 one per code (issue #84). A code holding a
  * space is no token and matches nothing, as in the junction; a quoted `cat:`
  * operand can carry one.
  */
@@ -173,7 +186,7 @@ function updateOpening(
   };
 }
 
-/** An index or trigger schema v4 defines, as a file holds it ({@link MirrorStore.checkSchemaObjects}). */
+/** An index or trigger the schema defines, as a file holds it ({@link MirrorStore.checkSchemaObjects}). */
 export interface SchemaObjectCheck {
   name: string;
   /** The statements that rebuild it as the schema module defines it, in order. */
@@ -192,9 +205,13 @@ function createdName(create: string): string {
 
 const FILL_TRIGGER = createdName(MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL);
 
-/** The indexes and the trigger schema v4 defines, each with the statements that rebuild it. */
-const V4_SCHEMA_OBJECTS: readonly (Omit<SchemaObjectCheck, 'status'> & { create: string })[] = [
-  ...MIRROR_DATE_INDEXES.map(([drop, create]) => ({
+/**
+ * The indexes and the trigger v4 and v5 define, each with the statements that
+ * rebuild it: everything a migration redefines, which `IF NOT EXISTS` would
+ * never repair.
+ */
+const SCHEMA_OBJECTS: readonly (Omit<SchemaObjectCheck, 'status'> & { create: string })[] = [
+  ...[...MIRROR_DATE_INDEXES, MIRROR_PAPER_ID_INDEX].map(([drop, create]) => ({
     type: 'index' as const,
     name: createdName(create),
     create,
@@ -373,7 +390,8 @@ export class MirrorStore {
   /**
    * The writers' open (`runHarvest`, `mirror:verify`): open or create the store
    * at `path`, apply the schema, and run each migration the file still needs
-   * (v1→v2, v2→v3, v3→v4) before returning. A failed open closes its connection.
+   * (v1→v2, v2→v3, v3→v4, v4→v5) before returning. A failed open closes its
+   * connection.
    *
    * One writer migrates a file (issue #71). The schema is applied in one write
    * transaction that also re-reads the version under the lock: a file this
@@ -503,18 +521,6 @@ export class MirrorStore {
   // -------------------------------------------------------------------------
   // Paper writes
   // -------------------------------------------------------------------------
-
-  /**
-   * Ensure the write-path index on `paper_categories(paper_id)` exists (issue
-   * #50). A no-op when it already does; the first call on a full-corpus mirror
-   * builds it in one pass over the junction. Called by the harvest runner, never
-   * by {@link MirrorStore.open} — see `MIRROR_WRITE_INDEX_SQL`. Another writer's
-   * lock is waited out up to the writer busy timeout, then fails with
-   * `SQLITE_BUSY` (issue #64).
-   */
-  ensureWriteIndex(): void {
-    this.db.exec([MIRROR_WRITE_INDEX_SQL]);
-  }
 
   /**
    * Batch upsert records inside a single transaction. Tombstones are deleted
@@ -758,7 +764,7 @@ export class MirrorStore {
    * A term-less search filtered by category groups (issue #78). Every statement
    * reads `paper_categories` indexes only, `papers` rows for the page alone.
    * The group with the fewest junction rows drives; each other group is tested
-   * per candidate on the junction's primary key.
+   * per candidate with one covering seek ({@link carriesCodeFrom}, issue #85).
    */
   private searchGroups(
     groups: readonly (readonly string[])[],
@@ -791,8 +797,9 @@ export class MirrorStore {
       return { papers, total, totalIsLowerBound: false };
     }
 
-    const [driver = [], ...others] =
-      groups.length > 1 ? this.fewestJunctionRowsFirst(groups, window) : groups;
+    const ordered = groups.length > 1 ? this.fewestJunctionRowsFirst(groups, window) : groups;
+    if (ordered === undefined) return { papers: [], total: 0, totalIsLowerBound: false };
+    const [driver = [], ...others] = ordered;
     const probes = others.map((group) => ` AND ${carriesCodeFrom(group, 'd.paper_id')}`).join('');
     const filterParams = [...window.params, ...others.flat()];
     const filter = `${window.sql}${probes}`;
@@ -815,9 +822,15 @@ export class MirrorStore {
     let pageSql: string;
     let pageParams: unknown[];
     if (total < MIRROR_SEARCH_MATCH_CAP) {
-      // Sort the entries the count read: fewer than the cap.
+      // Sort the entries the count read: fewer than the cap. With no window to
+      // range on, an update order reads them from the index that holds
+      // `updated`, so no entry costs a read of its junction row (issue #85).
+      const index =
+        key === 'updated' && window.params.length === 0
+          ? 'paper_categories_cat_updated_idx'
+          : 'paper_categories_cat_published_idx';
       pageSql = `SELECT ${distinct}d.${key} AS k, d.paper_id FROM paper_categories d
-                 INDEXED BY paper_categories_cat_published_idx
+                 INDEXED BY ${index}
                  WHERE d.category IN (${placeholders(driver)})${filter}
                  ORDER BY 1 ${dir}, 2 ${dir} LIMIT ? OFFSET ?`;
       pageParams = [...driver, ...filterParams, limit, offset];
@@ -899,43 +912,59 @@ export class MirrorStore {
 
   /**
    * `groups` reordered so the one holding the fewest junction rows in the
-   * window, counted up to the cap, comes first; the rest keep their order.
-   * Among groups that reach the cap, the one with the most codes comes first,
-   * so each candidate costs the fewest primary-key probes into the others: a
-   * small group beside a whole archive would probe every archive code for each
-   * of its rows. Groups that reach the cap with as many codes as each other
-   * are counted on, up to {@link DRIVER_ROWS_COUNTED}, and the fewest rows
-   * drives (for `cs.LG` beside `cs.AI`, half the probes).
+   * window comes first, the rest keeping their order, or `undefined` when a
+   * group holds none, so no paper matches (issue #85). Each group is tested
+   * for a row before any is counted, so an empty one ends the search there.
+   *
+   * Every other group costs one seek per candidate ({@link carriesCodeFrom}),
+   * so the driver's row count alone sets the probes, whatever any group's code
+   * count. Fewest codes first, each group is counted up to the cap or the
+   * fewest rows found so far, whichever is lower, and one that comes in under
+   * them drives; no count reads past the cap. When every group reaches it,
+   * each is counted on, up to the fewest found so far and at most
+   * {@link DRIVER_ROWS_COUNTED}, and the fewest drive again, ties going to the
+   * fewer codes: beside `cat:cs`, `stat`'s 186,680 rows drive rather than
+   * `cs`'s 1.58 million, and `cs.AI` drives beside `cs.LG` in either order.
    */
   private fewestJunctionRowsFirst(
     groups: readonly (readonly string[])[],
     window: { params: string[]; sql: string },
-  ): (readonly string[])[] {
+  ): (readonly string[])[] | undefined {
+    const rowsIn = (group: readonly string[]) =>
+      `FROM paper_categories d INDEXED BY paper_categories_cat_published_idx
+       WHERE d.category IN (${placeholders(group)})${window.sql}`;
+    const holdsRow = (group: readonly string[]) =>
+      this.db
+        .prepare<{ found: number }>(`SELECT EXISTS (SELECT 1 ${rowsIn(group)}) AS found`)
+        .get(...group, ...window.params)?.found === 1;
+    if (!groups.every(holdsRow)) return;
     const rows = (group: readonly string[], limit: number) =>
       this.db
-        .prepare<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM (SELECT 1 FROM paper_categories d
-           INDEXED BY paper_categories_cat_published_idx
-           WHERE d.category IN (${placeholders(group)})${window.sql} LIMIT ?)`,
-        )
+        .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 ${rowsIn(group)} LIMIT ?)`)
         .get(...group, ...window.params, limit)?.n ?? 0;
-    const sizes = groups.map((group) => rows(group, MIRROR_SEARCH_MATCH_CAP));
-    let first = 0;
-    for (const [i, group] of groups.entries()) {
-      const size = sizes[i] ?? 0;
-      const best = sizes[first] ?? 0;
-      if (size < best || (size === best && group.length > (groups[first]?.length ?? 0))) first = i;
+
+    // A stable sort: groups with as many codes keep their order.
+    const visit = [...groups.keys()].sort(
+      (a, b) => (groups[a]?.length ?? 0) - (groups[b]?.length ?? 0),
+    );
+    let first = visit[0] ?? 0;
+    let fewest = MIRROR_SEARCH_MATCH_CAP;
+    for (const i of visit) {
+      const n = rows(groups[i] ?? [], fewest);
+      if (n < fewest) {
+        fewest = n;
+        first = i;
+      }
     }
-    const codes = groups[first]?.length;
-    const level =
-      sizes[first] === MIRROR_SEARCH_MATCH_CAP
-        ? [...groups.keys()].filter(
-            (i) => sizes[i] === MIRROR_SEARCH_MATCH_CAP && groups[i]?.length === codes,
-          )
-        : [];
-    if (level.length > 1) {
-      const deeper = level.map((i) => rows(groups[i] ?? [], DRIVER_ROWS_COUNTED));
-      first = level[deeper.indexOf(Math.min(...deeper))] ?? first;
+    if (fewest === MIRROR_SEARCH_MATCH_CAP) {
+      let deepest = DRIVER_ROWS_COUNTED;
+      for (const i of visit) {
+        const n = rows(groups[i] ?? [], deepest);
+        if (n < deepest) {
+          deepest = n;
+          first = i;
+        }
+      }
     }
     return [groups[first] ?? [], ...groups.filter((_, i) => i !== first)];
   }
@@ -968,19 +997,20 @@ export class MirrorStore {
   }
 
   /**
-   * Each index and trigger schema v4 defines, as this file holds it against the
-   * schema module's definition. A file can record v4 and still lack one an
-   * operator or another build dropped or redefined — a search naming a missing
-   * index fails with a driver error and goes live — and no open recreates it:
-   * the module runs these definitions only when it creates a file and as the v3
-   * migration. Text is compared with `IF NOT EXISTS`, which SQLite does not
-   * store, removed and whitespace collapsed.
+   * Each index and trigger v4 and v5 define, as this file holds it against the
+   * schema module's definition. A file can record its version and still lack
+   * one an operator or another build dropped or redefined — a search naming a
+   * missing index fails with a driver error and goes live — and no open
+   * recreates it: the module runs these definitions only when it creates a file
+   * and as the migration that introduced each. Text is compared with
+   * `IF NOT EXISTS`, which SQLite does not store, removed and whitespace
+   * collapsed.
    */
   checkSchemaObjects(): SchemaObjectCheck[] {
     const stored = this.db.prepare<{ sql: string | null }>(
       `SELECT sql FROM sqlite_master WHERE type = ? AND name = ?`,
     );
-    return V4_SCHEMA_OBJECTS.map(({ type, name, create, restore }) => {
+    return SCHEMA_OBJECTS.map(({ type, name, create, restore }) => {
       const sql = stored.get(type, name)?.sql;
       const status =
         sql == null ? 'missing' : comparableSql(sql) === comparableSql(create) ? 'ok' : 'differs';
@@ -1197,6 +1227,7 @@ function applySchema(db: SqliteHandle, path: string): ClaimedMigration | undefin
       db.exec(MIRROR_SCHEMA_STATEMENTS);
       if (created) {
         db.exec(MIRROR_V4_STATEMENTS);
+        db.exec(MIRROR_V5_STATEMENTS);
         writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
       }
       const from = readSchemaVersion(db) ?? 0;
@@ -1263,7 +1294,11 @@ function migrate(db: SqliteHandle, path: string, { from, lease }: ClaimedMigrati
       migrateToV3(db, fenced);
       fenced(() => writeSchemaVersion(db, 3));
     }
-    if (from < 4) migrateToV4(db, fenced);
+    if (from < 4) {
+      migrateToV4(db, fenced);
+      fenced(() => writeSchemaVersion(db, 4));
+    }
+    if (from < 5) migrateToV5(db, fenced);
     db.transaction(() => {
       assertHeld();
       writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
@@ -1480,6 +1515,97 @@ function migrateToV4(db: SqliteHandle, inTransaction: InTransaction, batchSize =
   for (const [drop, create] of MIRROR_DATE_INDEXES) {
     inTransaction(() => db.exec([drop, create]));
     process.stdout.write(`mirror migration v3→v4 (index): ${create}\n`);
+  }
+}
+
+/**
+ * Migrate a v4 mirror DB to v5 in place: its parts in order, each one
+ * idempotent and run through `inTransaction` (the lease-fenced transaction of
+ * {@link migrate}) on its own. The caller writes schema_version 5 once every
+ * part has returned, so an interrupted run repeats them all on the next open,
+ * each skipping the work it already committed.
+ */
+function migrateToV5(db: SqliteHandle, inTransaction: InTransaction): void {
+  repairQuoteReferences(db, inTransaction);
+  definePaperIdIndex(db, inTransaction);
+}
+
+/**
+ * v5, second part (issue #85): end `paper_categories_paper_id_idx` at
+ * {@link MIRROR_PAPER_ID_INDEX}'s `(paper_id, category)`, from the `(paper_id)`
+ * the harvest runner built in a harvested file or from none in one the store
+ * created, so a migrated file and a new one define it alike. The drop and the
+ * create run in one transaction, which reuses the dropped index's pages; one
+ * that finds the definition already in place, as a repeat after an
+ * interruption does, changes nothing. The repair touches only `papers`, so the
+ * order of the two parts is free. On a full-size mirror the transaction runs
+ * 13–24 s and writes a WAL of about 160 MB.
+ */
+function definePaperIdIndex(db: SqliteHandle, inTransaction: InTransaction): void {
+  const [drop, create] = MIRROR_PAPER_ID_INDEX;
+  const built = inTransaction(() => {
+    const stored = db
+      .prepare<{ sql: string | null }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
+      )
+      .get(createdName(create))?.sql;
+    if (stored != null && comparableSql(stored) === comparableSql(create)) return false;
+    db.exec([drop, create]);
+    return true;
+  });
+  if (built) process.stdout.write(`mirror migration v4→v5 (index): ${create}\n`);
+}
+
+/** The `papers` columns that hold arXiv's text, as the harvester stores them. */
+const TEXT_COLUMNS = ['title', 'authors', 'abstract', 'comment', 'journal_ref', 'doi'] as const;
+
+/**
+ * v5, first part (issue #88): decode the `&#39;` and `&#34;` a harvester stored
+ * before it resolved numeric references, in each of {@link TEXT_COLUMNS}. OAI
+ * writes every `'` and `"` of arXiv's text as one of the two and no other
+ * character as a numeric reference, so any other reference a row holds is
+ * arXiv's own text (OAI sends it with its `&` escaped) and stays. The repaired
+ * row is what the harvester now stores for the same record.
+ *
+ * Batched by rowid window, each window one transaction. The update touches only
+ * the rows that hold one of the two, so every other row stays byte for byte,
+ * and a repeat after an interruption writes no row it already repaired: a
+ * replacement never forms another reference. `papers_au` keeps `papers_fts` in
+ * step with each row it rewrites. On a full-size mirror a window commits in
+ * under 3 s.
+ */
+function repairQuoteReferences(
+  db: SqliteHandle,
+  inTransaction: InTransaction,
+  batchSize = 5_000,
+): void {
+  const holdsOne = TEXT_COLUMNS.map(
+    (c) => `instr(${c}, '&#39;') > 0 OR instr(${c}, '&#34;') > 0`,
+  ).join(' OR ');
+  const repair = db.prepare(
+    `UPDATE papers
+     SET ${TEXT_COLUMNS.map((c) => `${c} = replace(replace(${c}, '&#39;', ''''), '&#34;', '"')`).join(', ')}
+     WHERE rowid > ? AND rowid <= ? AND (${holdsOne})`,
+  );
+  const select = db.prepare<{ rowid: number }>(
+    `SELECT rowid FROM papers WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+  );
+  const total = db.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM papers`).get()?.n ?? 0;
+  let lastRowid = 0;
+  let processed = 0;
+  let repaired = 0;
+  while (total > 0) {
+    const rows = select.all(lastRowid, batchSize);
+    if (rows.length === 0) break;
+    const upperRowid = rows[rows.length - 1]?.rowid ?? lastRowid;
+    const lowerRowid = lastRowid;
+    repaired += inTransaction(() => repair.run(lowerRowid, upperRowid).changes);
+    processed += rows.length;
+    lastRowid = upperRowid;
+    process.stdout.write(
+      `mirror migration v4→v5 (quote references): ${processed}/${total} rows, ${repaired} repaired\n`,
+    );
+    if (rows.length < batchSize) break;
   }
 }
 

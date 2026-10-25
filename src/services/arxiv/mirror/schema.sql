@@ -1,12 +1,14 @@
--- arxiv-mcp-server OAI-PMH mirror schema v4 (issues #18 + #19 + #37 + #78)
+-- arxiv-mcp-server OAI-PMH mirror schema v5 (issues #18 + #19 + #37 + #78 + #88 + #85)
+-- v5's migration repairs the quote references a pre-v5 harvester stored
+-- undecoded in the papers text columns (repairQuoteReferences in store.ts),
+-- then defines the junction's paper_id index (the v5 block below).
 -- Review copy of schema.ts, which the writers' MirrorStore.open executes one
--- statement at a time (all but the write-path index at the end of the
--- paper_categories section): the PRAGMAs first, then everything after them in
--- one write transaction (issue #71). The v4 block in the paper_categories
--- section runs in that transaction only when it creates the file; on a v3 file
--- the same statements are the migration (migrateToV4 in store.ts), so the
--- block's DDL never runs up front against an older file. The server's
--- query-only connection runs none of it.
+-- statement at a time: the PRAGMAs first, then everything after them in one
+-- write transaction (issue #71). The v4 and v5 blocks in the paper_categories
+-- section run in that transaction only when it creates the file; on an older
+-- file the same statements are the migration (migrateToV4 and migrateToV5 in
+-- store.ts), so neither block's DDL runs up front against an older file. The
+-- server's query-only connection runs none of it.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -156,14 +158,18 @@ CREATE INDEX papers_updated_idx ON papers(updated, published);
 DROP INDEX IF EXISTS papers_revised_early_idx;
 CREATE INDEX papers_revised_early_idx ON papers(published, updated) WHERE updated < published;
 
--- Write-path index (issue #50): each record write deletes the paper's junction
--- rows by paper_id, and a tombstone's ON DELETE CASCADE looks them up the same
--- way. Built by the harvest runner before its first page
--- (MirrorStore.ensureWriteIndex), never by MirrorStore.open: only the harvest
--- looks junction rows up by paper_id, and over a full-corpus junction the build
--- takes seconds. Reads never filter by paper_id. Not part of the schema version.
-CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx
-  ON paper_categories(paper_id);
+-- ---------------------------------------------------------------------------
+-- v5 (issue #85): the junction's index by paper, a drop and a create run in one
+-- transaction. Each record write deletes the paper's junction rows by paper_id,
+-- and a tombstone's ON DELETE CASCADE looks them up the same way (issue #50); a
+-- search without a free-text term probes each candidate's entries here for a
+-- group of several codes, one seek in all, where the primary key would cost one
+-- per code. Before v5 the harvest runner built it as (paper_id) outside the
+-- schema version; the migration ends a file with that definition, or with none,
+-- at this one.
+-- ---------------------------------------------------------------------------
+DROP INDEX IF EXISTS paper_categories_paper_id_idx;
+CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id, category);
 
 -- ---------------------------------------------------------------------------
 -- harvest_state — single-row table tracking init/refresh progress.

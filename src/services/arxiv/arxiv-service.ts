@@ -37,6 +37,7 @@ import {
   submittedDateBounds,
   submittedDateClause,
 } from './date-window.js';
+import { newArxivEntityDecoder } from './mirror/harvester.js';
 import {
   expandCategoryOperands,
   isDriverError,
@@ -1044,6 +1045,8 @@ export class ArxivService {
       // of "0" is text, not a number to re-spell or drop. The mirror harvester
       // parses with the same setting. See issue #45.
       parseTagValue: false,
+      // References decode as the harvester's do, so a quote reads alike on both paths (#88).
+      entityDecoder: newArxivEntityDecoder(),
       isArray: (_name, jpath) =>
         typeof jpath === 'string' &&
         ['feed.entry', 'feed.entry.author', 'feed.entry.category', 'feed.entry.link'].includes(

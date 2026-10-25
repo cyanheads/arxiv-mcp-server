@@ -1,17 +1,18 @@
 /**
- * @fileoverview Verify the mirror SQLite file: its schema version, each index
- * and trigger schema v4 defines against the schema module's definition, then
- * PRAGMA integrity_check and quick_check. Exits non-zero on any failure so
- * cron / health-check jobs can surface it immediately. A missing or redefined
- * v4 index or trigger is reported with the statements that rebuild it; no
- * open rebuilds one, this script's included.
+ * @fileoverview Verify the mirror SQLite file: its schema version (opening it
+ * runs any migration it still needs, so this upgrades an older file first),
+ * each index and trigger the schema defines against the schema module's
+ * definition, then PRAGMA integrity_check and quick_check. Exits non-zero on
+ * any failure so cron / health-check jobs can surface it immediately. A missing
+ * or redefined index or trigger is reported with the statements that rebuild
+ * it; no open rebuilds one, this script's included.
  *
  * Usage:
  *   bun run mirror:verify
  *
  * Exit status:
- *   0   the file is on the current schema, holds every v4 index and trigger as
- *       the schema defines it, and passes both checks
+ *   0   the file is on the current schema, holds every index and trigger as the
+ *       schema defines it, and passes both checks
  *   1   a check or the schema migration failed
  *   75  another writer is migrating the mirror file's schema; nothing changed,
  *       verify again once it finishes (the message names its pid)
@@ -42,7 +43,7 @@ async function main(): Promise<void> {
     }
     const objects = store.checkSchemaObjects();
     const described = (o: (typeof objects)[number]) =>
-      o.status === 'differs' ? 'differs from schema v4' : o.status;
+      o.status === 'differs' ? `differs from schema v${schema.expected}` : o.status;
     console.log('Schema objects:');
     for (const o of objects) console.log(`  ${o.type} ${o.name}: ${described(o)}`);
     const broken = objects.filter((o) => o.status !== 'ok');

@@ -70,9 +70,6 @@ export type ProgressCallback = (info: {
  * checkpoint inside the harvester, once per checkpoint: a second rejection
  * before the checkpoint advances fails the run (issue #59).
  *
- * Before the first page it ensures the write-path index on
- * `paper_categories(paper_id)` (issue #50).
- *
  * Persists `harvest_state` after every page; `complete` (with `completed_at`)
  * is written only when the list drains. With `deadline`, the run stops after a
  * whole page once one worst-case page cycle no longer fits before it (issue
@@ -99,7 +96,6 @@ export async function runHarvest(
 ): Promise<HarvestResult> {
   const config = getServerConfig();
   const store = await openStore(config.mirrorPath);
-  store.ensureWriteIndex();
   const existing = store.readHarvestState();
 
   const harvestOptions: HarvesterOptions = {
