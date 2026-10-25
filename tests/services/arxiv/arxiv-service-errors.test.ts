@@ -1128,7 +1128,7 @@ describe('fake clock suites', () => {
             onAbort(signal, () =>
               reject(
                 new McpError(
-                  JsonRpcErrorCode.InternalError,
+                  JsonRpcErrorCode.ValidationError,
                   'Failed to extract text from PDF: Invalid PDF structure.',
                   { reason: 'pdf_text_extract_failed' },
                 ),

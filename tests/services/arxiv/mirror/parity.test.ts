@@ -15,6 +15,7 @@ import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-p
 import { initArxivService } from '@/services/arxiv/arxiv-service.js';
 import { MirrorStore, resetStore } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
+import { readCommonMarkText } from '../../../helpers/commonmark-text.js';
 
 const records: ArxivRawRecord[] = [
   {
@@ -300,7 +301,8 @@ describe('mirror and live search contract parity', () => {
         .filter((block) => block.type === 'text')
         .map((block) => block.text)
         .join('\n');
-      expect(text).toContain(expectedQuery);
+      // The query echo trailer is Markdown-encoded: read it back as a CommonMark parse does.
+      expect(readCommonMarkText(text)).toContain(expectedQuery);
       for (const paper of papers) {
         for (const value of [
           paper.id,

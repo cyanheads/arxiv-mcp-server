@@ -17,6 +17,7 @@ import { paperResource } from '@/mcp-server/resources/definitions/paper.resource
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
 import { initArxivService } from '@/services/arxiv/arxiv-service.js';
+import { readCommonMarkText } from '../helpers/commonmark-text.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: () => ({
@@ -307,8 +308,9 @@ describe('a malformed ID fails invalid_id before any upstream request (#41)', ()
         code: JsonRpcErrorCode.ValidationError,
         data: { reason: 'invalid_id' },
       });
-      expect(textOf(metadata)).toContain(input);
-      expect(textOf(metadata)).toContain('hep-th/9901001');
+      // An error's text is Markdown-encoded: read it back as a CommonMark parse does.
+      expect(readCommonMarkText(textOf(metadata))).toContain(input);
+      expect(readCommonMarkText(textOf(metadata))).toContain('hep-th/9901001');
 
       const read = await runToolContract(arxivReadPaper, { paper_id: input });
       expect(read.isError).toBe(true);
@@ -316,7 +318,7 @@ describe('a malformed ID fails invalid_id before any upstream request (#41)', ()
         code: JsonRpcErrorCode.ValidationError,
         data: { reason: 'invalid_id' },
       });
-      expect(textOf(read)).toContain(input);
+      expect(readCommonMarkText(textOf(read))).toContain(input);
 
       await expect(readResource(encodeURIComponent(input))).rejects.toMatchObject({
         code: JsonRpcErrorCode.ValidationError,

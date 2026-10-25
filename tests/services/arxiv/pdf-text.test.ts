@@ -241,8 +241,9 @@ describe('extractInWorker (#73)', () => {
       return { code, message, data, cause: { name: cause.name, message: cause.message } };
     };
     expect(shape(inWorker)).toEqual(shape(inThread));
+    // pdf.js names bytes it cannot read InvalidPDFException, which the parser raises as ValidationError.
     expect(inWorker).toMatchObject({
-      code: JsonRpcErrorCode.InternalError,
+      code: JsonRpcErrorCode.ValidationError,
       message: 'Failed to extract text from PDF: Invalid PDF structure.',
       data: { reason: 'pdf_text_extract_failed' },
     });
