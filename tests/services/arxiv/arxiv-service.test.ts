@@ -1647,6 +1647,36 @@ describe('ArxivService.getPapers', () => {
       doi: '-0.50',
     });
   });
+
+  // Issue #88: numeric references decode in the parse's one pass, as the mirror
+  // harvester's do, so a quote reads as the character while a reference
+  // arXiv's own text holds (sent with its `&` escaped) comes back as written.
+  it('decodes numeric references once, keeping a reference the source text holds', async () => {
+    mockFetch.mockResolvedValueOnce(
+      atomResponse(`<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00088v1</id>
+    <title>Agents&#39; &#x22;interactions&#34;</title>
+    <summary>x &amp;#8722; y &amp;amp; z &lt;Fe&gt; &amp;#39;</summary>
+    <author><name>O&#x27;Brien</name></author>
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-01-22T00:00:00Z</updated>
+  </entry>
+</feed>`),
+    );
+    const [paper] = (await getArxivService().search('all:quotes', {}, createMockContext())).papers;
+
+    expect(paper).toMatchObject({
+      title: 'Agents\' "interactions"',
+      abstract: 'x &#8722; y &amp; z <Fe> &#39;',
+      authors: ["O'Brien"],
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
