@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.7.2](changelog/1.7.x/1.7.2.md) — 2026-10-25
+
+content[] from arxiv_search_papers, arxiv_get_metadata, and arxiv_read_paper reads back through a CommonMark parse as structuredContent carries it. Mirror schema v5 repairs stored apostrophes and quotes, and searches over several category groups run faster.
+
 ## [1.7.1](changelog/1.7.x/1.7.1.md) — 2026-10-23
 
 arxiv_search_papers reads mirror queries with arXiv's grammar and sends forms the mirror cannot answer as arXiv does to the live API. Term-less mirror searches are index-driven under schema v4, with a lower-bound total. An unparseable PDF fails pdf_extraction_failed.
