@@ -1,0 +1,27 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "arxiv-mcp-server",
+  "version": "1.7.2",
+  "description": "Search arXiv, fetch paper metadata, and read full-text content via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/arxiv-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/arxiv-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "arxiv",
+    "academic-papers",
+    "research",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "cyanheads"
+  ]
+}
