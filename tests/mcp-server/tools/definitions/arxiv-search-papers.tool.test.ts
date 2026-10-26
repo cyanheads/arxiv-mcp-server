@@ -317,7 +317,8 @@ describe('arxivSearchPapers', () => {
 
   // formatPaper()'s encoding is tabled in security.test.ts, through this tool;
   // this pins the rest of the page: each paper set off by a rule, and the query
-  // echo reading back from content[] as structuredContent carries it.
+  // echo reading back from content[] as structuredContent carries it — a code
+  // span, so the copied query carries no backslash escapes.
   it('sets each paper off by a rule and reads back the query echo (#87)', async () => {
     const commented: PaperMetadata = {
       ...MOCK_PAPER,
@@ -359,7 +360,7 @@ describe('arxivSearchPapers', () => {
         ].join('\n\n'),
       );
       expect(readCommonMarkText(trailer ?? '', preset), preset).toBe(
-        `⟨strong⟩Query:⟨/strong⟩ ${query}\n⟨strong⟩Total Found:⟨/strong⟩ 2\n⟨strong⟩Page Start:⟨/strong⟩ 0`,
+        `⟨strong⟩Query:⟨/strong⟩ ⟨code_inline:${query}⟩\n⟨strong⟩Total Found:⟨/strong⟩ 2\n⟨strong⟩Page Start:⟨/strong⟩ 0`,
       );
     }
   });
