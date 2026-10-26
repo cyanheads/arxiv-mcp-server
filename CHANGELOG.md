@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.8.0](changelog/1.8.x/1.8.0.md) — 2026-10-26
+
+Publishes the arxiv-guide Agent Skill, served over MCP as skill://arxiv-guide/SKILL.md and shipped in the npm package, Docker image, and .mcpb, and adopts mcp-ts-core 0.13.18: the HTTP per-request memory leak fixed in 0.13.17, and a .mcpb that no longer carries source, a local database, or node-gyp build files.
+
 ## [1.7.2](changelog/1.7.x/1.7.2.md) — 2026-10-25
 
 content[] from arxiv_search_papers, arxiv_get_metadata, and arxiv_read_paper reads back through a CommonMark parse as structuredContent carries it. Mirror schema v5 repairs stored apostrophes and quotes, and searches over several category groups run faster.

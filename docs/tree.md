@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 10:23:23
+Generated on: 2026-10-26 07:48:00
 
 ```text
 arxiv-mcp-server/
@@ -31,6 +31,7 @@ arxiv-mcp-server/
 │   ├── 1.5.x/
 │   ├── 1.6.x/
 │   ├── 1.7.x/
+│   ├── 1.8.x/
 │   └── template.md
 ├── claude-plans/
 ├── dev-logs/
@@ -45,6 +46,8 @@ arxiv-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -148,6 +151,9 @@ arxiv-mcp-server/
 │   ├── split-changelog.ts
 │   ├── tree.ts
 │   └── tsconfig.json
+├── skills/
+│   └── arxiv-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -285,7 +291,9 @@ arxiv-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
