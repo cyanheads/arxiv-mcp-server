@@ -27,6 +27,7 @@ await createApp({
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: [],
+  skills: 'skills',
   landing: { requireAuth: false },
   // Every tool here is a read-only arXiv lookup — no tool calls ctx.requestInput,
   // and ctx.state is tenant-scoped storage rather than a session store. Stateless
