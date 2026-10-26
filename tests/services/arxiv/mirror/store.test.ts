@@ -1385,7 +1385,9 @@ describe('MirrorStore.search without a free-text term (#78)', () => {
     const opened = await MirrorStore.openReader(dbPath);
     if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
     store = opened.store;
-  }, 30_000);
+    // The reference scans are this block's slow part: run them once here, outside every timed test (#95).
+    for (const shape of SHAPES) reference(shape);
+  }, 60_000);
 
   afterAll(async () => {
     store.close();
