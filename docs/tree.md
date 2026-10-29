@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 07:48:00
+Generated on: 2026-10-26 15:19:14
 
 ```text
 arxiv-mcp-server/
@@ -37,7 +37,8 @@ arxiv-mcp-server/
 ├── dev-logs/
 ├── docs/
 │   ├── arxiv-mcp-server-research.md
-│   └── design.md
+│   ├── design.md
+│   └── mirror.md
 ├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
@@ -185,6 +186,7 @@ arxiv-mcp-server/
 │   │       │   ├── schema.sql
 │   │       │   ├── schema.ts
 │   │       │   ├── store.ts
+│   │       │   ├── tex2utf.ts
 │   │       │   └── types.ts
 │   │       ├── arxiv-service.ts
 │   │       ├── categories.ts
@@ -225,17 +227,21 @@ arxiv-mcp-server/
 │   │   ├── corpus.test.ts
 │   │   └── README.md
 │   ├── fixtures/
-│   │   └── arxiv-api/
-│   │       ├── 1706.03762+astro-ph_0703001.xml
-│   │       ├── 1706.03762+astro-ph_0703001v1.xml
-│   │       ├── 1706.03762+hep-th_9901001.xml
-│   │       ├── 1706.03762+hep-th_9901001v3.xml
-│   │       ├── 1706.03762v1.xml
-│   │       ├── 1706.03762v1+hep-th_9901001.xml
-│   │       ├── astro-ph_0703001+hep-th_9901001.xml
-│   │       ├── hep-th_9901001.xml
-│   │       ├── hep-th_9901001+math_0309136.xml
-│   │       └── http-500.xml
+│   │   ├── arxiv-api/
+│   │   │   ├── 1706.03762+astro-ph_0703001.xml
+│   │   │   ├── 1706.03762+astro-ph_0703001v1.xml
+│   │   │   ├── 1706.03762+hep-th_9901001.xml
+│   │   │   ├── 1706.03762+hep-th_9901001v3.xml
+│   │   │   ├── 1706.03762v1.xml
+│   │   │   ├── 1706.03762v1+hep-th_9901001.xml
+│   │   │   ├── astro-ph_0703001+hep-th_9901001.xml
+│   │   │   ├── hep-th_9901001.xml
+│   │   │   ├── hep-th_9901001+math_0309136.xml
+│   │   │   └── http-500.xml
+│   │   └── arxiv-metadata/
+│   │       ├── atom.xml.gz
+│   │       ├── meta.json
+│   │       └── oai-arxivraw.xml.gz
 │   ├── helpers/
 │   │   └── commonmark-text.ts
 │   ├── mcp-server/
@@ -265,7 +271,8 @@ arxiv-mcp-server/
 │           │   ├── reader.test.ts
 │           │   ├── refresh-subprocess.test.ts
 │           │   ├── runner.test.ts
-│           │   └── store.test.ts
+│           │   ├── store.test.ts
+│           │   └── tex2utf.test.ts
 │           ├── arxiv-service-errors.test.ts
 │           ├── arxiv-service-mirror.test.ts
 │           ├── arxiv-service.test.ts

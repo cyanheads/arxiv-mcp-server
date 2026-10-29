@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.8.1](changelog/1.8.x/1.8.1.md) — 2026-10-29
+
+Mirror and live answers read a paper the same: TeX is converted to Unicode at harvest (mirror schema v6), authors split like the API, and multi-word au: queries go live. content[] keeps TeX verbatim in code literals, repeated IDs are looked up once, and read_paper bodies shed LaTeXML presentation markup.
+
 ## [1.8.0](changelog/1.8.x/1.8.0.md) — 2026-10-26
 
 Publishes the arxiv-guide Agent Skill, served over MCP as skill://arxiv-guide/SKILL.md and shipped in the npm package, Docker image, and .mcpb, and adopts mcp-ts-core 0.13.18: the HTTP per-request memory leak fixed in 0.13.17, and a .mcpb that no longer carries source, a local database, or node-gyp build files.
