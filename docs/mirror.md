@@ -30,15 +30,15 @@ When a release changes the mirror's schema, the server answers from the live API
 
 One writer migrates the file at a time. A mirror command started meanwhile changes nothing and exits 75, naming the process that holds the migration; run it again once that finishes.
 
-Cost on a full-size mirror (v5 → v6 estimated, see below):
+Cost on a full-size mirror:
 
 | Migration | What it does | Time | Peak WAL | File growth |
 |:---|:---|:---|:---|:---|
 | v3 → v4 | Adds a column to the category table, fills it, rebuilds five date indexes | ~5 min | ~450 MB | ~9% |
 | v4 → v5 | Rewrites each paper whose text holds `&#39;` or `&#34;` with the quote characters (about 1.2M of 3.2M papers), then rebuilds the category index searches use | 4.5–7.5 min, depending on host load | ~160 MB | ~10% |
-| v5 → v6 | Converts TeX accents, letters, greek, and symbols in titles, authors, abstracts, comments, and journal refs to Unicode, as the arXiv API serves them (about a quarter of papers) | ~3 min estimated; plan for up to ~8 | ~50 MB measured | ~6% measured |
+| v5 → v6 | Converts TeX accents, letters, greek, and symbols in titles, authors, abstracts, comments, and journal refs to Unicode, as the arXiv API serves them (869,563 of 3,230,542 papers) | ~4.7 min | ~50 MB | under 0.1% |
 
-The v5 → v6 row is not a full-size measurement. Its basis: on one unbiased OAI page of 1,300 records (datestamp 2026-10-20), 330 rows change. A v5 file built from that page and replicated with distinct IDs to 130,000 and 390,000 rows migrates in 6.7–7.3 s and 22.8 s, about 56–59 µs per row scanned (about 230 µs per row rewritten), with the WAL peaking at 43–50 MB and the file growing 5.8%. At that slope ~3.2M papers take about 3 minutes. The replicas repeat one page's vocabulary, so their FTS index is smaller than a real mirror's and each rewrite there touches fewer index pages; v5's rewrite of 1.2M rows in 4.5–7.5 min bounds the plausible range above.
+The v5 → v6 time and file growth were measured on a full-size mirror of 3,230,542 papers. Its peak WAL was measured on smaller copies: a v5 file built from one OAI page and replicated with distinct IDs to 130,000 and 390,000 rows peaked at 43–50 MB.
 
 Rolling back to 1.7.1 or earlier and refreshing stores those character references again in each paper the refresh rewrites. After rolling forward, run `UPDATE schema_version SET version = 4` on the file and then `bun run mirror:verify` to repeat the repair. Likewise, a release before schema v6 (1.8.0 or earlier) that refreshes a v6 file stores TeX again in each paper it rewrites; after rolling forward, run `UPDATE schema_version SET version = 5` and then `bun run mirror:verify` to repeat the conversion.
 
