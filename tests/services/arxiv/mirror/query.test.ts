@@ -382,8 +382,8 @@ describe('translateQuery — operators around cat: and submittedDate: operands (
   });
 
   it('keeps a cat: on the left of an ANDNOT a conjunct, and the ANDNOT in the match', () => {
-    const { matchExpr, categoryGroups } = mirrored('au:"hinton g" AND cat:cs.LG ANDNOT ti:survey');
-    expect(matchExpr).toBe('authors:"hinton g" NOT title:"survey"');
+    const { matchExpr, categoryGroups } = mirrored('au:hinton AND cat:cs.LG ANDNOT ti:survey');
+    expect(matchExpr).toBe('authors:"hinton" NOT title:"survey"');
     expect(categoryGroups).toEqual([['cs.LG']]);
   });
 
@@ -671,8 +671,8 @@ describe('translateQuery — arXiv’s query grammar (issue #82)', () => {
     // The echoed form of a query beside the category parameter.
     ['(quantum computing) AND cat:cs.LG', '("quantum" OR "computing")', [['cs.LG']]],
     [
-      'au:"hinton g" AND cat:cs.LG ANDNOT ti:survey',
-      'authors:"hinton g" NOT title:"survey"',
+      'au:hinton AND cat:cs.LG ANDNOT ti:survey',
+      'authors:"hinton" NOT title:"survey"',
       [['cs.LG']],
     ],
     // A cat:-only OR set on the right of an AND is one group, adjacency included.
@@ -713,6 +713,63 @@ describe('translateQuery — arXiv’s query grammar (issue #82)', () => {
     'x AND (cat:cs.LG ANDNOT y)',
   ])('routes %s live: no positive term is left', (query) => {
     expect(translateQuery(query)).toEqual(live('no_positive_term'));
+  });
+
+  // Issue #96 — arXiv matches an `au:` value of several words inside one
+  // author's name, in any order, and reads `_` as a space; the mirror's
+  // `authors` column is the whole author list as one string, so it would match
+  // an ordered phrase that can span two authors.
+  it.each([
+    // Each one measured live and on the mirror: `au:"hinton g"` is 1 paper live
+    // and 16 on the mirror, `au:"hinton geoffrey"` 59 and 0, `au:del_maestro` 90 and 0.
+    'au:"hinton g"',
+    'au:"geoffrey hinton" AND cat:cs.LG',
+    'au:"hinton geoffrey"',
+    'au:del_maestro',
+    'au:hinton_g',
+    'au:J.A.Hinton',
+    // The mirror's tokenizer splits on every character but a letter, a digit,
+    // `-`, and `_`: a quote, a comma, an en dash, a tab, a symbol.
+    "au:o'brien",
+    'au:o’brien',
+    'au:hinton,g',
+    'au:jarillo–herrero',
+    'au:"hinton\tg"',
+    'au:a+b',
+    'AU:"Hinton G"',
+    'au:"  hinton  g  "',
+    // Wherever the operand sits.
+    'transformer AND au:"hinton g"',
+    'transformer OR au:"hinton g"',
+    'transformer au:"hinton g"',
+    'transformer ANDNOT au:"hinton g"',
+    'au:"hinton g" ANDNOT ti:survey',
+    'au:"hinton g" AND NOT ti:survey',
+    '(au:"hinton g")',
+    'cat:cs.LG AND au:del_maestro',
+    'ti:transformer AND (cat:cs.LG AND (au:"hinton g" OR au:bengio))',
+  ])('routes %j live: an author value of more than one word', (query) => {
+    expect(translateQuery(query)).toEqual(live('multiword_author'));
+  });
+
+  it.each([
+    ['au:hinton', 'authors:"hinton"'],
+    ['au:"hinton"', 'authors:"hinton"'],
+    ['au:" hinton "', 'authors:"hinton"'],
+    // One token on both paths: 152 papers live and on the mirror.
+    ['au:jarillo-herrero', 'authors:"jarillo-herrero"'],
+    ['au:hinton AND cat:cs.LG', 'authors:"hinton"'],
+    ['au:müller', 'authors:"müller"'],
+    ['au:张三', 'authors:"张三"'],
+    // A separator at either end leaves one word.
+    ['au:hinton.', 'authors:"hinton."'],
+    ['au:"(hinton)"', 'authors:"(hinton)"'],
+    // Only `au:` is read per author; other fields keep the mirror's phrase match.
+    ['ti:"hinton g"', 'title:"hinton g"'],
+    ['"hinton geoffrey"', '"hinton geoffrey"'],
+    ['all:del_maestro', allCols('del_maestro')],
+  ])('keeps %j on the mirror: an author value of one word', (query, matchExpr) => {
+    expect(mirrored(query).matchExpr).toBe(matchExpr);
   });
 });
 
@@ -758,6 +815,12 @@ describe('translateQuery — linear on caller-sized input (issue #65)', () => {
       'nested groups of AND NOT',
       (n: number) => `${'(a AND NOT '.repeat(n / 11)}b${')'.repeat(n / 11)}`,
     ],
+    // Issue #96 — the au: word scan.
+    ['one long author word', (n: number) => `au:"${'x'.repeat(n)}"`],
+    ['an author word ending in a second', (n: number) => `au:"${'7'.repeat(n)} y"`],
+    ['a hyphen run in an author value', (n: number) => `au:${'a-'.repeat(n / 2)}`],
+    ['separators throughout an author value', (n: number) => `au:"${'. '.repeat(n / 2)}"`],
+    ['many one-word author operands', (n: number) => `${'au:hinton AND '.repeat(n / 14)}x`],
   ])('stays linear for %s from 5k to 320k characters', (_shape, build) => {
     // Warm the JIT so the first size is not charged for compilation.
     for (let i = 0; i < 3; i++) translateQuery(build(5_000));
@@ -849,7 +912,7 @@ describe('translateQuery → FTS5 parser parity (issue #13)', () => {
     'a ANDNOT b AND (c OR d)',
     'a OR b ANDNOT c AND d',
     'a ANDNOT all:b AND all:c',
-    'au:"hinton g" AND cat:cs.LG ANDNOT ti:survey',
+    'au:hinton AND cat:cs.LG ANDNOT ti:survey',
     '(cat:cs.LG AND (a ANDNOT b)) AND c',
     // Issue #82 — arXiv's grammar: adjacency as OR, one precedence grouped right,
     // operator words only in uppercase, a negation folded into its conjunct.
@@ -1243,12 +1306,15 @@ describe('translateQuery against an independent evaluator of arXiv’s grammar (
       if (got.join() !== expected.join()) mismatches.push({ query, expected, got });
     }
     expect(mismatches.slice(0, 5)).toEqual([]);
-    // Only filters arXiv reads as disjuncts or negated, negations left alone, and
-    // category filters naming no code go live.
+    // Only filters arXiv reads as disjuncts or negated, negations left alone,
+    // category filters naming no code, and two-word au: phrases go live: arXiv
+    // matches those inside one author's name (#96), which the reference's
+    // contiguous-phrase reading does not model.
     expect([...routes.keys()].sort()).toEqual([
       'empty_category',
       'filter_not_conjunct',
       'mirror',
+      'multiword_author',
       'no_positive_term',
     ]);
     // The differential is not vacuous: a large share of random queries stays on the

@@ -52,6 +52,8 @@ import {
   searchInWorker,
   translateQuery,
 } from './mirror/index.js';
+import { splitAuthors } from './mirror/tex2utf.js';
+import { noSuchPaperMessage } from './paper-id.js';
 import { extractInWorker, type PdfTextExtractor } from './pdf-text.js';
 import {
   ARXIV_API_RESULT_LIMIT,
@@ -510,6 +512,124 @@ function texAnnotation(inner: string): string | undefined {
   }
 }
 
+/** A `<span>` or `</span>` tag, group 1 the closing slash, group 2 the attributes. */
+const SPAN_TAG = /<(\/?)span(\s[^<>]*)?>/g;
+/** A tag's class value. */
+const CLASS_VALUE = /\sclass="([^"]*)"/;
+/** The table element each part of a span-built tabular stands for; `ltx_th` first, since a header cell carries `ltx_td` too. */
+const SPAN_TABULAR_PARTS = [
+  ['table', /\bltx_tabular\b/],
+  ['tr', /\bltx_tr\b/],
+  ['th', /\bltx_th\b/],
+  ['td', /\bltx_td\b/],
+] as const;
+
+/**
+ * Rename the parts of a span-built LaTeXML tabular (`ltx_tabular`, `ltx_tr`,
+ * `ltx_th`, and `ltx_td` spans, which LaTeXML writes for a tabular set inline)
+ * to `<table>`, `<tr>`, `<th>`, and `<td>`, attributes kept, each closer renamed
+ * with its opener. Runs before the class pass drops the classes that mark them,
+ * so unwrapping bare spans afterwards leaves the rows and cells standing. See
+ * issue #94.
+ *
+ * One forward pass with a stack of open spans; each tag scan stops at the next
+ * `<` or `>`, so the pass is linear in page length.
+ */
+function renameSpanTabulars(html: string): string {
+  const open: string[] = [];
+  return html.replace(SPAN_TAG, (tag, closing: string, attrs = '') => {
+    if (closing) {
+      const name = open.pop();
+      return name === undefined || name === 'span' ? tag : `</${name}>`;
+    }
+    const classes = CLASS_VALUE.exec(attrs)?.[1] ?? '';
+    const part = SPAN_TABULAR_PARTS.find(([, token]) => token.test(classes))?.[0];
+    open.push(part ?? 'span');
+    return part ? `<${part}${attrs}>` : tag;
+  });
+}
+
+/**
+ * An HTML tag: group 1 the closing slash, 2 the name, 3 the attributes. The
+ * attribute scan stops at the next `<` or `>`, so tag scans never overlap.
+ */
+const TAG = /<(\/?)([a-zA-Z][\w-]*)(\s[^<>]*)?>/g;
+/** A `style` attribute and the whitespace run before it, matched only where the run starts. */
+const STYLE_ATTRIBUTE = /(?<!\s)\s+style="[^"]*"/g;
+/** A `title` attribute and the whitespace run before it, matched only where the run starts. */
+const TITLE_ATTRIBUTE = /(?<!\s)\s+title="[^"]*"/g;
+/** A style that hides its element: LaTeX `\phantom`, which LaTeXML renders to align table digits. */
+const HIDDEN_STYLE = /\sstyle="[^"]*visibility:\s*hidden/;
+
+/** What the presentation pass does with one `<span>` and its matching closer. */
+type SpanDisposition = 'drop' | 'keep' | 'unwrap';
+
+/**
+ * Drop the presentation markup the class and id passes leave: every `style`
+ * attribute, the `title` LaTeXML puts on each link (a cross-reference breadcrumb
+ * or empty), a `visibility:hidden` span with all its content, and the opener
+ * and matching closer of each span left with no attribute. All other text stays
+ * as written, in order. A hidden span drops only when it closes; an unclosed
+ * one loses its style like any other. See issue #94.
+ *
+ * Acts only on `span` and `a` tags and `style` attributes: collapsed TeX keeps
+ * its `<` and `>` raw (`$a<b$`), so a TeX run that reads as some other tag
+ * passes through untouched. A first pass pairs span openers with closers on a
+ * stack, the way the second pass reads them; each tag scan stops at the next
+ * `<` or `>`, so both passes are linear in page length.
+ */
+function stripPresentationMarkup(html: string): string {
+  const tags = [...html.matchAll(TAG)];
+  const closes = new Uint8Array(tags.length);
+  const openers: number[] = [];
+  tags.forEach(([, closing, name], i) => {
+    if (name !== 'span') return;
+    if (!closing) {
+      openers.push(i);
+      return;
+    }
+    const opener = openers.pop();
+    if (opener !== undefined) closes[opener] = 1;
+  });
+
+  const out: string[] = [];
+  const spans: SpanDisposition[] = [];
+  let dropDepth = 0;
+  let copied = 0;
+  tags.forEach((match, i) => {
+    const [tag, closing, name, attrs = ''] = match;
+    if (dropDepth === 0) out.push(html.slice(copied, match.index));
+    copied = match.index + tag.length;
+    if (name === 'span') {
+      if (closing) {
+        const disposition = spans.pop();
+        if (disposition === 'drop') dropDepth--;
+        else if (disposition !== 'unwrap' && dropDepth === 0) out.push(tag);
+        return;
+      }
+      if (dropDepth > 0 || (closes[i] === 1 && HIDDEN_STYLE.test(attrs))) {
+        spans.push('drop');
+        dropDepth++;
+        return;
+      }
+      const kept = attrs.replace(STYLE_ATTRIBUTE, '');
+      if (kept.trim() === '') {
+        spans.push('unwrap');
+        return;
+      }
+      spans.push('keep');
+      out.push(kept === attrs ? tag : `<span${kept}>`);
+      return;
+    }
+    if (dropDepth > 0) return;
+    let kept = attrs.replace(STYLE_ATTRIBUTE, '');
+    if (name === 'a') kept = kept.replace(TITLE_ATTRIBUTE, '');
+    out.push(kept === attrs ? tag : `<${closing}${name}${kept}>`);
+  });
+  out.push(html.slice(copied));
+  return out.join('');
+}
+
 /**
  * Strip LaTeXML-generated class/id noise, collapse MathML to LaTeX, and collapse
  * redundant break runs. LaTeXML emits `class="ltx_..."` and generated `id="..."`
@@ -517,6 +637,10 @@ function texAnnotation(inner: string): string | undefined {
  * `<annotation encoding="application/x-tex">` child already carries the same
  * content in a fraction of the bytes. Stripping these typically shrinks a
  * math-heavy paper's HTML by an order of magnitude with zero content loss.
+ * Span-built tabulars become table markup before the class pass
+ * (`renameSpanTabulars`), and the presentation markup left after it goes last
+ * (`stripPresentationMarkup`): styles, link titles, `\phantom` spans, and bare
+ * spans.
  *
  * Exception: class attributes containing a structural marker (see
  * LATEXML_STRUCTURAL_CLASS) are preserved verbatim so section boundaries remain
@@ -528,14 +652,14 @@ function texAnnotation(inner: string): string | undefined {
  * See issue #52.
  */
 export function stripLatexmlNoise(html: string): string {
-  return (
-    collapseMathML(html)
+  return stripPresentationMarkup(
+    renameSpanTabulars(collapseMathML(html))
       .replace(/(?<!\s)\s+class="(ltx_[^"]*)"/gi, (match, value) =>
         LATEXML_STRUCTURAL_CLASS.test(value) ? match : '',
       )
       .replace(/(?<!\s)\s+id="[^"]*"/gi, '')
       // Collapse runs of 2+ <br> tags (LaTeXML emits these around display math)
-      .replace(/(?:<br\s*\/?>\s*){2,}/gi, '<br>\n')
+      .replace(/(?:<br\s*\/?>\s*){2,}/gi, '<br>\n'),
   );
 }
 
@@ -573,10 +697,11 @@ const HEADING_SOURCE_MAX = 4000;
 
 /**
  * A cleaned LaTeXML heading opener, `<hN …>`, group 2 its attributes.
- * `stripLatexmlNoise` drops the `id` but keeps a structural class and any
- * other attribute beside it, such as the `style` LaTeXML gives a resized
- * heading (`<h4 class="ltx_title ltx_title_section" style="font-size:90%;">`).
- * The attribute scan stops at the next `<` or `>`. See issue #66.
+ * `stripLatexmlNoise` drops the `id` and the `style` LaTeXML gives a resized
+ * heading (`<h4 class="ltx_title ltx_title_section" style="font-size:90%;">`)
+ * but keeps a structural class and any other attribute beside it, so the class
+ * need not be the opener's only attribute. The attribute scan stops at the
+ * next `<` or `>`. See issues #66 and #94.
  */
 const HEADING_OPENER = /<h([1-6])(\s[^<>]*)?>/y;
 
@@ -776,27 +901,31 @@ function extractPaperId(idUrl: string): string {
 }
 
 /**
- * Convert a mirror `PaperRow` to the canonical `PaperMetadata` shape. The
- * mirror stores the latest version only — the returned `id` reflects that.
- * Authors are best-effort split on commas; arXivRaw stores authors as a free
- * text block, so split fidelity varies by submission style.
+ * An instant as the arXiv API writes it, `YYYY-MM-DDTHH:MM:SSZ`. The mirror
+ * stores `toISOString()` output (`.000Z`), which its date-window bounds compare
+ * against; arXiv's dates carry whole seconds, so only the empty fraction goes.
+ */
+const apiInstant = (stored: string) => stored.replace(/\.000Z$/, 'Z');
+
+/**
+ * Convert a mirror `PaperRow` to the canonical `PaperMetadata` shape, reading
+ * as the live API returns the same paper (issue #89). The mirror stores the
+ * latest version only — the returned `id` reflects that. The stored author
+ * line is split with arXiv's own rule ({@link splitAuthors}): `,`, ` and `,
+ * `&`, and `:` separate names, and parenthesized affiliations drop out.
  */
 function rowToMetadata(row: PaperRow): PaperMetadata {
   const versionedId = row.version ? `${row.id}v${row.version}` : row.id;
-  const authors = row.authors
-    .split(/[,\n]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
   const categories = row.categories.split(/\s+/).filter(Boolean);
   return {
     id: versionedId,
     title: row.title,
-    authors,
+    authors: splitAuthors(row.authors),
     abstract: row.abstract,
     primary_category: row.primary_category,
     categories,
-    published: row.published,
-    updated: row.updated,
+    published: apiInstant(row.published),
+    updated: apiInstant(row.updated),
     ...(row.comment && { comment: row.comment }),
     ...(row.journal_ref && { journal_ref: row.journal_ref }),
     ...(row.doi && { doi: row.doi }),
@@ -1722,10 +1851,7 @@ export class ArxivService {
         { paperId, pdfUrl: `https://arxiv.org/pdf/${paperId}`, reason: 'version_not_served' },
       );
     }
-    throw notFound(
-      `Paper '${paperId}' not found. Verify the ID format (e.g., '2401.12345' or '2401.12345v2').`,
-      { paperId, reason: 'no_match' },
-    );
+    throw notFound(noSuchPaperMessage(paperId), { paperId, reason: 'no_match' });
   }
 
   /**
@@ -2189,7 +2315,11 @@ export class ArxivService {
       .replace(/\s+/g, ' ')
       .trim();
 
-    const authors: string[] = (entry.author ?? []).map((a) => String(a.name));
+    // Collapsed as the title is: content[] carries the author line in a code
+    // span, which reads a line break as a space (#91). Mirror rows arrive so.
+    const authors: string[] = (entry.author ?? []).map((a) =>
+      String(a.name).replace(/\s+/g, ' ').trim(),
+    );
     const categories: string[] = (entry.category ?? []).map((c) => String(c['@_term']));
     const primaryCategory = String(
       entry['arxiv:primary_category']?.['@_term'] ?? categories[0] ?? '',

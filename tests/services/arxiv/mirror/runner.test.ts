@@ -1232,8 +1232,8 @@ describe('runHarvest', () => {
           'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated)',
         ],
         name: 'paper_categories_cat_updated_idx',
-        listed: 'index paper_categories_cat_updated_idx: differs from schema v5',
-        failure: 'index paper_categories_cat_updated_idx differs from schema v5',
+        listed: `index paper_categories_cat_updated_idx: differs from schema v${MIRROR_SCHEMA_VERSION}`,
+        failure: `index paper_categories_cat_updated_idx differs from schema v${MIRROR_SCHEMA_VERSION}`,
         restore: [
           'DROP INDEX IF EXISTS paper_categories_cat_updated_idx;',
           'CREATE INDEX paper_categories_cat_updated_idx ON paper_categories(category, updated, paper_id, published);',
@@ -1246,8 +1246,8 @@ describe('runHarvest', () => {
           'CREATE INDEX papers_revised_early_idx ON papers(published, updated)',
         ],
         name: 'papers_revised_early_idx',
-        listed: 'index papers_revised_early_idx: differs from schema v5',
-        failure: 'index papers_revised_early_idx differs from schema v5',
+        listed: `index papers_revised_early_idx: differs from schema v${MIRROR_SCHEMA_VERSION}`,
+        failure: `index papers_revised_early_idx differs from schema v${MIRROR_SCHEMA_VERSION}`,
         restore: [
           'DROP INDEX IF EXISTS papers_revised_early_idx;',
           'CREATE INDEX papers_revised_early_idx ON papers(published, updated) WHERE updated < published;',
@@ -1260,8 +1260,8 @@ describe('runHarvest', () => {
           'CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id)',
         ],
         name: 'paper_categories_paper_id_idx',
-        listed: 'index paper_categories_paper_id_idx: differs from schema v5',
-        failure: 'index paper_categories_paper_id_idx differs from schema v5',
+        listed: `index paper_categories_paper_id_idx: differs from schema v${MIRROR_SCHEMA_VERSION}`,
+        failure: `index paper_categories_paper_id_idx differs from schema v${MIRROR_SCHEMA_VERSION}`,
         restore: [
           'DROP INDEX IF EXISTS paper_categories_paper_id_idx;',
           'CREATE INDEX paper_categories_paper_id_idx ON paper_categories(paper_id, category);',

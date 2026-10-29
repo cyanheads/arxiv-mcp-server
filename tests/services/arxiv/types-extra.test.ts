@@ -153,8 +153,13 @@ describe('formatPaper edge cases', () => {
     expect(text).toContain('First line.');
   });
 
-  it('handles empty authors array without throwing', () => {
-    const paper: PaperMetadata = { ...BASE_PAPER, authors: [] };
-    expect(() => formatPaper(paper)).not.toThrow();
+  // An empty code span would read back as two literal backticks (#91).
+  it('emits no author line for an empty authors array', () => {
+    const text = formatPaper({ ...BASE_PAPER, authors: [] });
+    expect(text.split('\n').slice(0, 3)).toEqual([
+      '**`Test Paper`**',
+      'arXiv:2401.12345v1 | cs.AI | 2024-01-22',
+      '',
+    ]);
   });
 });

@@ -8,7 +8,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import type { PaperMetadata, SearchResult } from '@/services/arxiv/types.js';
-import { COMMONMARK_PRESETS, readCommonMarkText } from '../../../helpers/commonmark-text.js';
+import {
+  COMMONMARK_PRESETS,
+  readCommonMarkFences,
+  readCommonMarkText,
+} from '../../../helpers/commonmark-text.js';
 
 vi.mock('@/services/arxiv/arxiv-service.js', () => ({
   getArxivService: vi.fn(),
@@ -306,7 +310,7 @@ describe('arxivSearchPapers', () => {
     const result = { papers: [MOCK_PAPER] };
     const blocks = arxivSearchPapers.format?.(result) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('**Attention Is All You Need**');
+    expect(text).toContain('**`Attention Is All You Need`**');
   });
 
   it('formats empty results as empty string (notice is in enrichment)', () => {
@@ -319,7 +323,7 @@ describe('arxivSearchPapers', () => {
   // this pins the rest of the page: each paper set off by a rule, and the query
   // echo reading back from content[] as structuredContent carries it — a code
   // span, so the copied query carries no backslash escapes.
-  it('sets each paper off by a rule and reads back the query echo (#87)', async () => {
+  it('sets each paper off by a rule and reads back the query echo (#87, #91)', async () => {
     const commented: PaperMetadata = {
       ...MOCK_PAPER,
       title: 'A commented paper',
@@ -346,18 +350,22 @@ describe('arxivSearchPapers', () => {
     for (const preset of COMMONMARK_PRESETS) {
       expect(readCommonMarkText(papers ?? '', preset), preset).toBe(
         [
-          `⟨strong⟩${commented.title}⟨/strong⟩\narXiv:${commented.id} | ${meta}\nAlice, Bob`,
-          '⟨blockquote_open⟩',
-          commented.abstract,
-          '⟨blockquote_close⟩',
-          `Comment: 12 pages\nPublished: ${commented.published} | Updated: ${commented.updated}\nAbstract: ⟨a href=${commented.abstract_url}⟩${commented.abstract_url}⟨/a⟩\nPDF: ⟨a href=${commented.pdf_url}⟩${commented.pdf_url}⟨/a⟩`,
+          `⟨strong⟩⟨code_inline:${commented.title}⟩⟨/strong⟩\narXiv:${commented.id} | ${meta}\n⟨code_inline:Alice, Bob⟩`,
+          '⟨fence:text⟩',
+          'Comment:',
+          '⟨fence:text⟩',
+          `Published: ${commented.published} | Updated: ${commented.updated}\nAbstract: ⟨a href=${commented.abstract_url}⟩${commented.abstract_url}⟨/a⟩\nPDF: ⟨a href=${commented.pdf_url}⟩${commented.pdf_url}⟨/a⟩`,
           '⟨hr⟩',
-          `⟨strong⟩${MOCK_PAPER.title}⟨/strong⟩\narXiv:${MOCK_PAPER.id} | ${meta}\nAlice, Bob`,
-          '⟨blockquote_open⟩',
-          MOCK_PAPER.abstract,
-          '⟨blockquote_close⟩',
+          `⟨strong⟩⟨code_inline:${MOCK_PAPER.title}⟩⟨/strong⟩\narXiv:${MOCK_PAPER.id} | ${meta}\n⟨code_inline:Alice, Bob⟩`,
+          '⟨fence:text⟩',
           `Published: ${MOCK_PAPER.published} | Updated: ${MOCK_PAPER.updated}\nAbstract: ⟨a href=${MOCK_PAPER.abstract_url}⟩${MOCK_PAPER.abstract_url}⟨/a⟩\nPDF: ⟨a href=${MOCK_PAPER.pdf_url}⟩${MOCK_PAPER.pdf_url}⟨/a⟩`,
         ].join('\n\n'),
+      );
+      expect(readCommonMarkFences(papers ?? '', preset), preset).toEqual(
+        [commented.abstract, '12 pages', MOCK_PAPER.abstract].map((value) => ({
+          info: 'text',
+          literal: `${value}\n`,
+        })),
       );
       expect(readCommonMarkText(trailer ?? '', preset), preset).toBe(
         `⟨strong⟩Query:⟨/strong⟩ ⟨code_inline:${query}⟩\n⟨strong⟩Total Found:⟨/strong⟩ 2\n⟨strong⟩Page Start:⟨/strong⟩ 0`,

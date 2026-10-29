@@ -4,7 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 
 /** Shared schema for paper metadata — used by search, get_metadata, and resource outputs. */
 export const PaperMetadataSchema = z
@@ -15,8 +15,12 @@ export const PaperMetadataSchema = z
     abstract: z.string().describe('Full abstract text.'),
     primary_category: z.string().describe('Primary arXiv category (e.g., "cs.CL").'),
     categories: z.array(z.string()).describe('All arXiv categories assigned to this paper.'),
-    published: z.string().describe('Original submission date (ISO 8601).'),
-    updated: z.string().describe('Last update date (ISO 8601).'),
+    published: z
+      .string()
+      .describe('Original submission instant, ISO 8601 UTC (e.g., "2018-10-11T00:50:01Z").'),
+    updated: z
+      .string()
+      .describe('Last update instant, ISO 8601 UTC (e.g., "2018-10-11T00:50:01Z").'),
     comment: z.string().optional().describe('Author comment (e.g., page count, conference).'),
     journal_ref: z.string().optional().describe('Journal reference if published.'),
     doi: z.string().optional().describe('DOI if available.'),
@@ -213,11 +217,16 @@ export interface PaperContent {
 
 /**
  * Format a PaperMetadata into a Markdown block. Shared by search and get_metadata tools.
- * Every upstream string goes through `escapeMarkdownInline`, so a CommonMark parse
- * reads it back as `structuredContent` carries it (issue #87). The abstract is a
- * quote of its own, set off by blank lines: a labelled line directly after it
- * would join the quote as a lazy continuation line. The abstract and PDF URLs
- * render as links whose text is the URL itself.
+ * Every upstream string reads back through a CommonMark parse as
+ * `structuredContent` carries it (issue #87). The author-written fields are
+ * mostly TeX, which an inline escape alters (`\ ` doubles its backslash, `_{`
+ * and `~` gain one), so they go out byte-for-byte in code literals (issue #91):
+ * the title and author line in code spans, the abstract and the comment, which
+ * can hold line breaks, in `text` fences. A span reads a line break as a space,
+ * so both paths hand over titles and author names with whitespace collapsed. An
+ * empty author list emits no line, since an empty span reads as two backticks.
+ * The ID, categories, dates, journal reference, and DOI stay escaped inline;
+ * the abstract and PDF URLs render as links whose text is the URL itself.
  */
 export function formatPaper(p: PaperMetadata): string {
   const esc = escapeMarkdownInline;
@@ -232,15 +241,10 @@ export function formatPaper(p: PaperMetadata): string {
       : published || updated;
   const meta = [`arXiv:${esc(p.id)}`, esc(cats), dateStr].filter(Boolean).join(' | ');
 
-  const lines = [
-    `**${esc(p.title)}**`,
-    meta,
-    esc(p.authors.join(', ')),
-    '',
-    `> ${esc(p.abstract).replaceAll('\n', '\n> ')}`,
-    '',
-  ];
-  if (p.comment) lines.push(`Comment: ${esc(p.comment)}`);
+  const lines = [`**${markdown().inlineCode(p.title).build()}**`, meta];
+  if (p.authors.length > 0) lines.push(markdown().inlineCode(p.authors.join(', ')).build());
+  lines.push('', markdown().codeBlock(p.abstract, 'text').build(), '');
+  if (p.comment) lines.push('Comment:', markdown().codeBlock(p.comment, 'text').build());
   if (p.journal_ref) lines.push(`Journal: ${esc(p.journal_ref)}`);
   if (p.doi) lines.push(`DOI: ${esc(p.doi)}`);
   lines.push(`Published: ${esc(p.published)} | Updated: ${esc(p.updated)}`);

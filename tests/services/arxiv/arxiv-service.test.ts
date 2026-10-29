@@ -1463,10 +1463,10 @@ describe('ArxivService.getPapers', () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_SINGLE));
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.getPapers(['2401.12345', '9999.99999'], ctx);
+    const result = await service.getPapers(['2401.12345', '2312.99999'], ctx);
 
     expect(result.papers).toHaveLength(1);
-    expect(result.not_found).toEqual([{ id: '9999.99999', reason: 'not_in_arxiv' }]);
+    expect(result.not_found).toEqual([{ id: '2312.99999', reason: 'not_in_arxiv' }]);
   });
 
   it('preserves input order regardless of arXiv response order (issue #5)', async () => {
@@ -1675,6 +1675,42 @@ describe('ArxivService.getPapers', () => {
       title: 'Agents\' "interactions"',
       abstract: 'x &#8722; y &amp; z <Fe> &#39;',
       authors: ["O'Brien"],
+    });
+  });
+
+  // Issue #91: content[] carries the author line in a code span, which reads a
+  // line break as a space, so each name's whitespace runs collapse as the
+  // title's do. The comment keeps its line breaks: content[] fences it.
+  it('collapses whitespace runs inside each author name and keeps the comment as written', async () => {
+    mockFetch.mockResolvedValueOnce(
+      atomResponse(`<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00091v1</id>
+    <title>A
+      wrapped title</title>
+    <summary>x</summary>
+    <author><name>Jane
+      Q.  Doe</name></author>
+    <author><name>A.\tB.</name></author>
+    <author><name>Solo</name></author>
+    <arxiv:comment>12 pages
+Code at https://x.example/~a</arxiv:comment>
+    <published>2024-01-22T00:00:00Z</published>
+    <updated>2024-01-22T00:00:00Z</updated>
+  </entry>
+</feed>`),
+    );
+    const [paper] = (await getArxivService().search('all:names', {}, createMockContext())).papers;
+
+    expect(paper).toMatchObject({
+      title: 'A wrapped title',
+      authors: ['Jane Q. Doe', 'A. B.', 'Solo'],
+      comment: '12 pages\nCode at https://x.example/~a',
     });
   });
 });
@@ -2091,12 +2127,32 @@ describe('ArxivService.readContent', () => {
     );
   });
 
-  it('throws notFound when paper does not exist', async () => {
+  it('throws no_match naming the missing paper, with no hint of its own, when the paper does not exist (#93)', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
     const service = getArxivService();
 
-    await expect(service.readContent('9999.99999', {}, ctx)).rejects.toThrow(/not found/i);
+    const error = await service.readContent('2312.99999', {}, ctx).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(McpError);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: "arXiv has no paper with ID '2312.99999'.",
+      data: { paperId: '2312.99999', reason: 'no_match' },
+    });
+    // The contract's recovery fills the hint; one written here would override it.
+    expect((error as McpError).data).not.toHaveProperty('recovery');
+  });
+
+  it('throws no_match naming "paper or version" when a pinned ID returns nothing (#93)', async () => {
+    mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+    const ctx = createMockContext();
+    const service = getArxivService();
+
+    await expect(service.readContent('1706.03762v99', {}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: "arXiv has no paper or version with ID '1706.03762v99'.",
+      data: { paperId: '1706.03762v99', reason: 'no_match' },
+    });
   });
 
   it('throws content_unavailable when no HTML render and no PDF exist', async () => {
@@ -2922,7 +2978,7 @@ describe('ArxivService.readContent', () => {
     expect(result.source).toBe('arxiv_html');
     expect(
       result.content.endsWith(
-        '<div><p>See pages - of <a href="https://supplement.pdf" title="">supplement.pdf</a></p></div></article>',
+        '<div><p>See pages - of <a href="https://supplement.pdf">supplement.pdf</a></p></div></article>',
       ),
     ).toBe(true);
     expect(requested).toEqual(['https://arxiv.org/html/2405.03599v3']);
@@ -3184,8 +3240,8 @@ describe('ArxivService.readContent', () => {
     // Content should still contain the actual text and tag skeleton
     expect(result.content).toContain('Hello');
     expect(result.content).toContain('World');
-    expect(result.content).toContain('<span>');
-    expect(result.content).toContain('<p>');
+    // The span the class and id strip leaves bare unwraps to its text (#94)
+    expect(result.content).toBe('<article>Hello<br>\n<p>World</p></article>');
     // Both char counts are reported; body is strictly smaller after stripping
     expect(result.total_characters).toBe(raw.length);
     expect(result.body_characters).toBe(result.content.length);
@@ -3292,7 +3348,7 @@ describe('ArxivService.readContent', () => {
   it('pages the last chunk of article content, not footer chrome', async () => {
     const page = corpusPage('render/arxiv-2409.09856v3');
     // The cleaned body's length, as the fixture's expected.json records it.
-    const bodyCharacters = 486_432;
+    const bodyCharacters = 349_957;
     const result = await readPage('2409.09856v3', page, 'arxiv_html', {
       maxCharacters: 100_000,
       start: bodyCharacters - 5_000,
@@ -3478,9 +3534,13 @@ describe('ArxivService.readContent', () => {
           true,
         );
       }
+      // The served heading carries a style beside its class; cleaning keeps the class alone (#94).
+      expect(article).toMatch(
+        /<h\d class="[^"]*\bltx_title_section\b[^"]*" style="font-size:\d+%;">/,
+      );
       const styled = outline.find((entry) => entry.title === styledTitle);
       expect(result.content.slice(styled?.start ?? 0)).toMatch(
-        /^<h\d class="[^"]*\bltx_title_section\b[^"]*" style="font-size:\d+%;">/,
+        /^<h\d class="[^"]*\bltx_title_section\b[^"]*">/,
       );
     },
   );
@@ -3694,9 +3754,9 @@ describe('HTML cleaning passes', { timeout: 30_000 }, () => {
 </section>`;
 
     expect(stripLatexmlNoise(section)).toBe(`<section class="ltx_section">
-<h2 class="ltx_title ltx_title_section"><span>1 </span>Introduction</h2>
+<h2 class="ltx_title ltx_title_section">1 Introduction</h2>
 <div>
-<p>See <cite>[<a href="#bib.bib1" title="">1</a>]</cite>, where $n$ is <span style="font-size:90%;">fixed</span>.<br></p>
+<p>See <cite>[<a href="#bib.bib1">1</a>]</cite>, where $n$ is fixed.<br></p>
 </div>
 <figure><img src="x1.png" width="912" height="1344" alt="Refer to caption"></figure>
 </section>
@@ -3711,6 +3771,79 @@ describe('HTML cleaning passes', { timeout: 30_000 }, () => {
       '<h2   class="ltx_title ltx_title_section">',
     );
     expect(stripLatexmlNoise('<span class="other">  class="ltx_x"')).toBe('<span class="other">');
+  });
+
+  it('drops every style attribute and the title on links, keeping a title elsewhere and the structural class (#94)', () => {
+    const html =
+      '<h4 class="ltx_title ltx_title_section" style="font-size:90%;">1 Scope</h4>\n' +
+      '<p>See <a href="#S3.F2" title="Figure 2 ‣ 3.2.2 Multi-Head Attention ‣ 3 Model" class="ltx_ref" style="color:#000;">2</a>, ' +
+      '<a href="https://x.org/" title="">x.org</a>, <span class="ltx_text" title="tooltip">T</span>, <abbr title="Transformer">T</abbr>.</p>\n' +
+      '<figure><img src="x1.png" class="ltx_graphics" style="aspect-ratio:912/1344;" width="912" alt="Refer to caption"></figure>';
+
+    expect(stripLatexmlNoise(html)).toBe(
+      '<h4 class="ltx_title ltx_title_section">1 Scope</h4>\n' +
+        '<p>See <a href="#S3.F2">2</a>, <a href="https://x.org/">x.org</a>, <span title="tooltip">T</span>, <abbr title="Transformer">T</abbr>.</p>\n' +
+        '<figure><img src="x1.png" width="912" alt="Refer to caption"></figure>',
+    );
+  });
+
+  it('drops a \\phantom span with its content, nested markup included, and nothing else (#94)', () => {
+    // 2307.09288v2 aligns table digits with \phantom{0}: without the style, 17.7 reads 017.7.
+    const cell =
+      '<td class="ltx_td ltx_align_center"><span class="ltx_text"><span class="ltx_text" style="visibility:hidden">0</span></span>17.7</td>';
+    expect(stripLatexmlNoise(cell)).toBe('<td>17.7</td>');
+    expect(
+      stripLatexmlNoise(
+        '<p>a<span style="visibility: hidden;">b<span lang="de">c<em>d</em></span><span>e</span>$x$</span>f</p>',
+      ),
+    ).toBe('<p>af</p>');
+  });
+
+  it('keeps an unclosed hidden span and its content, dropping only its style (#94)', () => {
+    expect(stripLatexmlNoise('<p>a<span style="visibility:hidden">0</p></article>')).toBe(
+      '<p>a0</p></article>',
+    );
+    // The inner span closes, so it drops; the outer never does, so its content stays.
+    expect(
+      stripLatexmlNoise(
+        '<span style="visibility:hidden">0<span style="visibility:hidden">1</span>2',
+      ),
+    ).toBe('02');
+  });
+
+  it("unwraps a bare span's opener and matching closer, keeping a span with another attribute and its closer (#94)", () => {
+    expect(
+      stripLatexmlNoise(
+        '<p><span class="ltx_text ltx_font_italic">it</span> <span lang="de">Wort <span id="x">x</span></span>' +
+          '<span class="ltx_rule" style="width:100%;"> </span>|<span > y </span></p>',
+      ),
+    ).toBe('<p>it <span lang="de">Wort x</span> | y </p>');
+    // A closer with no opener stays as written.
+    expect(stripLatexmlNoise('a</span>b<span>c</span>')).toBe('a</span>bc');
+  });
+
+  it("renders a span-built tabular as table markup with each cell's text in its cell (#94)", () => {
+    // 2303.08774v6 Table 1 shape: LaTeXML writes an inline tabular as nested spans.
+    const tabular =
+      '<span id="S4.T1.3.1.1" class="ltx_tabular ltx_align_middle">' +
+      '<span id="S4.T1.3.1.1.1" class="ltx_tr">' +
+      '<span class="ltx_td ltx_th ltx_th_column ltx_align_left">Exam</span>' +
+      '<span class="ltx_td ltx_align_left ltx_border_r"><span class="ltx_text" style="font-size:90%;">GPT-4</span></span></span>' +
+      '<span class="ltx_tr"><span class="ltx_td ltx_nopad_r">' +
+      '<span class="ltx_tabular"><span class="ltx_tr"><span class="ltx_td">inner</span></span></span>' +
+      '</span><span class="ltx_td"><span lang="fr">été</span></span></span></span>';
+
+    expect(stripLatexmlNoise(`<p>${tabular}</p>`)).toBe(
+      '<p><table><tr><th>Exam</th><td>GPT-4</td></tr>' +
+        '<tr><td><table><tr><td>inner</td></tr></table></td><td><span lang="fr">été</span></td></tr></table></p>',
+    );
+  });
+
+  it('leaves collapsed TeX that reads like a tag as written (#94)', () => {
+    const tex = (source: string) =>
+      `<math display="inline"><semantics><mi>x</mi><annotation encoding="application/x-tex">${source}</annotation></semantics></math>`;
+    const html = `<p>${tex('0&lt;h&lt;1')}, ${tex('\\{a &lt;b&gt; d\\}')}, ${tex('&lt;a ,b&gt;')}</p>`;
+    expect(stripLatexmlNoise(html)).toBe('<p>$0<h<1$, $\\{a <b> d\\}$, $<a ,b>$</p>');
   });
 
   it('keeps the class and id strip linear in page length', () => {
@@ -3728,6 +3861,38 @@ describe('HTML cleaning passes', { timeout: 30_000 }, () => {
     expectLinear('<br ', stripLatexmlNoise);
     expectLinear('<br>x', stripLatexmlNoise);
     expectLinear('<br>\n<br', stripLatexmlNoise);
+  });
+
+  it('keeps the span, link-title, and style scan linear in page length (#94)', () => {
+    expectLinear('<span ', stripLatexmlNoise);
+    expectLinear('<span style="', stripLatexmlNoise);
+    expectLinear('<span>', stripLatexmlNoise);
+    expectLinear('</span>', stripLatexmlNoise);
+    expectLinear('<a title="', stripLatexmlNoise);
+    expectLinear('<span><span>x</span>', stripLatexmlNoise);
+  });
+
+  it('keeps the hidden-span drop linear in page length, closed, unclosed, and nested (#94)', () => {
+    expectLinear('<span style="visibility:hidden">x', stripLatexmlNoise);
+    expectLinear('<span style="visibility:hidden">x</span>', stripLatexmlNoise);
+    // Every opener closed at the end: one hidden span holding the whole nest drops.
+    expectLinear('<span style="visibility:hidden"><span>x', (s) =>
+      stripLatexmlNoise(`${s}${'</span>'.repeat(s.split('<span').length - 1)}`),
+    );
+    expectLinear(' style="visibility:', (s) => stripLatexmlNoise(`<span${s}>x</span>`));
+  });
+
+  it('keeps the span-tabular rename linear in page length (#94)', () => {
+    expectLinear('<span class="ltx_tabular"><span class="ltx_tr">', stripLatexmlNoise);
+    expectLinear('<span class="ltx_td">x</span>', stripLatexmlNoise);
+    expectLinear(' class="ltx_t', (s) => stripLatexmlNoise(`<span${s}>`));
+  });
+
+  it('keeps the presentation pass linear on one long tag, one long line, and line breaks throughout (#94)', () => {
+    expectLinear(' style="x', (s) => stripLatexmlNoise(`<span${s}>`));
+    expectLinear(' title="x', (s) => stripLatexmlNoise(`<a${s}>`));
+    expectLinear('§1 x', (s) => stripLatexmlNoise(`<span style="${s}\ny">x</span>`));
+    expectLinear('  \r\n', (s) => stripLatexmlNoise(`<a${s}title="x"${s}style="y">x</a>`));
   });
 
   it('keeps the ltx_page_main fallback search linear in page length', () => {

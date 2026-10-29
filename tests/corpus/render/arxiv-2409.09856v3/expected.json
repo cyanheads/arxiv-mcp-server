@@ -1,296 +1,296 @@
 {
   "kind": "render",
   "source": "arxiv_html",
-  "body_characters": 486432,
+  "body_characters": 349957,
   "total_characters": 1821385,
-  "pages": 5,
-  "body_sha256": "2f4e25a866c85b28ffb9eec87d8bbc416e4aa5b5bb2d7f9e4fecc7b906498521",
+  "pages": 4,
+  "body_sha256": "bb02f356b2c555ba6d014f90b1d334c8e3cbe7c9fd3c48d07610d0c2b613c091",
   "outline_omitted_levels": [3],
   "outline": [
     {
       "level": 1,
       "title": "Introduction",
-      "start": 65378
+      "start": 14738
     },
     {
       "level": 2,
       "title": "0.1. What was done in previous papers?",
-      "start": 67236
+      "start": 16493
     },
     {
       "level": 2,
       "title": "0.2. What is done in this paper?",
-      "start": 77385
+      "start": 24790
     },
     {
       "level": 2,
       "title": "0.3. Complications stemming from a non-trivial center",
-      "start": 87578
+      "start": 32741
     },
     {
       "level": 2,
       "title": "0.4. What is not done in this paper?",
-      "start": 95190
+      "start": 38761
     },
     {
       "level": 2,
       "title": "0.5. Contents",
-      "start": 107704
+      "start": 50045
     },
     {
       "level": 2,
       "title": "0.6. Acknowledgements",
-      "start": 111916
+      "start": 52760
     },
     {
       "level": 1,
       "title": "1. Summary of the preceding results",
-      "start": 113616
+      "start": 54429
     },
     {
       "level": 2,
       "title": "1.1. The Langlands functor and its categorical properties",
-      "start": 114049
+      "start": 54813
     },
     {
       "level": 2,
       "title": "1.2. Spectral properties",
-      "start": 116336
+      "start": 56646
     },
     {
       "level": 2,
       "title": "1.3. Restriction to the irreducible locus",
-      "start": 119405
+      "start": 58962
     },
     {
       "level": 2,
       "title": "1.4. Properties of ${\\mathcal{A}}_{G,\\operatorname{irred}}$",
-      "start": 124132
+      "start": 62632
     },
     {
       "level": 1,
       "title": "2. Reduction to the case when $G$ is almost simple and simply-connected",
-      "start": 126431
+      "start": 64710
     },
     {
       "level": 2,
       "title": "2.1. Compatibility between Langlands functors",
-      "start": 127523
+      "start": 65593
     },
     {
       "level": 2,
       "title": "2.2. Proof of Proposition 2.1.6",
-      "start": 132577
+      "start": 70031
     },
     {
       "level": 2,
       "title": "2.3. Changing the group",
-      "start": 159003
+      "start": 92138
     },
     {
       "level": 2,
       "title": "2.4. Proof of Theorem 2.3.5",
-      "start": 167482
+      "start": 98812
     },
     {
       "level": 1,
       "title": "3. Low genus cases",
-      "start": 190200
+      "start": 117847
     },
     {
       "level": 2,
       "title": "3.1. What do we need to prove?",
-      "start": 190652
+      "start": 118268
     },
     {
       "level": 2,
       "title": "3.2. The case of $g=0$",
-      "start": 191420
+      "start": 118644
     },
     {
       "level": 2,
       "title": "3.3. The case $g=1$",
-      "start": 191910
+      "start": 118930
     },
     {
       "level": 1,
       "title": "4. Calculation of the fundamental group",
-      "start": 196979
+      "start": 122907
     },
     {
       "level": 2,
       "title": "4.1. The fundamental groupoid of $\\operatorname{Bun}_{{\\check{G}}}$",
-      "start": 198506
+      "start": 124159
     },
     {
       "level": 2,
       "title": "4.2. Line bundles on $\\operatorname{Bun}_{\\check{G}}$",
-      "start": 202933
+      "start": 127686
     },
     {
       "level": 2,
       "title": "4.3. The fundamental group of $\\operatorname{LS}_{\\check{G}}^{\\operatorname{irred}}$",
-      "start": 211087
+      "start": 133564
     },
     {
       "level": 1,
       "title": "5. The core of the proof",
-      "start": 223684
+      "start": 142234
     },
     {
       "level": 2,
       "title": "5.1. Action of the center",
-      "start": 224662
+      "start": 142846
     },
     {
       "level": 2,
       "title": "5.2. Endomorphisms of the vacuum Poincaré object",
-      "start": 230530
+      "start": 147885
     },
     {
       "level": 2,
       "title": "5.3. Algebraic geometry of $\\operatorname{LS}_{\\check{G}}$",
-      "start": 235324
+      "start": 151225
     },
     {
       "level": 2,
       "title": "5.4. Structure of ${\\mathcal{A}}_{G,\\operatorname{irred}}$",
-      "start": 238174
+      "start": 153279
     },
     {
       "level": 2,
       "title": "5.5. Proof of GLC",
-      "start": 241532
+      "start": 155240
     },
     {
       "level": 2,
       "title": "5.6. Additional remarks",
-      "start": 260049
+      "start": 170508
     },
     {
       "level": 1,
       "title": "6. The vacuum Poincaré object",
-      "start": 264424
+      "start": 173618
     },
     {
       "level": 2,
       "title": "6.1. How to calculate those endomorphisms?",
-      "start": 265616
+      "start": 173993
     },
     {
       "level": 2,
       "title": "6.2. Proof of Theorems 5.2.3 and 5.2.4",
-      "start": 267653
+      "start": 175960
     },
     {
       "level": 2,
       "title": "6.3. Proof of Theorems 5.2.7 and 5.2.8",
-      "start": 283133
+      "start": 188532
     },
     {
       "level": 1,
       "title": "7. Geometry of $\\operatorname{Bun}_{G}$",
-      "start": 286322
+      "start": 190293
     },
     {
       "level": 2,
       "title": "7.1. Proof of Proposition 4.1.6",
-      "start": 287640
+      "start": 190768
     },
     {
       "level": 2,
       "title": "7.2. Proof of Proposition 4.3.5",
-      "start": 294723
+      "start": 196312
     },
     {
       "level": 2,
       "title": "7.3. Proof of Proposition 5.3.5",
-      "start": 298894
+      "start": 199407
     },
     {
       "level": 2,
       "title": "7.4. Proof of Proposition 4.3.8",
-      "start": 312772
+      "start": 209912
     },
     {
       "level": 1,
       "title": "8. 2-Fourier-Mukai transform of the automorphic category",
-      "start": 320081
+      "start": 216245
     },
     {
       "level": 2,
       "title": "8.1. The notion of 2-Fourier-Mukai transform",
-      "start": 320858
+      "start": 216653
     },
     {
       "level": 2,
       "title": "8.2. Some compatibilities",
-      "start": 336258
+      "start": 229221
     },
     {
       "level": 2,
       "title": "8.3. The 2-Fourier-Mukai transform and Verdier duality",
-      "start": 345414
+      "start": 236516
     },
     {
       "level": 2,
       "title": "8.4. Some further compatibilities",
-      "start": 355072
+      "start": 242923
     },
     {
       "level": 2,
       "title": "8.5. Example: the usual Fourier-Mukai transform",
-      "start": 371081
+      "start": 255766
     },
     {
       "level": 2,
       "title": "8.6. Two sheaves associated with automorphic category",
-      "start": 375427
+      "start": 259917
     },
     {
       "level": 2,
       "title": "8.7. Proof of Theorem 8.6.8",
-      "start": 389125
+      "start": 270506
     },
     {
       "level": 2,
       "title": "8.8. Proof of Proposition 8.7.7 (a)",
-      "start": 411955
+      "start": 288482
     },
     {
       "level": 2,
       "title": "8.9. Proof of Proposition 8.7.7 (b)",
-      "start": 431667
+      "start": 305187
     },
     {
       "level": 2,
       "title": "8.10. Geometric Langlands for non-pure inner forms",
-      "start": 452348
+      "start": 323238
     },
     {
       "level": 2,
       "title": "8.11. An arithmetic variant",
-      "start": 460964
+      "start": 329683
     },
     {
       "level": 1,
       "title": "Appendix A Review of (semi-)stability for $G$-bundles",
-      "start": 471362
+      "start": 337765
     },
     {
       "level": 2,
       "title": "A.1. Definition of (semi-)stability",
-      "start": 471694
+      "start": 338075
     },
     {
       "level": 2,
       "title": "A.2. A characterization of (semi-)stability",
-      "start": 475089
+      "start": 341344
     },
     {
       "level": 1,
       "title": "References",
-      "start": 479319
+      "start": 344348
     }
   ]
 }

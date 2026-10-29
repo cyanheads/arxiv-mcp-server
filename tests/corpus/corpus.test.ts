@@ -487,6 +487,14 @@ describe('corpus gate', () => {
       ],
       ['an unclosed <math> left in', 'markup', (c) => inject(c, '<p>', '<math')],
       ['an id left in', 'markup', (c) => inject(c, '<p>', '<p id="S1.p1">')],
+      ['a style left in', 'markup', (c) => inject(c, '<p>', '<p style="font-size:90%;">')],
+      ['a link title left in', 'markup', (c) => inject(c, '<p>', '<p><a href="#S2" title="">')],
+      [
+        'a link title written first',
+        'markup',
+        (c) => inject(c, '<p>', '<p><a title="x" href="#S2">'),
+      ],
+      ['a bare span left in', 'markup', (c) => inject(c, '<p>', '<p><span>')],
       [
         'a non-structural LaTeXML class left in',
         'markup',

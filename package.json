@@ -13,6 +13,7 @@
     "dist/",
     "!dist/*.mcpb",
     "README.md",
+    "docs/mirror.md",
     "LICENSE",
     "CHANGELOG.md",
     "changelog/",

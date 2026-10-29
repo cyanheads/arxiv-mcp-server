@@ -22,6 +22,10 @@
  *   - `paper_categories(paper_id, category)` joins the schema, so a term-less
  *     search probes each other group with one seek per candidate.
  *
+ * Schema v6 (issue #89):
+ *   - `rawToRow` converts arXiv's TeX to Unicode in the text columns, and the
+ *     migration converts the rows a pre-v6 harvester stored with TeX.
+ *
  * Writers own the file (issue #55). `MirrorStore.open` is the writers' open
  * (`runHarvest`, `mirror:verify`): it creates the file, applies the schema, and
  * runs the in-place migrations an existing DB still needs, in order, before
@@ -57,6 +61,7 @@ import {
   MIRROR_V4_STATEMENTS,
   MIRROR_V5_STATEMENTS,
 } from './schema.js';
+import { tex2utf, tex2utfAuthors } from './tex2utf.js';
 import type { ArxivRawRecord, HarvestState, PaperRow } from './types.js';
 
 /**
@@ -1048,6 +1053,19 @@ export function normalizeDateToIso(raw: string): string {
   return new Date(ms).toISOString();
 }
 
+/** `text` with its whitespace runs collapsed to one space and its ends trimmed. */
+const collapse = (text: string) => text.replace(/\s+/g, ' ').trim();
+
+/**
+ * A text column as the mirror stores it: whitespace collapsed, then arXiv's
+ * TeX-to-Unicode conversion, so the row reads as the arXiv API serves it and
+ * the FTS index holds the text a live search matches (issue #89).
+ */
+const storedText = (text: string) => tex2utf(collapse(text));
+
+/** The author line as the mirror stores it; see {@link tex2utfAuthors}. */
+const storedAuthors = (authors: string) => tex2utfAuthors(collapse(authors));
+
 /** Convert an OAI `arXivRaw` record to a flattened `papers`-table row. */
 export function rawToRow(r: ArxivRawRecord): PaperRow {
   const categoryTokens = r.categories.split(/\s+/).filter(Boolean);
@@ -1068,16 +1086,16 @@ export function rawToRow(r: ArxivRawRecord): PaperRow {
   return {
     id: r.paper_id,
     version: versionLabel,
-    title: r.title.replace(/\s+/g, ' ').trim(),
-    authors: r.authors.replace(/\s+/g, ' ').trim(),
-    abstract: r.abstract.replace(/\s+/g, ' ').trim(),
+    title: storedText(r.title),
+    authors: storedAuthors(r.authors),
+    abstract: storedText(r.abstract),
     primary_category: primary,
     categories: categoryTokens.join(' '),
     published,
     updated,
     latest_version: updated,
-    ...(r.comments && { comment: r.comments.replace(/\s+/g, ' ').trim() }),
-    ...(r.journal_ref && { journal_ref: r.journal_ref.replace(/\s+/g, ' ').trim() }),
+    ...(r.comments && { comment: storedText(r.comments) }),
+    ...(r.journal_ref && { journal_ref: storedText(r.journal_ref) }),
     ...(r.doi && { doi: r.doi.trim() }),
   };
 }
@@ -1298,7 +1316,11 @@ function migrate(db: SqliteHandle, path: string, { from, lease }: ClaimedMigrati
       migrateToV4(db, fenced);
       fenced(() => writeSchemaVersion(db, 4));
     }
-    if (from < 5) migrateToV5(db, fenced);
+    if (from < 5) {
+      migrateToV5(db, fenced);
+      fenced(() => writeSchemaVersion(db, 5));
+    }
+    if (from < 6) convertTexText(db, fenced);
     db.transaction(() => {
       assertHeld();
       writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
@@ -1606,6 +1628,80 @@ function repairQuoteReferences(
     lastRowid = upperRowid;
     process.stdout.write(
       `mirror migration v4→v5 (quote references): ${processed}/${total} rows, ${repaired} repaired\n`,
+    );
+    if (rows.length < batchSize) break;
+  }
+}
+
+/** The text columns arXiv's TeX-to-Unicode conversion applies to; `doi` is not one. */
+const CONVERTED_COLUMNS = ['title', 'authors', 'abstract', 'comment', 'journal_ref'] as const;
+
+type ConvertedRow = {
+  abstract: string;
+  authors: string;
+  comment: string | null;
+  journal_ref: string | null;
+  rowid: number;
+  title: string;
+};
+
+/**
+ * v6 (issue #89): convert the TeX a pre-v6 harvester stored in
+ * {@link CONVERTED_COLUMNS} to Unicode, so each rewritten row equals what
+ * {@link rawToRow} now stores for its record. Only a row holding `\` or `{{`
+ * in one of them can change, so SQL picks those out and the conversion, which
+ * SQL cannot express, runs here on each; a row whose five values come back
+ * unchanged is not written, and every other row stays byte for byte.
+ *
+ * Batched by rowid window, each window one transaction through `inTransaction`
+ * (the lease-fenced transaction of {@link migrate}), with `papers_au` keeping
+ * `papers_fts` in step with each row rewritten. The conversion is idempotent,
+ * so a repeat after an interruption reads the windows already done and writes
+ * none of their rows again.
+ */
+function convertTexText(db: SqliteHandle, inTransaction: InTransaction, batchSize = 5_000): void {
+  const mayChange = CONVERTED_COLUMNS.map(
+    (c) => `instr(${c}, '\\') > 0 OR instr(${c}, '{{') > 0`,
+  ).join(' OR ');
+  const candidates = db.prepare<ConvertedRow>(
+    `SELECT rowid, ${CONVERTED_COLUMNS.join(', ')} FROM papers
+     WHERE rowid > ? AND rowid <= ? AND (${mayChange})`,
+  );
+  const rewrite = db.prepare(
+    `UPDATE papers SET ${CONVERTED_COLUMNS.map((c) => `${c} = ?`).join(', ')} WHERE rowid = ?`,
+  );
+  const select = db.prepare<{ rowid: number }>(
+    `SELECT rowid FROM papers WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+  );
+  const total = db.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM papers`).get()?.n ?? 0;
+  let lastRowid = 0;
+  let processed = 0;
+  let rewritten = 0;
+  while (total > 0) {
+    const rows = select.all(lastRowid, batchSize);
+    if (rows.length === 0) break;
+    const upperRowid = rows[rows.length - 1]?.rowid ?? lastRowid;
+    const lowerRowid = lastRowid;
+    rewritten += inTransaction(() => {
+      let changed = 0;
+      for (const row of candidates.all(lowerRowid, upperRowid)) {
+        const next = [
+          storedText(row.title),
+          storedAuthors(row.authors),
+          storedText(row.abstract),
+          row.comment === null ? null : storedText(row.comment),
+          row.journal_ref === null ? null : storedText(row.journal_ref),
+        ];
+        if (CONVERTED_COLUMNS.every((c, k) => next[k] === row[c])) continue;
+        rewrite.run(...next, row.rowid);
+        changed++;
+      }
+      return changed;
+    });
+    processed += rows.length;
+    lastRowid = upperRowid;
+    process.stdout.write(
+      `mirror migration v5→v6 (TeX to Unicode): ${processed}/${total} rows, ${rewritten} rewritten\n`,
     );
     if (rows.length < batchSize) break;
   }

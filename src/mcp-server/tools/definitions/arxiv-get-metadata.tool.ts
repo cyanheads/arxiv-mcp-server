@@ -52,7 +52,7 @@ const OutputSchema = partialResultSchema({
   succeededKey: 'papers',
   succeededSchema: PaperMetadataSchema,
   succeededDescription:
-    'Papers found, in request order. Fewer than requested when an ID is malformed, absent from arXiv, a version arXiv will not serve, one whose live lookup failed behind the local mirror, or past the first 10 well-formed IDs.',
+    'Papers found, in request order, one per distinct ID. Fewer than requested when an ID repeats an earlier one, is malformed, absent from arXiv, a version arXiv will not serve, one whose live lookup failed behind the local mirror, or past the first 10 distinct well-formed IDs.',
   failedKey: 'not_found',
   idKey: 'id',
   idDescription:
@@ -64,7 +64,7 @@ const OutputSchema = partialResultSchema({
     .array(z.string())
     .optional()
     .describe(
-      'Well-formed IDs past the first 10, in canonical form and request order, that this call did not look up. Pass them as paper_ids in the next call. Absent when every well-formed ID was looked up.',
+      'Distinct well-formed IDs past the first 10, in canonical form and request order, that this call did not look up. Pass them as paper_ids in the next call. Absent when every well-formed ID was looked up.',
     ),
 });
 
@@ -86,7 +86,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       code: JsonRpcErrorCode.NotFound,
       when: 'None of the requested IDs returned data from arXiv.',
       recovery:
-        'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and confirm the paper exists via arxiv_search_papers.',
+        'Find the paper with arxiv_search_papers, or recheck the ID against its source; if the ID pins a version, retry without the suffix.',
       severity: 'notice',
     },
     {
@@ -137,7 +137,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
           .max(100),
       )
       .describe(
-        'arXiv paper IDs, up to 100. The first 10 well-formed IDs are looked up; the rest come back in remaining_ids to pass to the next call. Accepted forms: "2401.12345", "2401.12345v2" (a pinned version), or a pre-2007 ID like "hep-th/9901001" (archive spelled as arXiv issued it), each optionally prefixed "arXiv:", or an arxiv.org abs, pdf, or html URL, with or without https:// or a ?query or #fragment. An ID in any other form is reported in not_found with reason invalid_id and is not looked up.',
+        'arXiv paper IDs, up to 100. The first 10 distinct well-formed IDs are looked up; the rest come back in remaining_ids to pass to the next call. An ID repeated in any accepted spelling is looked up once, while different versions of one paper stay separate lookups. Accepted forms: "2401.12345", "2401.12345v2" (a pinned version), or a pre-2007 ID like "hep-th/9901001" (archive spelled as arXiv issued it), each optionally prefixed "arXiv:", or an arxiv.org abs, pdf, or html URL, with or without https:// or a ?query or #fragment. An ID in any other form is reported in not_found with reason invalid_id and is not looked up.',
       ),
   }),
 
@@ -146,7 +146,9 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
   async handler(input, ctx) {
     const service = getArxivService();
     const requested = input.paper_ids.map((raw) => ({ raw, id: normalizePaperId(raw) }));
-    const wellFormed = requested.flatMap((entry) => (entry.id ? [entry.id] : []));
+    // One lookup per canonical ID, version suffix included, at its first
+    // occurrence: a repeat spends no slot of the cap (#92).
+    const wellFormed = [...new Set(requested.flatMap((entry) => (entry.id ? [entry.id] : [])))];
     if (wellFormed.length === 0) {
       throw ctx.fail(
         'invalid_id',
@@ -160,11 +162,9 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
     const result = await service.getPapers(lookup, ctx);
     const lookupMisses = result.not_found ?? [];
 
-    // Report not_found in request order: a malformed ID where it sat, each
-    // lookup miss at its ID's slot. Misses arrive in lookup order, so each
-    // looked-up slot takes the next one when it names that slot's ID.
-    const pending = [...lookupMisses];
-    let lookedUp = 0;
+    // Report not_found in request order: a malformed ID at every place it sat,
+    // each lookup miss once, at its ID's first occurrence.
+    const pending = new Map(lookupMisses.map((miss) => [miss.id, miss]));
     const notFound = requested.flatMap<PaperLookupMiss>((entry) => {
       if (!entry.id) {
         return [
@@ -175,9 +175,9 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
           },
         ];
       }
-      const miss = pending[0];
-      if (lookedUp++ >= LOOKUP_CAP || miss?.id !== entry.id) return [];
-      pending.shift();
+      const miss = pending.get(entry.id);
+      if (!miss) return [];
+      pending.delete(entry.id);
       return [miss];
     });
 
@@ -236,7 +236,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
         `Found ${result.totalSucceeded} of ${result.totalSucceeded + (result.not_found?.length ?? 0)} papers.`,
         // IDs remain only past the lookup cap, so exactly LOOKUP_CAP were looked up.
         remaining > 0 &&
-          `Looked up the first ${LOOKUP_CAP} well-formed IDs; ${remaining} more ${remaining === 1 ? 'ID is' : 'IDs are'} listed under Remaining IDs below.`,
+          `Looked up the first ${LOOKUP_CAP} distinct well-formed IDs; ${remaining} more ${remaining === 1 ? 'ID is' : 'IDs are'} listed under Remaining IDs below.`,
       ]
         .filter(Boolean)
         .join(' '),

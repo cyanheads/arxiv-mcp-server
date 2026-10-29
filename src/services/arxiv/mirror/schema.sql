@@ -1,7 +1,10 @@
--- arxiv-mcp-server OAI-PMH mirror schema v5 (issues #18 + #19 + #37 + #78 + #88 + #85)
+-- arxiv-mcp-server OAI-PMH mirror schema v6 (issues #18 + #19 + #37 + #78 + #88 + #85 + #89)
 -- v5's migration repairs the quote references a pre-v5 harvester stored
 -- undecoded in the papers text columns (repairQuoteReferences in store.ts),
--- then defines the junction's paper_id index (the v5 block below).
+-- then defines the junction's paper_id index (the v5 block below). v6 changes
+-- no DDL: its migration converts the TeX a pre-v6 harvester stored in the
+-- papers text columns to Unicode, as the arXiv API serves it (convertTexText
+-- in store.ts).
 -- Review copy of schema.ts, which the writers' MirrorStore.open executes one
 -- statement at a time: the PRAGMAs first, then everything after them in one
 -- write transaction (issue #71). The v4 and v5 blocks in the paper_categories

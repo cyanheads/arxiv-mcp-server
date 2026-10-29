@@ -382,10 +382,13 @@ export function readViolations(kind: string, meta: FixtureMeta, read: ReadOutcom
     );
   }
 
-  // Cleaning: no MathML, no ids, no non-structural LaTeXML classes, no relative links.
+  // Cleaning: no MathML, ids, styles, link titles, bare spans, non-structural classes, or relative links.
   const markup: string[] = [];
   if (/<math\b/i.test(body)) markup.push('<math');
   if (/\sid="/i.test(body)) markup.push('id="');
+  if (/<[a-zA-Z][^<>]*\sstyle="/.test(body)) markup.push('style="');
+  if (/<a\s(?:[^<>]*\s)?title="/.test(body)) markup.push('<a title="');
+  if (/<span\s*>/.test(body)) markup.push('<span>');
   const noisyClasses = [...body.matchAll(LTX_CLASS_VALUE)]
     .map((m) => m[1] ?? '')
     .filter((value) => !STRUCTURAL_CLASS.test(value));

@@ -6,7 +6,7 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
-import { normalizePaperId, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
+import { normalizePaperId, noSuchPaperMessage, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
 
 /**
  * Percent-decode a URI-template variable. Template matching yields the raw text
@@ -55,9 +55,9 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
     {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Paper ID is not present in the arXiv index.',
+      when: 'arXiv has no paper with this ID, or no such version when the ID pins one.',
       recovery:
-        'Verify the paper ID format (e.g., "2401.12345") and confirm the paper exists via arxiv_search_papers.',
+        'Find the paper with arxiv_search_papers, or recheck the ID against its source; if the ID pins a version, retry without the suffix.',
     },
     {
       reason: 'version_unavailable',
@@ -127,7 +127,7 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
       if (miss?.reason === 'version_not_served') {
         throw ctx.fail('version_not_served', message, { paperId, not_found: miss });
       }
-      throw ctx.fail('no_match', `Paper '${paperId}' not found.`, { paperId });
+      throw ctx.fail('no_match', noSuchPaperMessage(paperId), { paperId });
     }
     return paper;
   },

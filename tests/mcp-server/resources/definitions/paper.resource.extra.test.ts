@@ -76,8 +76,8 @@ describe('paperResource — additional cases', () => {
     const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
       typeof paperResource.handler
     >[1];
-    await expect(paperResource.handler({ paperId: '9999.99999' }, ctx)).rejects.toThrow(
-      /9999\.99999/,
+    await expect(paperResource.handler({ paperId: '2312.99999' }, ctx)).rejects.toThrow(
+      /2312\.99999/,
     );
   });
 
@@ -109,5 +109,10 @@ describe('paperResource — additional cases', () => {
     expect(noMatch).toBeDefined();
     // -32001 is JsonRpcErrorCode.NotFound
     expect(noMatch?.code).toBe(-32001);
+    // The ID passed normalization, so its format is not what to recheck (#93).
+    expect(noMatch?.recovery).toBe(
+      'Find the paper with arxiv_search_papers, or recheck the ID against its source; if the ID pins a version, retry without the suffix.',
+    );
+    expect(noMatch?.when).not.toMatch(/format/i);
   });
 });

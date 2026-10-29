@@ -66,6 +66,14 @@ export interface MirrorQuery {
  * - `filter_not_conjunct` — a `cat:` or `submittedDate:` operand sits under an
  *   `OR` or on the right of an `ANDNOT`, where no filter beside the FTS match
  *   expresses it.
+ * - `multiword_author` — an `au:` value of more than one word as the mirror's
+ *   FTS tokenizer splits it (`au:"hinton g"`, `au:J.A.Hinton`, `au:o'brien`), or
+ *   one holding an underscore (`au:del_maestro`), wherever it sits. arXiv
+ *   matches such a value inside one author's name, its words in any order with
+ *   others between them, and reads `_` as a space; the mirror's `authors`
+ *   column is the whole author list as one string, so it matches an ordered
+ *   phrase that can span two authors, and keeps `_` inside a token. A
+ *   hyphenated surname is one word on both paths and stays. See issue #96.
  * - `no_positive_term` — with its filters lifted, the query or a parenthesized
  *   group in it keeps terms only on the right of an `ANDNOT`, which FTS5 cannot
  *   match on their own (`(cat:cs.LG ANDNOT survey) AND transformer` included).
@@ -83,6 +91,7 @@ export type LiveRouteReason =
   | 'empty_query'
   | 'field_not_in_mirror'
   | 'filter_not_conjunct'
+  | 'multiword_author'
   | 'no_positive_term'
   | 'stopword_term'
   | 'unbalanced_parens';
@@ -173,6 +182,36 @@ const STOPWORDS: ReadonlySet<string> = new Set([
   'to',
   'with',
 ]);
+
+/**
+ * A character the mirror's FTS tokenizer keeps inside a token: its
+ * `unicode61 … tokenchars '-_'` (schema.ts) splits on everything but letters,
+ * numbers, private-use characters, `-`, and `_`. A combining mark counts as a
+ * separator here, though the tokenizer folds the Latin diacritics into the
+ * letter before them: a value written decomposed goes live, never the reverse.
+ */
+const FTS_TOKEN_CHAR = /^[\p{L}\p{N}\p{Co}-]$/u;
+
+/**
+ * Whether an `au:` value is more than one word to arXiv: two or more tokens as
+ * the mirror's FTS tokenizer splits them, or an underscore, which arXiv reads as
+ * a space and the tokenizer keeps inside a token. Scans each character once and
+ * stops at the second word.
+ */
+function holdsSeveralWords(value: string): boolean {
+  let words = 0;
+  let inWord = false;
+  for (const ch of value) {
+    if (ch === '_') return true;
+    if (!FTS_TOKEN_CHAR.test(ch)) {
+      inWord = false;
+    } else if (!inWord) {
+      inWord = true;
+      if (++words > 1) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Prefix → `papers_fts` column. Every entry here has to be an indexed column of
@@ -397,6 +436,7 @@ function parse(tokens: readonly Token[]): { root: Node | undefined } | LiveQuery
         if (t.field !== 'cat' && STOPWORDS.has(t.value.trim().toLowerCase())) {
           return live('stopword_term');
         }
+        if (t.field === 'au' && holdsSeveralWords(t.value)) return live('multiword_author');
         attach(
           frame,
           t.field === 'cat'

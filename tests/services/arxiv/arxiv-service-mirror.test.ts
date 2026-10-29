@@ -480,12 +480,12 @@ describe('ArxivService — mirror integration', () => {
     it('reports still-missing IDs when fallback also returns nothing', async () => {
       mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
       const ctx = createMockContext();
-      const result = await service.getPapers(['2401.10001', '9999.99999'], ctx);
+      const result = await service.getPapers(['2401.10001', '2312.99999'], ctx);
 
       expect(mockFetch).toHaveBeenCalledTimes(1);
       expect(result.papers).toHaveLength(1);
       expect(result.papers[0]?.id).toBe('2401.10001v1');
-      expect(result.not_found).toEqual([{ id: '9999.99999', reason: 'not_in_arxiv' }]);
+      expect(result.not_found).toEqual([{ id: '2312.99999', reason: 'not_in_arxiv' }]);
     });
 
     it('skips fallback and reports misses when mirrorFallbackLive=false', async () => {
@@ -565,6 +565,143 @@ describe('ArxivService — mirror integration', () => {
           detail: expect.stringContaining("'hep-th/9901001v3'"),
         },
       ]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // A mirror row reads as the live API returns the paper (#89)
+  // -------------------------------------------------------------------------
+
+  describe('a mirror row in the live form (#89)', () => {
+    /** Add `records` to the seeded mirror, as the harvest writes them. */
+    async function harvest(...records: ArxivRawRecord[]): Promise<void> {
+      const store = await MirrorStore.open(configOverrides.mirrorPath);
+      store.applyBatch(records, []);
+      store.close();
+    }
+
+    it('splits a comma-separated author line into its names', async () => {
+      const result = await service.getPapers(['2401.10001'], createMockContext());
+      expect(result.papers[0]?.authors).toEqual(['Alice Smith', 'Bob Jones']);
+    });
+
+    it.each([
+      [
+        'a closing , and',
+        'Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova',
+        ['Jacob Devlin', 'Ming-Wei Chang', 'Kenton Lee', 'Kristina Toutanova'],
+      ],
+      [
+        'and throughout',
+        'Henan Zhao and Garnett W. Bryant and Wesley Griffin and Judith E. Terrill and Jian Chen',
+        ['Henan Zhao', 'Garnett W. Bryant', 'Wesley Griffin', 'Judith E. Terrill', 'Jian Chen'],
+      ],
+      [
+        'a TeX accent beside and',
+        "Redouane Zamoum and Adeline Cr\\'epieux",
+        ['Redouane Zamoum', 'Adeline Crépieux'],
+      ],
+      [
+        'an affiliation in parentheses',
+        'Geoffrey Hinton (University of Toronto)',
+        ['Geoffrey Hinton'],
+      ],
+      [
+        'an enumerated affiliation list',
+        'Dariush Wahdany (1) and Jesse Cresswell (2) ((1) CISPA Helmholtz Center for Information Security, (2) Layer 6 AI)',
+        ['Dariush Wahdany', 'Jesse Cresswell'],
+      ],
+      ['run-together initials', 'J.A.Hinton & G. E. Hinton', ['J. A. Hinton', 'G. E. Hinton']],
+    ])('lists the authors of a line with %s as arXiv does', async (_case, authors, expected) => {
+      await harvest(mkRecord({ paper_id: '2401.20001', authors }));
+      const result = await service.getPapers(['2401.20001'], createMockContext());
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers[0]?.authors).toEqual(expected);
+    });
+
+    it('returns each name on one line with single spaces, whatever whitespace the stored line holds', async () => {
+      // A row written outside the harvest, which collapses whitespace itself.
+      const db = new Database(configOverrides.mirrorPath);
+      db.run(`UPDATE papers SET authors = ? WHERE id = '2401.10001'`, [
+        'Alice\n  Smith,  Bob\tJones and\r\nCarol   Adams',
+      ]);
+      db.close();
+      const result = await service.getPapers(['2401.10001'], createMockContext());
+      expect(result.papers[0]?.authors).toEqual(['Alice Smith', 'Bob Jones', 'Carol Adams']);
+    });
+
+    it('returns published and updated as the API writes them, whole seconds with no fraction', async () => {
+      await harvest(
+        mkRecord({
+          paper_id: '1810.04805',
+          versions: [
+            { version: 'v1', date: 'Thu, 11 Oct 2018 00:50:01 GMT' },
+            { version: 'v2', date: 'Fri, 24 May 2019 20:37:26 GMT' },
+          ],
+        }),
+      );
+      const result = await service.getPapers(['1810.04805', '2401.10002'], createMockContext());
+      expect(result.papers.map(({ published, updated }) => ({ published, updated }))).toEqual([
+        { published: '2018-10-11T00:50:01Z', updated: '2019-05-24T20:37:26Z' },
+        { published: '2024-01-15T00:00:00Z', updated: '2024-02-20T00:00:00Z' },
+      ]);
+    });
+
+    it('returns the live form from a search page, whose date window and order still read the stored instants', async () => {
+      const result = await service.search(
+        'all:mirror',
+        {
+          sortBy: 'submitted',
+          sortOrder: 'ascending',
+          submittedFrom: '2024-01-15',
+          submittedTo: '2024-01-22',
+        },
+        createMockContext(),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers.map(({ id, published }) => ({ id, published }))).toEqual([
+        { id: '2401.10002v3', published: '2024-01-15T00:00:00Z' },
+        { id: '2401.10001v1', published: '2024-01-22T00:00:00Z' },
+      ]);
+    });
+
+    it('carries the converted text and the split names to both tool surfaces', async () => {
+      await harvest(
+        mkRecord({
+          paper_id: '2504.01540',
+          title: 'From Sm{\\o}r-re-br{\\o}d to Subwords',
+          authors: "O. Barrag\\'an and A. Petralia",
+          abstract: 'Optical (3300-9700 \\AA) spectra of [$\\alpha$/Fe] stars.',
+          comments: '\\copyright 2026 IEEE',
+          versions: [{ version: 'v1', date: 'Wed, 02 Apr 2025 09:15:00 GMT' }],
+        }),
+      );
+      initArxivService({ mirrorSearcher: searchInThread });
+      const result = await runToolContract(arxivGetMetadata, { paper_ids: ['2504.01540'] });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect((result.structuredContent as { papers: unknown[] }).papers[0]).toMatchObject({
+        title: 'From Smør-re-brød to Subwords',
+        authors: ['O. Barragán', 'A. Petralia'],
+        abstract: 'Optical (3300-9700 Å) spectra of [$α$/Fe] stars.',
+        comment: '©2026 IEEE',
+        published: '2025-04-02T09:15:00Z',
+        updated: '2025-04-02T09:15:00Z',
+      });
+      const text = result.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n');
+      for (const value of [
+        'Smør-re-brød',
+        'O. Barragán',
+        'A. Petralia',
+        'Å',
+        '©2026',
+        '2025-04-02T09:15:00Z',
+      ]) {
+        expect(text).toContain(value);
+      }
+      expect(text).not.toContain('.000Z');
+      expect(mockFetch).not.toHaveBeenCalled();
     });
   });
 
@@ -987,7 +1124,7 @@ describe('ArxivService — mirror integration', () => {
       mockLiveDownButHtmlUp();
       const ctx = createMockContext({ errors: arxivReadPaper.errors! });
 
-      await expect(service.readContent('9999.99999v1', {}, ctx)).rejects.toMatchObject({
+      await expect(service.readContent('2312.99999v1', {}, ctx)).rejects.toMatchObject({
         code: JsonRpcErrorCode.RateLimited,
         data: { reason: 'rate_limited' },
       });
@@ -1917,7 +2054,7 @@ describe('ArxivService — mirror integration', () => {
         ['(cat:cs.LG OR cat:cs.AI) AND transformer', ['2403.10001', '2403.10002', '2403.10004']],
         // The cat: sits on the left of the ANDNOT, so it is a conjunct and the
         // ANDNOT keeps excluding the surveys.
-        ['au:"hinton g" AND cat:cs.LG ANDNOT ti:survey', ['2403.10002']],
+        ['au:hinton AND cat:cs.LG ANDNOT ti:survey', ['2403.10002']],
         [
           'transformer AND submittedDate:[202001010000 TO 202101010000]',
           ['2403.10001', '2403.10004'],
@@ -2035,7 +2172,7 @@ describe('ArxivService — mirror integration', () => {
       it('reports the mirror answer through the tool’s structured and text output', async () => {
         initArxivService({ mirrorSearcher: searchInThread });
         const result = await runToolContract(arxivSearchPapers, {
-          query: 'au:"hinton g" AND cat:cs.LG ANDNOT ti:survey',
+          query: 'au:hinton AND cat:cs.LG ANDNOT ti:survey',
           max_results: 10,
         });
 
@@ -2173,6 +2310,10 @@ describe('ArxivService — mirror integration', () => {
         // A date filter the mirror cannot apply, read as terms it would match on.
         ['ti:quantum AND (lastUpdatedDate:[202410010000 TO 202410012359])', 'field_not_in_mirror'],
         ['ti:quantum AND submittedDate:[2024 TO 2025]', 'field_not_in_mirror'],
+        // An au: value of several words: arXiv matches it inside one author's
+        // name, the mirror across the whole author list (#96).
+        ['au:"hinton g" AND cat:cs.LG', 'multiword_author'],
+        ['quantum OR au:del_maestro', 'multiword_author'],
       ])('sends %s to the live API without consulting the mirror (%s)', async (query, reason) => {
         serveLivePaper();
         const stateSpy = vi.spyOn(MirrorStore.prototype, 'readHarvestState');
@@ -2208,6 +2349,7 @@ describe('ArxivService — mirror integration', () => {
         'quantum AND cat:zzz*',
         '(quantum of computing) AND ti:annealing',
         'ti:quantum AND (lastUpdatedDate:[202410010000 TO 202410012359])',
+        'au:"hinton g"',
       ])('returns a failed recency bypass for %s, never a mirror answer', async (query) => {
         configOverrides.mirrorRecentDaysLive = 2;
         mockFetch.mockResolvedValue(
@@ -2243,6 +2385,7 @@ describe('ArxivService — mirror integration', () => {
         'quantum AND cat:zzz*',
         '(quantum of computing) AND ti:annealing',
         'ti:quantum AND (lastUpdatedDate:[202410010000 TO 202410012359])',
+        'au:"hinton g"',
       ])('refuses start 10,000 for %s before any request', async (query) => {
         await expect(
           service.search(query, { start: 10_000 }, createMockContext()),
@@ -2267,6 +2410,67 @@ describe('ArxivService — mirror integration', () => {
         expect(structured.papers.map((p) => p.id)).toEqual(['2402.99999v1']);
         const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
         expect(text).toContain('2402.99999v1');
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Issue #96 — arXiv matches an au: value of several words inside one
+    // author's name, in any order. The mirror's authors column is the whole
+    // author list as one string, where a phrase can span two authors, so such a
+    // value goes live; a one-word value stays.
+    // -----------------------------------------------------------------------
+
+    describe('au: values of more than one word (#96)', () => {
+      beforeEach(async () => {
+        const store = await MirrorStore.open(configOverrides.mirrorPath);
+        store.applyBatch(
+          [
+            // `Hinton` ends one author and `G` starts the next, as in astro-ph/0604411.
+            mkRecord({
+              paper_id: '2405.10001',
+              title: 'Gamma-ray binaries',
+              authors: 'J. A. Hinton, G. Hermann',
+              categories: 'astro-ph.HE',
+            }),
+            mkRecord({
+              paper_id: '2405.10002',
+              title: 'Deep belief networks',
+              authors: 'Geoffrey E. Hinton',
+              categories: 'cs.LG',
+            }),
+          ],
+          [],
+        );
+        store.close();
+      });
+
+      it('reports the live answer to au:"hinton g" through the tool’s structured and text output, never a paper whose authors only span it', async () => {
+        serveLivePaper();
+        initArxivService({ mirrorSearcher: searchInThread });
+        const result = await runToolContract(arxivSearchPapers, {
+          query: 'au:"hinton g"',
+          max_results: 10,
+        });
+
+        expect(result.isError, JSON.stringify(result)).toBeFalsy();
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
+        expect(url.searchParams.get('search_query')).toBe('au:"hinton g"');
+        const structured = result.structuredContent as { papers: { id: string }[] };
+        expect(structured.papers.map((p) => p.id)).toEqual(['2402.99999v1']);
+        const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(text).toContain('2402.99999v1');
+        expect(text).toContain('From Live API');
+        expect(text).not.toContain('2405.10001');
+      });
+
+      it.each([
+        ['au:hinton AND cat:cs.LG', ['2405.10002v1']],
+        ['au:hinton', ['2405.10001v1', '2405.10002v1']],
+      ])('answers %s from the mirror', async (query, expected) => {
+        const result = await service.search(query, { maxResults: 10 }, createMockContext());
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(result.papers.map((p) => p.id).sort()).toEqual(expected);
       });
     });
 

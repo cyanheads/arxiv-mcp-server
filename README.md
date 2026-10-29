@@ -61,7 +61,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 
 ### `arxiv_get_metadata` <sub>tool</sub>
 
-- Takes up to 100 IDs and looks up the first 10; the rest come back in `remaining_ids` for the next call's `paper_ids`
+- Takes up to 100 IDs and looks up the first 10 distinct ones; the rest come back in `remaining_ids` for the next call's `paper_ids`. An ID repeated in any accepted spelling is looked up once, while different versions of one paper stay separate
 - Accepts versioned (`2401.12345v2`), unversioned, and pre-2007 (`hep-th/9901001`) IDs, with an optional `arXiv:` prefix or an arxiv.org `abs` / `pdf` / `html` URL
 - Returns found papers plus a typed `not_found[]` (`not_in_arxiv` / `version_not_in_mirror` / `version_not_served` / `live_lookup_failed` / `invalid_id`) for the rest; `version_not_served` is a superseded pre-2007 version arXiv's API answers HTTP 500 for, and its `detail` names the latest version. With the local mirror, `live_lookup_failed` marks an ID the mirror lacked whose live lookup failed; the papers the mirror served still come back
 - Fails `invalid_id` when no ID is well-formed, `no_match` when every ID misses, `version_unavailable` when a version is reachable only on the live API, and `version_not_served` when every ID is a version arXiv will not serve
@@ -74,7 +74,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 - ar5iv keeps one render per paper, so an ar5iv body may be another revision than `paper_id` and carries `revision_unconfirmed: true`, unless the read named no version and arXiv's API reported v1 as the paper's only version; `pdf_url` is exactly the `paper_id` revision
 - `max_characters` defaults to 100,000 (pass `null` for the whole paper); page with `start`. The first page carries an `outline` of section headings with offsets
 - `paper_id` accepts the same ID spellings as `arxiv_get_metadata`
-- Fails `invalid_id`, `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (the PDF has no text layer or does not parse), `version_unavailable` (version-pinned ID needs the live API), or `version_not_served` (a superseded pre-2007 version arXiv will not serve; names the latest version and this version's PDF)
+- Fails `invalid_id`, `no_match` (arXiv has no such paper, or no such version of it), `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (the PDF has no text layer or does not parse), `version_unavailable` (version-pinned ID needs the live API), or `version_not_served` (a superseded pre-2007 version arXiv will not serve; names the latest version and this version's PDF)
 
 ---
 
@@ -261,27 +261,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Optional: local mirror
 
-For self-hosted deployments behind a single egress IP, arXiv's ~3-second crawl delay serializes concurrent users. An optional local mirror removes that rate-limit exposure for `arxiv_search_papers` and `arxiv_get_metadata` by serving from a SQLite + FTS5 store harvested via OAI-PMH. `arxiv_read_paper` always fetches the body live — full-content harvesting is against arXiv's data policy — and takes its metadata from the mirror only when the live lookup fails or, for an ID without a version, is still pending after `ARXIV_API_TIMEOUT_MS`, reading the stored version, which can trail arXiv's latest until the next refresh.
-
-Disabled by default. To enable:
-
-```sh
-# 1. Cold-start harvest (~4.4h sequential). One-time per installation.
-#    Waits out arXiv outages; Ctrl+C stops it, and a rerun resumes from its checkpoint.
-bun run mirror:init
-
-# 2. Enable the mirror.
-export ARXIV_MIRROR_ENABLED=true
-
-# 3. Start the server — reads switch to the mirror once the harvest completes.
-bun run start:http
-```
-
-From an npm install, the `mirror:*` commands belong to the package rather than your project: run them in the package directory (`bun run --cwd node_modules/@cyanheads/arxiv-mcp-server mirror:init`), or run a script directly from your project root (`bun node_modules/@cyanheads/arxiv-mcp-server/scripts/arxiv-mirror-init.ts`). Set `ARXIV_MIRROR_PATH` to an absolute path outside `node_modules`, the same one the server reads, so a reinstall leaves the mirror in place.
-
-Keep it current with `bun run mirror:refresh` (cron/systemd/launchd, or `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode) and check it with `bun run mirror:verify`. An interrupted refresh picks up on the next run at the last datestamp it checkpointed, re-reading that day; when the in-process refresh runs out of its `ARXIV_MIRROR_REFRESH_TIMEOUT_MS` budget before leaving the day it started on, the next run resumes where it stopped instead. When a release changes the mirror's schema, the server answers from the live API until a writer migrates the file in place, with no re-harvest: with `ARXIV_MIRROR_REFRESH_CRON` in HTTP mode the server starts that refresh itself; otherwise run `bun run mirror:refresh` or `bun run mirror:verify`. One writer migrates the file at a time: a mirror command started meanwhile changes nothing and exits 75, naming the process that holds the migration, so run it again once that finishes. A schema v3 mirror migrates to v4 this way on the next writer open: it adds a column to the category table, fills it, and rebuilds five date indexes. On a full-size mirror that takes minutes, not seconds (about five minutes), and it needs free disk for a WAL that peaks near 450 MB and a file that grows about 9%. A schema v4 mirror migrates to v5 the same way: it rewrites each paper whose text holds `&#39;` or `&#34;` with the quote characters, about 1.2 million of 3.2 million papers, then rebuilds the category index searches use, in about 4.5 to 7.5 minutes on a full-size mirror depending on host load, with a WAL that peaks near 160 MB and a file that grows about 10%. Rolling back to 1.7.1 or earlier and refreshing stores those references again in each paper the refresh rewrites; after rolling forward, run `UPDATE schema_version SET version = 4` on the file and then `bun run mirror:verify` to repeat the repair.
-
-Mirror search ranks with FTS5 BM25, so `sort_by=relevance` returns a different top set than the live API. A mirror search with no free-text term counts exactly when it filters on one category code; one that spans several codes (`cat:cs`, two categories) or a submitted-date window alone stops counting at 50,000, and a total that reaches it comes with `totalFoundIsLowerBound: true`, meaning 50,000 or more. Searches that go to the live API instead: `sort_by=submitted` descending (while `ARXIV_MIRROR_RECENT_DAYS_LIVE` is positive), searches whose free-text terms match 50,000 or more papers, queries with a `cat:` or `submittedDate:` operand the mirror cannot apply as a filter (one joined to the rest by `OR` or by a space, or on the right of an `ANDNOT`) or that leave only `ANDNOT` terms once those operands are taken out, queries with unbalanced parentheses, a field prefix with no value (`ti: x`, `ti:`), an empty quoted phrase, or nothing left to match (`()`), queries with an `rn:`, `id:`, or `lastUpdatedDate:` operand or a malformed `submittedDate:`, queries with a word arXiv's index drops (`of`, `the`, `and`, …) outside a longer quoted phrase, a `cat:` wildcard that names no category (`cat:zzz.*`), and version-pinned requests (the mirror holds only the latest version).
+For self-hosted deployments behind one egress IP, an optional SQLite + FTS5 mirror of arXiv's OAI-PMH metadata serves `arxiv_search_papers` and `arxiv_get_metadata` locally, so concurrent users stop queueing behind arXiv's 3-second crawl delay; `arxiv_read_paper` still fetches paper text live. Harvest it once with `bun run mirror:init` (~4.4h), then set `ARXIV_MIRROR_ENABLED=true`. Running it from an npm install, scheduling refreshes, schema upgrades, and where mirror search differs from the live API are covered in [docs/mirror.md](./docs/mirror.md).
 
 ### Docker
 
@@ -305,7 +285,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `skills/arxiv-guide` | Agent skill published to agents that install the server, and served over MCP: citation-to-ID resolution, search gates, version and section-by-section reading workflows. |
 | `scripts/arxiv-mirror-*.ts` | Mirror lifecycle scripts (`init`, `refresh`, `verify`); `scripts/tsconfig.json` resolves their `@/` imports to `src/`, or to `dist/` in an install. |
 | `tests/` | Unit and integration tests. |
-| `docs/` | Design document and directory structure. |
+| `docs/` | Design document, local mirror guide, and directory structure. |
 
 ## Development guide
 

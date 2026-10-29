@@ -4,7 +4,8 @@
  * and migration idempotency. Also covers the v2→v3 index rebuild (issue #37),
  * the v3→v4 junction backfill and date-index rebuild (issue #78), the v4→v5
  * repair of the quote references a pre-v5 harvester stored (issue #88) and its
- * redefinition of the junction's paper_id index (issue #85),
+ * redefinition of the junction's paper_id index (issue #85), the v5→v6
+ * conversion of the TeX a pre-v6 harvester stored (issue #89),
  * the one-writer guard on migrating and creating a file (issue #71),
  * sort-order correctness (issue #18), and index-backed category COUNT
  * (issue #19).
@@ -12,18 +13,22 @@
  */
 
 import { type ChildProcess, spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { parseListRecords } from '@/services/arxiv/mirror/harvester.js';
 import {
   MIRROR_PAPER_ID_INDEX,
   MIRROR_PRAGMA_STATEMENTS,
   MIRROR_SCHEMA_STATEMENTS,
   MIRROR_SCHEMA_VERSION,
   MIRROR_V4_STATEMENTS,
+  MIRROR_V5_STATEMENTS,
 } from '@/services/arxiv/mirror/schema.js';
 import { MirrorStore, normalizeDateToIso, rawToRow } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
@@ -755,7 +760,9 @@ describe('v2→v3 migration (#37)', () => {
         data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 2 },
       });
       expect((failure as McpError).message).toMatch(
-        /from schema v2 to v5 by another writer \(pid 4242, .*changed nothing\. Run it again once that migration finishes\./,
+        new RegExp(
+          `from schema v2 to v${MIRROR_SCHEMA_VERSION} by another writer \\(pid 4242, .*changed nothing\\. Run it again once that migration finishes\\.`,
+        ),
       );
       expect(batches).toBe(0);
       expect(await ftsColumns()).toEqual(['title', 'authors', 'abstract']);
@@ -1275,7 +1282,9 @@ describe('v3→v4 migration (#78)', () => {
       code: JsonRpcErrorCode.Conflict,
       data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 3 },
     });
-    expect((failure as McpError).message).toMatch(/from schema v3 to v5 by another writer/);
+    expect((failure as McpError).message).toContain(
+      `from schema v3 to v${MIRROR_SCHEMA_VERSION} by another writer`,
+    );
     expect(await inspect()).toMatchObject({
       junctionColumns: ['category', 'paper_id', 'updated'],
       leases: ['another-writer'],
@@ -1379,7 +1388,11 @@ describe('v3→v4 migration (#78)', () => {
     });
 
     expect(backfillsOnResume).toBe(0);
-    expect(await inspect()).toMatchObject({ leases: [], unfilled: 0, version: 5 });
+    expect(await inspect()).toMatchObject({
+      leases: [],
+      unfilled: 0,
+      version: MIRROR_SCHEMA_VERSION,
+    });
     const check = new Database(dbPath, { readonly: true });
     expect(check.query(`SELECT title FROM papers WHERE id = '2401.00001'`).get()).toEqual({
       title: "Agents' interactions",
@@ -1580,7 +1593,11 @@ describe('v4→v5 migration (#88, #85)', () => {
     expect(
       after.papers.filter((r) => String(r.abstract).includes('&#8722;1 &amp; &lt;x&gt;')),
     ).toHaveLength(3_000);
-    expect(await fileState()).toEqual({ ftsIntegrity: 'ok', leases: [], version: 5 });
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
 
     expect(await ftsCount('title:"don\'t"')).toBe(4_000);
     // The token now stands only for itself: paper 39's title.
@@ -1608,7 +1625,11 @@ describe('v4→v5 migration (#88, #85)', () => {
       (await MirrorStore.open(dbPath)).close();
     });
     expect(lines).toEqual([]);
-    expect(await fileState()).toEqual({ ftsIntegrity: 'ok', leases: [], version: 5 });
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
   });
 
   it('resumes an interrupted repair, leaving the rows it already repaired untouched', async () => {
@@ -1652,7 +1673,11 @@ describe('v4→v5 migration (#88, #85)', () => {
     expect(quotedPastFirstBatch).toHaveLength(4_471);
     expect(updated).toEqual(quotedPastFirstBatch);
     expect((await rows()).papers).toEqual(before.papers.map(repaired));
-    expect(await fileState()).toEqual({ ftsIntegrity: 'ok', leases: [], version: 5 });
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
 
     // A file that reached v5 runs no repair again.
     const rerun = await repairLines(async () => {
@@ -1673,7 +1698,9 @@ describe('v4→v5 migration (#88, #85)', () => {
       code: JsonRpcErrorCode.Conflict,
       data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 4 },
     });
-    expect((failure as McpError).message).toMatch(/from schema v4 to v5 by another writer/);
+    expect((failure as McpError).message).toContain(
+      `from schema v4 to v${MIRROR_SCHEMA_VERSION} by another writer`,
+    );
     expect(await rows()).toEqual(before);
     expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 4 });
   });
@@ -1812,7 +1839,11 @@ describe('v4→v5 migration (#88, #85)', () => {
         sql: MIRROR_PAPER_ID_INDEX[1],
       });
       expect(await paperIdIndex()).toEqual(await paperIdIndex(freshPath));
-      expect(await fileState()).toEqual({ ftsIntegrity: 'ok', leases: [], version: 5 });
+      expect(await fileState()).toEqual({
+        ftsIntegrity: 'ok',
+        leases: [],
+        version: MIRROR_SCHEMA_VERSION,
+      });
       const store = await MirrorStore.open(dbPath);
       expect(store.checkSchemaObjects().filter((o) => o.status !== 'ok')).toEqual([]);
       store.close();
@@ -1847,7 +1878,11 @@ describe('v4→v5 migration (#88, #85)', () => {
         columns: ['paper_id', 'category'],
         sql: MIRROR_PAPER_ID_INDEX[1],
       });
-      expect(await fileState()).toEqual({ ftsIntegrity: 'ok', leases: [], version: 5 });
+      expect(await fileState()).toEqual({
+        ftsIntegrity: 'ok',
+        leases: [],
+        version: MIRROR_SCHEMA_VERSION,
+      });
     });
 
     it('leaves the index as it was when the lease is lost before its transaction', async () => {
@@ -1873,6 +1908,387 @@ describe('v4→v5 migration (#88, #85)', () => {
       });
       expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 4 });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v5 → v6 migration (issue #89) — the TeX a pre-v6 harvester stored in the
+// text columns, converted to Unicode in place.
+// ---------------------------------------------------------------------------
+
+describe('v5→v6 migration (#89)', () => {
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-migration-v6-test-'));
+    dbPath = join(dir, 'mirror.db');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  type Row = Record<string, string | number | null>;
+
+  /** A v5 file as a pre-v6 writer left it: the schema through v5, schema_version 5, no papers. */
+  async function buildV5Schema(): Promise<void> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    for (const sql of [
+      ...MIRROR_PRAGMA_STATEMENTS,
+      ...MIRROR_SCHEMA_STATEMENTS,
+      ...MIRROR_V4_STATEMENTS,
+      ...MIRROR_V5_STATEMENTS,
+    ]) {
+      db.prepare(sql).run();
+    }
+    db.prepare(
+      `INSERT INTO schema_version(version, applied_at) VALUES (5, '2026-10-25T00:00:00.000Z')`,
+    ).run();
+    db.close();
+  }
+
+  /**
+   * A v5 mirror of `count` papers with TeX as a pre-v6 harvester stored it,
+   * written through the live FTS triggers: the title of every 3rd paper, the
+   * authors of every 5th, the abstract of every 7th, the comment of every 11th,
+   * and the journal ref of every 13th hold TeX the conversion rewrites. Every
+   * 4th abstract holds math it leaves as written, and every 17th DOI a TeX
+   * accent, which is not a converted column.
+   */
+  async function buildV5Db(count: number): Promise<void> {
+    await buildV5Schema();
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+       INSERT INTO papers(id, version, title, authors, abstract, primary_category, categories,
+                          published, updated, latest_version, comment, journal_ref, doi)
+       SELECT printf('2401.%05d', i), '1',
+              'Paper ' || i || CASE WHEN i % 3 = 0 THEN ' from Sm{\\o}r-re-br{\\o}d' ELSE '' END,
+              CASE WHEN i % 5 = 0 THEN 'O. Barrag\\''an and A. Petralia' ELSE 'A. Author' END,
+              'Abstract ' || i
+                || CASE WHEN i % 7 = 0 THEN ' at (3300-9700 \\AA)' ELSE '' END
+                || CASE WHEN i % 4 = 0 THEN ' over $\\mathbb{R}^3$' ELSE '' END,
+              'cs.LG', 'cs.LG math.AP',
+              '2024-01-01T00:00:00.000Z', '2024-01-02T00:00:00.000Z', '2024-01-02T00:00:00.000Z',
+              CASE WHEN i % 11 = 0 THEN '\\copyright 2026 IEEE' WHEN i % 2 = 0 THEN '12 pages' END,
+              CASE WHEN i % 13 = 0 THEN 'Proc. Vald\\''es 3 (1999)' END,
+              CASE WHEN i % 17 = 0 THEN '10.1/a\\''b' END
+       FROM n`,
+    ).run(count);
+    for (const code of ['cs.LG', 'math.AP']) {
+      db.prepare(
+        `INSERT INTO paper_categories(category, paper_id, updated, published)
+         SELECT ?, id, updated, published FROM papers`,
+      ).run(code);
+    }
+    db.close();
+  }
+
+  /** Whether paper `i` of {@link buildV5Db} holds TeX the conversion rewrites. */
+  const changes = (i: number) => [3, 5, 7, 11, 13].some((d) => i % d === 0);
+  const changedUpTo = (n: number) =>
+    Array.from({ length: n }, (_, k) => k + 1).filter(changes).length;
+
+  /** `row` as arXiv's conversion leaves it, written out by hand for the five TeX forms. */
+  const converted = (row: Row): Row => ({
+    ...row,
+    title: String(row.title).replace('Sm{\\o}r-re-br{\\o}d', 'Smør-re-brød'),
+    authors: String(row.authors).replace("Barrag\\'an", 'Barragán'),
+    abstract: String(row.abstract).replace('\\AA', 'Å'),
+    comment: row.comment === null ? null : String(row.comment).replace('\\copyright ', '©'),
+    journal_ref:
+      row.journal_ref === null ? null : String(row.journal_ref).replace("Vald\\'es", 'Valdés'),
+  });
+
+  async function rows(): Promise<{ junction: Row[]; papers: Row[] }> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath, { readonly: true });
+    const result = {
+      papers: db.query('SELECT rowid, * FROM papers ORDER BY rowid').all() as Row[],
+      junction: db.query('SELECT rowid, * FROM paper_categories ORDER BY rowid').all() as Row[],
+    };
+    db.close();
+    return result;
+  }
+
+  async function fileState(): Promise<{
+    ftsIntegrity: string;
+    leases: string[];
+    version: number | undefined;
+  }> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    let ftsIntegrity = 'ok';
+    try {
+      db.run(`INSERT INTO papers_fts(papers_fts, rank) VALUES ('integrity-check', 1)`);
+    } catch (err) {
+      ftsIntegrity = String((err as { code?: string }).code ?? err);
+    }
+    const leases = (
+      db.query('SELECT holder FROM migration_lease').all() as { holder: string }[]
+    ).map((l) => l.holder);
+    const version = (db.query('SELECT version FROM schema_version').get() as { version: number })
+      ?.version;
+    db.close();
+    return { ftsIntegrity, leases, version };
+  }
+
+  async function ftsCount(matchExpr: string): Promise<number> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath, { readonly: true });
+    const { n } = db
+      .query('SELECT COUNT(*) AS n FROM papers_fts WHERE papers_fts MATCH ?')
+      .get(matchExpr) as { n: number };
+    db.close();
+    return n;
+  }
+
+  /** Run `fn`, returning the conversion's progress lines it wrote to stdout. */
+  async function conversionLines(fn: () => Promise<unknown>): Promise<string[]> {
+    const writes = vi.spyOn(process.stdout, 'write');
+    try {
+      await fn();
+      return writes.mock.calls.map(([chunk]) => String(chunk)).filter((l) => l.includes('v5→v6'));
+    } finally {
+      writes.mockRestore();
+    }
+  }
+
+  const PAPERS = 12_000;
+
+  it('converts every row that changes in place, one 5,000-row batch at a time, and leaves every other byte as it was', async () => {
+    await buildV5Db(PAPERS);
+    const before = await rows();
+    expect(changedUpTo(PAPERS)).toBe(7_397);
+    expect(await ftsCount('authors:barragan')).toBe(0);
+    expect(await ftsCount('title:"Smør-re-brød"')).toBe(0);
+
+    const lines = await conversionLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    expect(lines).toEqual([
+      `mirror migration v5→v6 (TeX to Unicode): 5000/12000 rows, ${changedUpTo(5_000)} rewritten\n`,
+      `mirror migration v5→v6 (TeX to Unicode): 10000/12000 rows, ${changedUpTo(10_000)} rewritten\n`,
+      'mirror migration v5→v6 (TeX to Unicode): 12000/12000 rows, 7397 rewritten\n',
+    ]);
+    const after = await rows();
+    expect(after.papers).toEqual(before.papers.map(converted));
+    const rewritten = after.papers.filter(
+      (row, k) => JSON.stringify(row) !== JSON.stringify(before.papers[k]),
+    );
+    expect(rewritten).toHaveLength(7_397);
+    expect(after.junction).toEqual(before.junction);
+    // Math the conversion leaves, and a DOI it never reads, stay as written.
+    expect(after.papers.filter((r) => String(r.abstract).includes('$\\mathbb{R}^3$'))).toHaveLength(
+      3_000,
+    );
+    expect(after.papers.filter((r) => r.doi === "10.1/a\\'b")).toHaveLength(705);
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
+
+    // The index holds the converted text: diacritic folding meets both spellings.
+    expect(await ftsCount('authors:barragan')).toBe(2_400);
+    expect(await ftsCount('authors:"Barragán"')).toBe(2_400);
+    expect(await ftsCount('title:"Smør-re-brød"')).toBe(4_000);
+    expect(await ftsCount('abstract:"3300-9700 Å"')).toBe(1_714);
+    const opened = await MirrorStore.openReader(dbPath);
+    if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+    expect(
+      opened.store.search({
+        matchExpr: 'authors:barragan',
+        limit: 1,
+        offset: 0,
+        sortBy: 'published',
+        sortOrder: 'ascending',
+      }),
+    ).toMatchObject({
+      total: 2_400,
+      papers: [{ id: '2401.00005', authors: 'O. Barragán and A. Petralia' }],
+    });
+    opened.store.close();
+  });
+
+  it('rewrites each captured arXivRaw row to what the harvest now stores for its record', async () => {
+    const fixtures = fileURLToPath(new URL('../../../fixtures/arxiv-metadata/', import.meta.url));
+    const records = parseListRecords(
+      gunzipSync(readFileSync(join(fixtures, 'oai-arxivraw.xml.gz'))).toString('utf8'),
+    ).records;
+    expect(records).toHaveLength(174);
+    const collapse = (text: string) => text.replace(/\s+/g, ' ').trim();
+    await buildV5Schema();
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    // The row a pre-v6 harvester stored: whitespace collapsed, TeX as written.
+    const insert = db.prepare(
+      `INSERT INTO papers(id, version, title, authors, abstract, primary_category, categories,
+                          published, updated, latest_version, comment, journal_ref, doi)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const record of records) {
+      const row = rawToRow(record);
+      insert.run(
+        row.id,
+        row.version,
+        collapse(record.title),
+        collapse(record.authors),
+        collapse(record.abstract),
+        row.primary_category,
+        row.categories,
+        row.published,
+        row.updated,
+        row.latest_version,
+        record.comments ? collapse(record.comments) : null,
+        record.journal_ref ? collapse(record.journal_ref) : null,
+        row.doi ?? null,
+      );
+    }
+    db.close();
+    const before = await rows();
+
+    const lines = await conversionLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    const after = await rows();
+    const byId = new Map(records.map((record) => [record.paper_id, rawToRow(record)]));
+    let rewritten = 0;
+    for (const [k, row] of after.papers.entries()) {
+      const expected = byId.get(String(row.id));
+      expect(row, String(row.id)).toMatchObject({
+        title: expected?.title,
+        authors: expected?.authors,
+        abstract: expected?.abstract,
+        comment: expected?.comment ?? null,
+        journal_ref: expected?.journal_ref ?? null,
+        doi: expected?.doi ?? null,
+      });
+      if (JSON.stringify(row) !== JSON.stringify(before.papers[k])) rewritten++;
+    }
+    expect(rewritten).toBe(88);
+    expect(lines).toEqual([
+      'mirror migration v5→v6 (TeX to Unicode): 174/174 rows, 88 rewritten\n',
+    ]);
+    expect(await fileState()).toMatchObject({ ftsIntegrity: 'ok', version: MIRROR_SCHEMA_VERSION });
+  });
+
+  it('runs no conversion on a file it creates', async () => {
+    const lines = await conversionLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+    expect(lines).toEqual([]);
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
+  });
+
+  it('resumes an interrupted conversion, rewriting no row it already converted', async () => {
+    await buildV5Db(PAPERS);
+    const before = await rows();
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    raw.run(`CREATE TRIGGER fail_convert BEFORE UPDATE ON papers WHEN old.rowid > 5000 BEGIN
+      SELECT RAISE(ABORT, 'simulated conversion failure');
+    END`);
+    raw.close();
+
+    const failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+
+    expect(failure).toMatchObject({ code: JsonRpcErrorCode.DatabaseError });
+    expect(String((failure as McpError).cause)).toMatch(/simulated conversion failure/);
+    expect(await fileState()).toMatchObject({ leases: [], version: 5 });
+    const partial = (await rows()).papers;
+    expect(partial.slice(0, 5_000)).toEqual(before.papers.slice(0, 5_000).map(converted));
+    expect(partial.slice(5_000)).toEqual(before.papers.slice(5_000));
+
+    const fix = new Database(dbPath);
+    fix.exec(`
+      DROP TRIGGER fail_convert;
+      CREATE TABLE update_log (row INTEGER NOT NULL);
+      CREATE TRIGGER log_update AFTER UPDATE ON papers BEGIN
+        INSERT INTO update_log(row) VALUES (old.rowid);
+      END;
+    `);
+    fix.close();
+    (await MirrorStore.open(dbPath)).close();
+
+    const log = new Database(dbPath, { readonly: true });
+    const updated = (
+      log.query('SELECT row FROM update_log ORDER BY row').all() as { row: number }[]
+    ).map((r) => r.row);
+    log.close();
+    const changingPastFirstBatch = Array.from(
+      { length: PAPERS - 5_000 },
+      (_, k) => k + 5_001,
+    ).filter(changes);
+    expect(changingPastFirstBatch).toHaveLength(4_315);
+    expect(updated).toEqual(changingPastFirstBatch);
+    expect((await rows()).papers).toEqual(before.papers.map(converted));
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
+
+    // A file that reached v6 runs no conversion again.
+    const rerun = await conversionLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+    expect(rerun).toEqual([]);
+  });
+
+  it('changes nothing and names the holder when another writer holds a live lease', async () => {
+    await buildV5Db(10);
+    const before = await rows();
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    raw.run(
+      `INSERT OR REPLACE INTO migration_lease(id, holder, pid, started_at, renewed_at)
+       VALUES (1, 'another-writer', 4242, '2026-01-01T00:00:00.000Z', ?)`,
+      [new Date().toISOString()],
+    );
+    raw.close();
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'migrating', version: 5 });
+
+    const failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+
+    expect(failure).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 5 },
+    });
+    expect((failure as McpError).message).toContain('from schema v5 to v6 by another writer');
+    expect(await rows()).toEqual(before);
+    expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 5 });
+  });
+
+  it('fences each batch: a writer whose lease another writer took over stops after the batch that lost it', async () => {
+    await buildV5Db(PAPERS);
+    const before = await rows();
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    raw.run(`CREATE TRIGGER steal_lease AFTER UPDATE OF renewed_at ON migration_lease BEGIN
+      UPDATE migration_lease SET holder = 'another-writer', pid = 4242 WHERE id = 1;
+    END`);
+    raw.close();
+
+    const failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+
+    expect(failure).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'migration_lease_lost', holderPid: 4242 },
+    });
+    const partial = (await rows()).papers;
+    expect(partial.slice(0, 5_000)).toEqual(before.papers.slice(0, 5_000).map(converted));
+    expect(partial.slice(5_000)).toEqual(before.papers.slice(5_000));
+    expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 5 });
   });
 });
 

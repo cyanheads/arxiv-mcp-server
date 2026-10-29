@@ -47,10 +47,16 @@
  *     the harvest runner gave its `(paper_id)` index, so a term-less search
  *     probes a group of any size with one seek per candidate. See
  *     {@link MIRROR_PAPER_ID_INDEX}.
+ *
+ * v6 changes (issue #89):
+ *   - `title`, `authors`, `abstract`, `comment`, and `journal_ref` hold text
+ *     after arXiv's TeX-to-Unicode conversion (`tex2utf.ts`), as the arXiv API
+ *     serves it; the migration converts the rows a pre-v6 harvester stored with
+ *     TeX in place (`convertTexText` in `store.ts`). No DDL changes.
  * @module services/arxiv/mirror/schema
  */
 
-export const MIRROR_SCHEMA_VERSION = 5;
+export const MIRROR_SCHEMA_VERSION = 6;
 
 /**
  * The FTS5 index and its `papers` sync triggers. Split out of the main schema

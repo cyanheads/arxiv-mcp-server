@@ -4,7 +4,7 @@ description: Resolve citations to arXiv IDs, find an author's papers, follow a p
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -32,7 +32,7 @@ A paper's `doi` field is the journal version's DOI, never arXiv's. The `id` the 
 ## Gates
 
 - **Missing `journal_ref` or `doi` does not mean unpublished.** Authors add both by hand, and many never do: 1706.03762, a NeurIPS 2017 paper, has neither. arXiv tells authors to put acceptance notes in `comment` instead (1206.4635's reads "ICML2012"). Check `comment`, then a scholarly-graph server, before calling a paper unpublished.
-- **A quoted full name can miss name variants.** Author strings are free text that differ from paper to paper: middle initials come and go, and some carry an affiliation in parentheses. How a quoted author phrase matches those variants also differs between deployments, so the same quoted name can return different papers on two servers while the surname alone returns the same set. For an author's papers, search the surname alone, narrow with a category, a topic word, or a co-author's surname, then check each `authors` list yourself. arXiv has no author identifiers, so one name can be several people: confirm by co-authors and subject.
+- **A quoted full name can miss name variants.** Author names are free text that differ from paper to paper: middle initials come and go. A quoted name such as `au:"geoffrey hinton"` matches a paper when one author's name holds every quoted word, in any order and with other words between them, so `Geoffrey E. Hinton` matches; an initial does not match a spelled-out first name, so `au:"hinton g"` misses him. For an author's papers, search the surname alone, narrow with a category, a topic word, or a co-author's surname, then check each `authors` list yourself. arXiv has no author identifiers, so one name can be several people: confirm by co-authors and subject.
 - **A category filter includes cross-lists.** `cat:cs.LG`, or `cs.LG` as `category`, matches every paper listing cs.LG in `categories`, primary or not: 1206.6445, primary cs.CV, comes back for cs.LG. For a field's own papers, keep those whose `primary_category` matches.
 - **The date window is the first version's date.** `submitted_from` and `submitted_to` filter on `published`, the v1 submission: a paper posted in 2022 and revised in 2024 falls outside a 2024 window. To find recent revisions, sort by `updated`.
 - **A citation's year is the venue's, not arXiv's.** The two can be years apart: 1205.2614, posted in 2012, carries the comment "Appears in … UAI2009". Widen a year window, or drop it and match on author and title words.

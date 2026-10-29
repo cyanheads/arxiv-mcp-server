@@ -1,86 +1,86 @@
 {
   "kind": "render",
   "source": "ar5iv",
-  "body_characters": 58372,
+  "body_characters": 44500,
   "total_characters": 102271,
   "pages": 1,
-  "body_sha256": "95db2a13c3f767d74d7a99f7ca47648765d2d48e27e65283e9411cf082a6a44b",
+  "body_sha256": "628f3efe07bcdc22d518f592da350309d37a618abe80a0e0e9ac1ead854b15f7",
   "outline_omitted_levels": [],
   "outline": [
     {
       "level": 1,
       "title": "1 Introduction",
-      "start": 2116
+      "start": 1717
     },
     {
       "level": 1,
       "title": "2 Challenge Set for Gender Bias in MT",
-      "start": 10211
+      "start": 8241
     },
     {
       "level": 1,
       "title": "3 Evaluation",
-      "start": 13301
+      "start": 10816
     },
     {
       "level": 2,
       "title": "3.1 Experimental Setup",
-      "start": 17492
+      "start": 14520
     },
     {
       "level": 3,
       "title": "MT systems",
-      "start": 17609
+      "start": 14624
     },
     {
       "level": 3,
       "title": "Target languages and morphological analysis",
-      "start": 19719
+      "start": 16411
     },
     {
       "level": 2,
       "title": "3.2 Results",
-      "start": 37337
+      "start": 27574
     },
     {
       "level": 2,
       "title": "3.3 Fighting Bias with Bias",
-      "start": 41127
+      "start": 30668
     },
     {
       "level": 2,
       "title": "3.4 Human Validation",
-      "start": 45062
+      "start": 33078
     },
     {
       "level": 1,
       "title": "4 Discussion",
-      "start": 47192
+      "start": 34978
     },
     {
       "level": 3,
       "title": "Related work",
-      "start": 47296
+      "start": 35069
     },
     {
       "level": 3,
       "title": "Limitations and future work",
-      "start": 48300
+      "start": 36019
     },
     {
       "level": 1,
       "title": "5 Conclusions",
-      "start": 49949
+      "start": 37538
     },
     {
       "level": 1,
       "title": "Acknowledgments",
-      "start": 50558
+      "start": 38125
     },
     {
       "level": 1,
       "title": "References",
-      "start": 50980
+      "start": 38547
     }
   ]
 }

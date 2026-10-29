@@ -14,7 +14,7 @@ describe('normalizePaperId', () => {
       '1706.03762',
       '1706.03762v7',
       '2401.12345',
-      '9999.99999',
+      '2412.99999',
       'hep-th/9901001',
       'hep-th/9901001v1',
       'math/0309136',
@@ -37,6 +37,27 @@ describe('normalizePaperId', () => {
       '0703.0001',
       '0703.12345',
       '1201.00001',
+    ]) {
+      expect(normalizePaperId(raw), raw).toBeUndefined();
+    }
+  });
+
+  it('rejects a YYMM whose month cannot exist, new-style and old-style alike (#98)', () => {
+    for (const id of ['2401.00001', '2412.00001', '0912.0001', 'hep-th/9912001', 'math/0701001']) {
+      expect(normalizePaperId(id), id).toBe(id);
+    }
+    for (const raw of [
+      '9999.99999',
+      '2400.00001',
+      '2413.00001',
+      '1700.12345',
+      '0800.0001',
+      'arXiv:2400.00001v2',
+      'https://arxiv.org/abs/2413.00001',
+      'hep-th/9900001',
+      'hep-th/9913001',
+      'math.GT/0300136',
+      'cond-mat/0599001v2',
     ]) {
       expect(normalizePaperId(raw), raw).toBeUndefined();
     }

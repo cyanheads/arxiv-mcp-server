@@ -22,12 +22,12 @@ const MOCK_PAPER: PaperMetadata = {
 describe('formatPaper', () => {
   it('renders basic paper metadata', () => {
     const text = formatPaper(MOCK_PAPER);
-    expect(text).toContain('**Test Paper Title**');
+    expect(text).toContain('**`Test Paper Title`**');
     expect(text).toContain('arXiv:2401.12345v1');
     expect(text).toContain('cs.AI');
     expect(text).toContain('2024-01-22');
-    expect(text).toContain('Alice, Bob');
-    expect(text).toContain('Test abstract text.');
+    expect(text).toContain('\n`Alice, Bob`\n');
+    expect(text).toContain('\n```text\nTest abstract text.\n```\n');
     expect(text).toContain(
       'PDF: [https://arxiv.org/pdf/2401.12345v1](<https://arxiv.org/pdf/2401.12345v1>)',
     );
@@ -41,7 +41,7 @@ describe('formatPaper', () => {
       doi: '10.1234/test',
     };
     const text = formatPaper(paper);
-    expect(text).toContain('Comment: 10 pages, 3 figures');
+    expect(text).toContain('\nComment:\n```text\n10 pages, 3 figures\n```\n');
     expect(text).toContain('Journal: Nature 2024');
     expect(text).toContain('DOI: 10.1234/test');
   });

@@ -8,7 +8,11 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import type { PaperLookupResult, PaperMetadata } from '@/services/arxiv/types.js';
-import { COMMONMARK_PRESETS, readCommonMarkText } from '../../../helpers/commonmark-text.js';
+import {
+  COMMONMARK_PRESETS,
+  readCommonMarkFences,
+  readCommonMarkText,
+} from '../../../helpers/commonmark-text.js';
 
 vi.mock('@/services/arxiv/arxiv-service.js', () => ({
   getArxivService: vi.fn(),
@@ -62,6 +66,32 @@ describe('arxivGetMetadata', () => {
     );
   });
 
+  it('looks up each canonical ID once, in first-occurrence order (#92)', async () => {
+    mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
+    const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
+      typeof arxivGetMetadata.handler
+    >[1];
+    const input = arxivGetMetadata.input.parse({
+      paper_ids: [
+        'arXiv:2401.12345',
+        '2401.67890',
+        'https://arxiv.org/abs/2401.12345',
+        '2401.12345v1',
+        '2401.67890',
+      ],
+    });
+    const result = await arxivGetMetadata.handler(input, ctx);
+
+    expect(mockGetPapers).toHaveBeenCalledWith(['2401.12345', '2401.67890', '2401.12345v1'], ctx);
+    expect(result.papers).toEqual([MOCK_PAPER]);
+  });
+
+  it('describes per-distinct-ID lookup on paper_ids', () => {
+    const description = arxivGetMetadata.input.shape.paper_ids.description ?? '';
+    expect(description).toContain('The first 10 distinct well-formed IDs are looked up');
+    expect(description).toContain('is looked up once');
+  });
+
   it('passes array input directly', async () => {
     mockGetPapers.mockResolvedValue({ papers: [MOCK_PAPER] });
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
@@ -78,7 +108,7 @@ describe('arxivGetMetadata', () => {
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: ['9999.99999'] });
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['2312.99999'] });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toThrow(/not found|no papers/i);
   });
@@ -86,25 +116,25 @@ describe('arxivGetMetadata', () => {
   it('names the malformed IDs in the no_match message (#41)', async () => {
     mockGetPapers.mockResolvedValue({
       papers: [],
-      not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+      not_found: [{ id: '2312.99999', reason: 'not_in_arxiv' }],
     });
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: ['9999.99999', 'doi:10.1/x'] });
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['2312.99999', 'doi:10.1/x'] });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'no_match',
         not_found: [
-          { id: '9999.99999', reason: 'not_in_arxiv' },
+          { id: '2312.99999', reason: 'not_in_arxiv' },
           expect.objectContaining({ id: 'doi:10.1/x', reason: 'invalid_id' }),
         ],
       },
       message: expect.stringContaining("'doi:10.1/x'"),
     });
-    expect(mockGetPapers).toHaveBeenCalledWith(['9999.99999'], ctx);
+    expect(mockGetPapers).toHaveBeenCalledWith(['2312.99999'], ctx);
   });
 
   it('fails with version_unavailable, not no_match, when every miss is a mirror version miss (#35)', async () => {
@@ -185,12 +215,12 @@ describe('arxivGetMetadata', () => {
   it('still fails with no_match when the IDs are genuinely absent from arXiv (#35)', async () => {
     mockGetPapers.mockResolvedValue({
       papers: [],
-      not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+      not_found: [{ id: '2312.99999', reason: 'not_in_arxiv' }],
     });
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
-    const input = arxivGetMetadata.input.parse({ paper_ids: ['9999.99999'] });
+    const input = arxivGetMetadata.input.parse({ paper_ids: ['2312.99999'] });
 
     await expect(arxivGetMetadata.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
@@ -203,20 +233,20 @@ describe('arxivGetMetadata', () => {
       papers: [MOCK_PAPER],
       not_found: [
         { id: '1706.03762v7', reason: 'version_not_in_mirror', detail: 'Mirror holds version 3.' },
-        { id: '9999.99999', reason: 'not_in_arxiv' },
+        { id: '2312.99999', reason: 'not_in_arxiv' },
       ],
     });
     const ctx = createMockContext({ errors: arxivGetMetadata.errors! }) as Parameters<
       typeof arxivGetMetadata.handler
     >[1];
     const input = arxivGetMetadata.input.parse({
-      paper_ids: ['2401.12345', '1706.03762v7', '9999.99999'],
+      paper_ids: ['2401.12345', '1706.03762v7', '2312.99999'],
     });
     const result = await arxivGetMetadata.handler(input, ctx);
 
     expect(result.not_found).toEqual([
       { id: '1706.03762v7', reason: 'version_not_in_mirror', detail: 'Mirror holds version 3.' },
-      { id: '9999.99999', reason: 'not_in_arxiv' },
+      { id: '2312.99999', reason: 'not_in_arxiv' },
     ]);
   });
 
@@ -226,7 +256,7 @@ describe('arxivGetMetadata', () => {
         papers: [MOCK_PAPER],
         totalSucceeded: 1,
         not_found: [
-          { id: '9999.99999', reason: 'not_in_arxiv' },
+          { id: '2312.99999', reason: 'not_in_arxiv' },
           {
             id: '1706.03762v7',
             reason: 'version_not_in_mirror',
@@ -235,9 +265,9 @@ describe('arxivGetMetadata', () => {
         ],
       }) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('**Test Paper**');
+    expect(text).toContain('**`Test Paper`**');
     expect(text).toContain('Found 1 of 3 papers');
-    expect(text).toContain('9999.99999 (not_in_arxiv)');
+    expect(text).toContain('2312.99999 (not_in_arxiv)');
     expect(text).toContain('1706.03762v7 (version_not_in_mirror): Mirror holds version 3.');
   });
 
@@ -283,15 +313,15 @@ describe('arxivGetMetadata', () => {
     );
   });
 
-  // formatPaper()'s encoding is tabled in security.test.ts; one escaped title
-  // proves this tool routes papers through it. The not_found lines are this
-  // tool's own: an id and a detail, with and without the detail, and
+  // formatPaper()'s encoding is tabled in security.test.ts; one TeX title in a
+  // code span proves this tool routes papers through it. The not_found lines are
+  // this tool's own: an id and a detail, with and without the detail, and
   // remaining_ids read back from content[] as structuredContent carries them.
-  it('reads back every paper, not_found entry, and remaining ID as structuredContent carries it (#87)', async () => {
+  it('reads back every paper, not_found entry, and remaining ID as structuredContent carries it (#87, #91)', async () => {
     const paper: PaperMetadata = {
       ...MOCK_PAPER,
       id: 'astro-ph/9705060v1',
-      title: 'Line strength indices Hb, <Fe>, and Mg2',
+      title: 'Line strength indices Hb, <Fe>, and Mg2 in AdS$_2$',
     };
     mockGetPapers.mockResolvedValue({
       papers: [paper],
@@ -329,14 +359,16 @@ describe('arxivGetMetadata', () => {
     ]);
     const block = result.content[0];
     const text = block?.type === 'text' ? block.text : '';
+    expect(text).toContain(paper.title);
     for (const preset of COMMONMARK_PRESETS) {
+      expect(readCommonMarkFences(text, preset), preset).toEqual([
+        { info: 'text', literal: `${paper.abstract}\n` },
+      ]);
       expect(readCommonMarkText(text, preset), preset).toBe(
         [
-          'Found 1 of 4 papers. Looked up the first 10 well-formed IDs; 1 more ID is listed under Remaining IDs below.',
-          `⟨strong⟩${paper.title}⟨/strong⟩\narXiv:${paper.id} | cs.AI | 2024-01-22\nAlice`,
-          '⟨blockquote_open⟩',
-          paper.abstract,
-          '⟨blockquote_close⟩',
+          'Found 1 of 4 papers. Looked up the first 10 distinct well-formed IDs; 1 more ID is listed under Remaining IDs below.',
+          `⟨strong⟩⟨code_inline:${paper.title}⟩⟨/strong⟩\narXiv:${paper.id} | cs.AI | 2024-01-22\n⟨code_inline:Alice⟩`,
+          '⟨fence:text⟩',
           `Published: ${paper.published} | Updated: ${paper.updated}\nAbstract: ⟨a href=${paper.abstract_url}⟩${paper.abstract_url}⟨/a⟩\nPDF: ⟨a href=${paper.pdf_url}⟩${paper.pdf_url}⟨/a⟩`,
           'Not found:',
           '⟨bullet_list_open⟩',

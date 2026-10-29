@@ -1,0 +1,718 @@
+{
+  "description": "arXiv metadata pairs: each paper's arXivRaw record as OAI-PMH serves it and the Atom entry the arXiv API serves for it, every record and entry copied verbatim from the response named here. The mirror's metadata for a paper must equal the live parser's output for its entry (issue #89).",
+  "oai": {
+    "file": "oai-arxivraw.xml.gz",
+    "url": "https://oaipmh.arxiv.org/oai?verb=ListRecords&metadataPrefix=arXivRaw&from=2026-10-20&until=2026-10-20",
+    "retrieved": "2026-10-28",
+    "notes": "The 174 paired records of the response's first page of 1,300; its envelope is kept, its resumption token dropped."
+  },
+  "atom": {
+    "file": "atom.xml.gz",
+    "url": "https://export.arxiv.org/api/query?id_list=<ids>",
+    "retrieved": "2026-10-29",
+    "notes": "The entries of four id_list responses for these IDs, under one feed element."
+  },
+  "license": {
+    "id": "CC0-1.0",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "confirmedBy": "https://info.arxiv.org/help/license/index.html"
+  },
+  "pairs": [
+    {
+      "id": "1305.4829",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "1711.08089",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "1901.08083",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2002.10557",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2201.02841",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2303.11071",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2304.01385",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2307.02315",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2309.13997",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2312.01607",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2401.00182",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2401.04272",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2403.00682",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2403.02619",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2405.13212",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2406.00366",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2406.14681",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2409.10201",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2410.03677",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2410.14056",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2410.23734",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2501.09063",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2501.14060",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2501.16268",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2502.06399",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2502.13098",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2502.18359",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2503.02847",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2503.22150",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2505.02198",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2505.02928",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2505.07104",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2505.08729",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2506.05662",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2506.07939",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2506.16858",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2507.04427",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2507.15478",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2508.05251",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2508.05603",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.00990",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.01091",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.02254",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.06450",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.12426",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.14358",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2509.18059",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2510.09203",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2510.21533",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2510.24047",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2510.27508",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2511.06064",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2511.08647",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2511.15020",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2511.21065",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2512.10497",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2512.22542",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2601.06421",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2601.07600",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2602.01412",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2602.14581",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2603.03279",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2603.06147",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2603.14204",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2603.14495",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2603.16075",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2603.24227",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2604.04891",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2604.07309",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2604.27266",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.05104",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.06520",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.14658",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.14781",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.16560",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.18170",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.20516",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.22701",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.27714",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.27715",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2605.28944",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2606.02398",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2606.04114",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2606.13120",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2606.26247",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2606.26473",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2606.31876",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2607.16645",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2607.23034",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2608.12143",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2608.20222",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2608.24187",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2608.30608",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2609.22596",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2609.28762",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2609.36176",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.04459",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.07034",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.07315",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.09249",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.09291",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.09436",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.10904",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.12476",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.15554",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.16623",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.18114",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.19833",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23858",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23864",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23897",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23903",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23912",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23914",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23953",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23964",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.23979",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24001",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24008",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24023",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24033",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24043",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24049",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24053",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24054",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24059",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24066",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24106",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24110",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24114",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24116",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24138",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24156",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24166",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24182",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24192",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24208",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24213",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24229",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24260",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24276",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24278",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24290",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24300",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24326",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24333",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24335",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24362",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24371",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24388",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24393",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24394",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24405",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24407",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24412",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24422",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24442",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24492",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24501",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24539",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24543",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24552",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24554",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24558",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24605",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24610",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24622",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24638",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24650",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24653",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24654",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24658",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24664",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "2610.24667",
+      "license": "CC0-1.0"
+    }
+  ]
+}

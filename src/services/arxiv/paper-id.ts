@@ -17,17 +17,18 @@ const ARXIV_URL =
   /^(?:https?:\/\/)?(?:www\.|export\.)?arxiv\.org\/(abs|pdf|html)\/([^?#]+?)\/?(?:[?#].*)?$/i;
 
 /**
- * New-style ID `YYMM.N…`, optional version; group 1 is `YYMM`, group 2 the
- * sequence number, whose width is fixed by the era (see {@link normalizePaperId}).
+ * New-style ID `YYMM.N…`, optional version, `MM` a month `01`–`12`; group 1 is
+ * `YYMM`, group 2 the sequence number, whose width is fixed by the era (see
+ * {@link normalizePaperId}).
  */
-const NEW_STYLE_ID = /^(\d{4})\.(\d{4,5})(?:v\d+)?$/;
+const NEW_STYLE_ID = /^(\d\d(?:0[1-9]|1[0-2]))\.(\d{4,5})(?:v\d+)?$/;
 
 /**
- * Old-style ID `archive[.SC]/YYMMNNN[vN]`, lowercased. The two-letter subject
- * class is redundant — sequence numbers are unique per archive — and arXiv
- * answers only the class-less form, so it is dropped.
+ * Old-style ID `archive[.SC]/YYMMNNN[vN]`, lowercased, `MM` a month `01`–`12`.
+ * The two-letter subject class is redundant — sequence numbers are unique per
+ * archive — and arXiv answers only the class-less form, so it is dropped.
  */
-const OLD_STYLE_ID = /^([a-z]+(?:-[a-z]+)?)(?:\.[a-z]{2})?\/(\d{7}(?:v\d+)?)$/;
+const OLD_STYLE_ID = /^([a-z]+(?:-[a-z]+)?)(?:\.[a-z]{2})?\/(\d\d(?:0[1-9]|1[0-2])\d{3}(?:v\d+)?)$/;
 
 /**
  * The archives that issued old-style IDs — every arXiv archive opened before
@@ -71,6 +72,16 @@ const LEGACY_ARCHIVES = new Set([
   'supr-con',
 ]);
 
+/**
+ * The `no_match` message for a canonical ID arXiv returned nothing for. The ID
+ * passed {@link normalizePaperId}, so its format is not in doubt; arXiv answers
+ * an absent paper and a pinned version it lacks with the same empty feed, so a
+ * pinned miss names both.
+ */
+export function noSuchPaperMessage(paperId: string): string {
+  return `arXiv has no paper${/v\d+$/.test(paperId) ? ' or version' : ''} with ID '${paperId}'.`;
+}
+
 /** Accepted spellings, for error messages. */
 export const PAPER_ID_FORMS =
   '"2401.12345", "2401.12345v2", or a pre-2007 ID like "hep-th/9901001" (archive spelled as arXiv issued it), optionally prefixed "arXiv:", or an arxiv.org abs, pdf, or html URL, with or without https:// or a ?query or #fragment';
@@ -87,6 +98,8 @@ export const PAPER_ID_FORMS =
  * A new-style sequence number is 4 digits from 0704 through 1412 and 5 digits
  * from 1501 on; the other width, or any new-style ID before 0704, names no
  * paper (`1706.0376`, `0703.12345`), so it is rejected rather than sent upstream.
+ * So is a `YYMM`, either style, whose month is not `01`–`12` (`2400.00001`,
+ * `hep-th/9913001`).
  */
 export function normalizePaperId(raw: string): string | undefined {
   const trimmed = raw.trim();

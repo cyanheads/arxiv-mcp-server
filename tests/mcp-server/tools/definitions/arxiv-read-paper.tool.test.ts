@@ -110,7 +110,7 @@ describe('arxivReadPaper', () => {
     };
     const blocks = arxivReadPaper.format?.(truncated) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('# Test Paper');
+    expect(text).toContain('# `Test Paper`');
     expect(text).toContain('[Truncated:');
     expect(text).toContain('50,000 body characters');
     expect(text).toContain('chars 0–19,999');
@@ -229,7 +229,7 @@ describe('arxivReadPaper', () => {
   it('formats without truncation notice when not truncated and start=0', () => {
     const blocks = arxivReadPaper.format?.(MOCK_CONTENT) ?? [];
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('# Test Paper');
+    expect(text).toContain('# `Test Paper`');
     expect(text).not.toContain('Truncated');
     expect(text).not.toContain('final chunk');
     expect(text).toContain('<html><body>Full paper content</body></html>');
@@ -264,10 +264,10 @@ describe('arxivReadPaper', () => {
     const text = formatText(OUTLINED);
 
     expect(text).toContain("Outline (pass an entry's start to read from that heading):");
-    expect(text).toContain('\n- 1 Introduction (level 1, start=5912)\n');
-    expect(text).toContain('\n  - 3.1 Encoder and Decoder Stacks (level 2, start=12593)\n');
-    expect(text).toContain('\n    - Encoder: (level 4, start=12701)\n');
-    expect(text).toContain('\n- References (level 1, start=50002)\n');
+    expect(text).toContain('\n- `1 Introduction` (level 1, start=5912)\n');
+    expect(text).toContain('\n  - `3.1 Encoder and Decoder Stacks` (level 2, start=12593)\n');
+    expect(text).toContain('\n    - `Encoder:` (level 4, start=12701)\n');
+    expect(text).toContain('\n- `References` (level 1, start=50002)\n');
     expect(text.indexOf('Outline')).toBeLessThan(text.indexOf(MOCK_CONTENT.content));
   });
 
@@ -284,14 +284,12 @@ describe('arxivReadPaper', () => {
     const text = formatText({ ...MOCK_CONTENT, outline });
 
     expect(text).toContain(
-      '\n- 7 Conclusion (level 1, start=41289)\n  - Acknowledgements (level 4, start=42627)\n  - Funding (level 4, start=42700)\n  - 7.1 Limits (level 2, start=42800)\n- References (level 1, start=42881)\n',
+      '\n- `7 Conclusion` (level 1, start=41289)\n  - `Acknowledgements` (level 4, start=42627)\n  - `Funding` (level 4, start=42700)\n  - `7.1 Limits` (level 2, start=42800)\n- `References` (level 1, start=42881)\n',
     );
     for (const preset of COMMONMARK_PRESETS) {
       const readout = readCommonMarkText(text, preset);
       expect(readout.match(/⟨list_item_open⟩/g), preset).toHaveLength(outline.length);
-      expect(inlineRuns(readout).slice(-outline.length), preset).toEqual(
-        outline.map((e) => `${e.title} (level ${e.level}, start=${e.start})`),
-      );
+      expect(inlineRuns(readout).slice(-outline.length), preset).toEqual(outline.map(itemReadsAs));
     }
   });
 
@@ -304,7 +302,7 @@ describe('arxivReadPaper', () => {
       ],
     });
 
-    expect(text).toContain('\n- A (level 2, start=1)\n  - A.1 (level 3, start=2)');
+    expect(text).toContain('\n- `A` (level 2, start=1)\n  - `A.1` (level 3, start=2)');
   });
 
   it('says which heading levels were left out of a capped outline', () => {
@@ -346,7 +344,7 @@ describe('arxivReadPaper', () => {
     // would read as that item's text (#87).
     const runs = inlineRuns(readCommonMarkText(text));
     expect(runs.slice(-2)).toEqual([
-      '200 Part (level 1, start=10050)',
+      '⟨code_inline:200 Part⟩ (level 1, start=10050)',
       '[Outline cut at 200 entries: more level 1 headings follow. Read on with start=10100 to reach them.]',
     ]);
   });
@@ -464,6 +462,34 @@ describe('arxivReadPaper', () => {
     expect(text).toContain(contract?.recovery ?? '<missing>');
   });
 
+  it('puts the no_match recovery on both surfaces, with no format hint (#93)', async () => {
+    const message = "arXiv has no paper with ID '2312.99999'.";
+    mockReadContent.mockRejectedValue(
+      notFound(message, { paperId: '2312.99999', reason: 'no_match' }),
+    );
+    const result = await runToolContract(arxivReadPaper, { paper_id: '2312.99999' });
+
+    expect(result.isError).toBe(true);
+    const contract = arxivReadPaper.errors?.find((e) => e.reason === 'no_match');
+    expect(contract?.recovery).toBe(
+      'Find the paper with arxiv_search_papers, or recheck the ID against its source; if the ID pins a version, retry without the suffix.',
+    );
+    const error = (
+      result.structuredContent as {
+        error: { code: number; message: string; data: { recovery?: { hint: string } } };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.message).toBe(message);
+    expect(error.data.recovery?.hint).toBe(contract?.recovery);
+    const text = readCommonMarkText(
+      result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n'),
+    );
+    expect(text).toContain(message);
+    expect(text).toContain(contract?.recovery ?? '<missing>');
+    expect(`${contract?.when} ${text}`.toLowerCase()).not.toContain('format');
+  });
+
   it('passes a live outage through as itself on both surfaces, with no not-found guidance (#68)', async () => {
     mockReadContent.mockRejectedValue(
       serviceUnavailable('arXiv API returned HTTP 503 (failed after 2 attempts)', {
@@ -520,7 +546,8 @@ describe('arxivReadPaper', () => {
 
 // ---------------------------------------------------------------------------
 // content[] reads back as structuredContent carries it (#87): the title and
-// outline titles escaped, the body in a fence whose literal is the body itself
+// outline titles in code spans, byte-for-byte (#91), the body in a fence whose
+// literal is the body itself
 // ---------------------------------------------------------------------------
 
 /** The one text block of a successful call. */
@@ -535,19 +562,26 @@ async function readText(input: Parameters<typeof runToolContract<typeof arxivRea
   };
 }
 
-/** The inline runs a parse reads, in order, leaving out the block markers between them. */
+/** The inline runs a parse reads, in order, leaving out the block markers between them (a run that is one code span stays). */
 const inlineRuns = (readout: string) =>
-  readout.split('\n\n').filter((part) => !/^⟨[a-z_]+(?::[^⟩]*)?⟩$/.test(part));
+  readout.split('\n\n').filter((part) => !/^⟨(?!code_inline:)[a-z_]+(?::[^⟩]*)?⟩$/.test(part));
 
-// escapeMarkdownInline's own value table lives in mcp-ts-core; these rows are
-// headingText()'s branch sides: no trailing # run, and a run set off by a space
-// or a tab (a closing sequence) or by nothing (text).
-describe('arxivReadPaper — the header title reads back as written (#87)', () => {
+/** One outline entry as a parse reads its list item: the title span, then its level and start. */
+const itemReadsAs = (e: { level: number; title: string; start: number }) =>
+  `⟨code_inline:${e.title}⟩ (level ${e.level}, start=${e.start})`;
+
+// Code-span sizing and padding are codeSpan()'s, tabled in mcp-ts-core; these
+// rows are the titles an inline escape altered or a heading could misread:
+// TeX (#91), a backtick at either end, and a trailing # run a heading would
+// strip as its closing sequence.
+describe('arxivReadPaper — the header title reads back as written (#87, #91)', () => {
   it.each([
     ['<Fe>', 'Hb, <Fe>, and Mg2'],
-    // An ATX heading strips a trailing run of # after a space or tab as its closing sequence.
+    ["2610.37667's TeX", "The 't Hooft model on (A)dS$_2$"],
+    ['$a*b*c$ and a TeX break', 'Bounds on $a*b*c$ and $1.84\\ R_{\\oplus}$'],
+    ['a backtick opening', '`code` first'],
+    ['a backtick run closing', 'last ``code``'],
     ['a closing # run', 'Programming in C #'],
-    ['a closing ## run', 'Ends on ##'],
     ['a closing # run after a tab', 'Ends on\t#'],
     ['a lone #', '#'],
   ])('%s', async (_name, title) => {
@@ -555,7 +589,8 @@ describe('arxivReadPaper — the header title reads back as written (#87)', () =
     const { structured, text } = await readText({ paper_id: '2401.12345' });
 
     expect(structured.title).toBe(title);
-    const heading = `⟨heading_open⟩\n\n${title}\n\n⟨heading_close⟩\n\n`;
+    expect(text.split('\n')[0]).toContain(title);
+    const heading = `⟨heading_open⟩\n\n⟨code_inline:${title}⟩\n\n⟨heading_close⟩\n\n`;
     for (const preset of COMMONMARK_PRESETS) {
       expect(readCommonMarkText(text, preset).slice(0, heading.length), preset).toBe(heading);
     }
@@ -574,14 +609,14 @@ describe('arxivReadPaper — the header title reads back as written (#87)', () =
     expect(readCommonMarkText(text)).toBe(
       [
         '⟨heading_open⟩',
-        'Sgr A* and <Fe>',
+        '⟨code_inline:Sgr A* and <Fe>⟩',
         '⟨heading_close⟩',
         'arXiv:2401.12345v1 | Source: ar5iv | Raw: 44 chars | Body: 44 chars\nAbstract: ⟨a href=https://arxiv.org/abs/2401.12345v1⟩https://arxiv.org/abs/2401.12345v1⟨/a⟩\nPDF: ⟨a href=https://arxiv.org/pdf/2401.12345v1⟩https://arxiv.org/pdf/2401.12345v1⟨/a⟩',
         '[Revision unconfirmed: ar5iv keeps one render per paper, so this body may be another revision than arXiv:2401.12345v1. The PDF at ⟨a href=https://arxiv.org/pdf/2401.12345v1⟩https://arxiv.org/pdf/2401.12345v1⟨/a⟩ is exactly arXiv:2401.12345v1.]',
         "Outline (pass an entry's start to read from that heading):",
         '⟨bullet_list_open⟩',
         '⟨list_item_open⟩',
-        '1. Go Somewhere (33.0%) (level 1, start=5)',
+        '⟨code_inline:1. Go Somewhere (33.0%)⟩ (level 1, start=5)',
         '⟨list_item_close⟩',
         '⟨bullet_list_close⟩',
         '⟨fence:html⟩',
@@ -593,10 +628,18 @@ describe('arxivReadPaper — the header title reads back as written (#87)', () =
   });
 });
 
-describe('arxivReadPaper — outline titles read back as written (#87)', () => {
+describe('arxivReadPaper — outline titles read back as written (#87, #91)', () => {
   // One title per kind of syntax a list item's text could open: an ordered and
-  // a bullet marker (a nested list), and inline markup.
-  const titles = ['1. Go Somewhere (33.0%)', '- Dash opening', '<b>Bold</b> *star* [x](y) `code`'];
+  // a bullet marker (a nested list), and inline markup; then TeX an inline
+  // escape altered and a backtick at either end of the span.
+  const titles = [
+    '1. Go Somewhere (33.0%)',
+    '- Dash opening',
+    '<b>Bold</b> *star* [x](y) `code`',
+    '2 The $\\mathcal{N}=2$ case on AdS$_2$',
+    '3 $a*b*c$ and ~17 pc',
+    '`code` first',
+  ];
 
   it('renders each title as one list item, nested by level, reading back as its title', async () => {
     const outline = titles.map((title, i) => ({ level: 1 + (i % 3), title, start: 100 * i }));
@@ -604,14 +647,33 @@ describe('arxivReadPaper — outline titles read back as written (#87)', () => {
     const { structured, text } = await readText({ paper_id: '2401.12345' });
 
     expect(structured.outline).toEqual(outline);
+    for (const title of titles) expect(text).toContain(title);
     for (const preset of COMMONMARK_PRESETS) {
       const readout = readCommonMarkText(text, preset);
       expect(readout.match(/⟨list_item_open⟩/g), preset).toHaveLength(titles.length);
       const runs = inlineRuns(readout);
       const first = runs.indexOf("Outline (pass an entry's start to read from that heading):");
-      expect(runs.slice(first + 1), preset).toEqual(
-        outline.map((e) => `${e.title} (level ${e.level}, start=${e.start})`),
-      );
+      expect(runs.slice(first + 1), preset).toEqual(outline.map(itemReadsAs));
+    }
+  });
+
+  // An empty span would read back as two literal backticks.
+  it('renders a heading with no text as its level and start alone', async () => {
+    const outline = [
+      { level: 1, title: '', start: 7 },
+      { level: 2, title: '1.1 Next', start: 9 },
+    ];
+    mockReadContent.mockResolvedValue({ ...MOCK_CONTENT, outline });
+    const { text } = await readText({ paper_id: '2401.12345' });
+
+    expect(text).toContain('\n- (level 1, start=7)\n  - `1.1 Next` (level 2, start=9)\n');
+    for (const preset of COMMONMARK_PRESETS) {
+      const runs = inlineRuns(readCommonMarkText(text, preset));
+      const first = runs.indexOf("Outline (pass an entry's start to read from that heading):");
+      expect(runs.slice(first + 1), preset).toEqual([
+        '(level 1, start=7)',
+        itemReadsAs(outline[1] ?? { level: 0, title: '', start: 0 }),
+      ]);
     }
   });
 });
@@ -763,13 +825,13 @@ describe('arxivReadPaper — corpus bodies read back whole and page by page (#87
     // pinned by its tests/corpus expected.json; these columns size the reads
     // below so none passes on an empty outline or a single page.
     {
-      // 801 blank lines (each would end a raw HTML block), 5 pages at 100k, and
+      // 802 blank lines (each would end a raw HTML block), 4 pages at 100k, and
       // 276 headings capped at 200 by dropping level 3.
       dir: 'arxiv-2409.09856v3',
       source: 'arxiv_html',
       outlineEntries: 57,
       omittedLevels: [3],
-      pages: 5,
+      pages: 4,
       hazard: /\n\n/,
     },
     {
@@ -778,7 +840,7 @@ describe('arxivReadPaper — corpus bodies read back whole and page by page (#87
       source: 'arxiv_html',
       outlineEntries: 183,
       omittedLevels: undefined,
-      pages: 4,
+      pages: 3,
       hazard: /^\d+[.)] /,
     },
     {
@@ -808,11 +870,11 @@ describe('arxivReadPaper — corpus bodies read back whole and page by page (#87
     for (const preset of COMMONMARK_PRESETS) {
       const readout = readCommonMarkText(whole.text, preset);
       const runs = inlineRuns(readout);
-      expect(runs[0], preset).toBe('Captured <Fe> [x](n) *body*');
+      expect(runs[0], preset).toBe('⟨code_inline:Captured <Fe> [x](n) *body*⟩');
       expect(readout.match(/⟨list_item_open⟩/g), preset).toHaveLength(outlineEntries);
       const first = runs.indexOf("Outline (pass an entry's start to read from that heading):");
       expect(runs.slice(first + 1), preset).toEqual([
-        ...outline.map((e) => `${e.title} (level ${e.level}, start=${e.start})`),
+        ...outline.map(itemReadsAs),
         ...(omittedLevels
           ? [
               `[Outline capped at 200 entries: level ${omittedLevels.join(' and level ')} headings omitted. Page through the body to reach them.]`,
@@ -855,7 +917,7 @@ function cpuMs(fn: () => unknown): number {
 }
 
 // The bound is thread CPU; the wall-clock timeout only has to outlast a loaded machine.
-describe('arxivReadPaper header title cost on upstream-sized titles (#87)', {
+describe('arxivReadPaper header title cost on upstream-sized titles (#87, #91)', {
   timeout: 60_000,
 }, () => {
   /**
@@ -876,9 +938,10 @@ describe('arxivReadPaper header title cost on upstream-sized titles (#87)', {
   }
 
   it.each<[string, (size: number) => string]>([
-    // The closing-run scan walks back over every trailing #.
+    // The code span's delimiter scan walks every backtick run.
+    ['a title ending in one long backtick run', (size) => `a ${'`'.repeat(size - 2)}`],
+    ['a title of many short backtick runs', (size) => ' `a'.repeat(size / 3)],
     ['a title ending in one long # run', (size) => `a ${'#'.repeat(size - 2)}`],
-    ['a title of many short # runs', (size) => ' #a'.repeat(size / 3)],
     ['one long line ending in a break', (size) => `${'§1 x'.repeat(size / 4)}\ny`],
     ['breaks throughout', (size) => '  \r\n'.repeat(size / 4)],
   ])('stays linear on %s', (_shape, make) => {

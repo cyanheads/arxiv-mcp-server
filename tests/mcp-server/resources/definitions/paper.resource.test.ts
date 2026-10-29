@@ -113,8 +113,8 @@ describe('paperResource', () => {
     const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
       typeof paperResource.handler
     >[1];
-    await expect(paperResource.handler({ paperId: '9999.99999' }, ctx)).rejects.toThrow(
-      /not found/i,
+    await expect(paperResource.handler({ paperId: '2312.99999' }, ctx)).rejects.toThrow(
+      "arXiv has no paper with ID '2312.99999'.",
     );
   });
 
@@ -165,15 +165,46 @@ describe('paperResource', () => {
   it('still fails with no_match when the ID is genuinely absent from arXiv (#35)', async () => {
     mockGetPapers.mockResolvedValue({
       papers: [],
-      not_found: [{ id: '9999.99999', reason: 'not_in_arxiv' }],
+      not_found: [{ id: '2312.99999', reason: 'not_in_arxiv' }],
     });
     const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
       typeof paperResource.handler
     >[1];
 
-    await expect(paperResource.handler({ paperId: '9999.99999' }, ctx)).rejects.toMatchObject({
+    await expect(paperResource.handler({ paperId: '2312.99999' }, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_match' },
+      data: { reason: 'no_match', paperId: '2312.99999' },
+      message: "arXiv has no paper with ID '2312.99999'.",
     });
+  });
+
+  it('names "paper or version" when a pinned ID is absent from arXiv (#93)', async () => {
+    mockGetPapers.mockResolvedValue({
+      papers: [],
+      not_found: [{ id: '1706.03762v99', reason: 'not_in_arxiv' }],
+    });
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await expect(
+      paperResource.handler({ paperId: 'arXiv%3A1706.03762v99' }, ctx),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'no_match', paperId: '1706.03762v99' },
+      message: "arXiv has no paper or version with ID '1706.03762v99'.",
+    });
+  });
+
+  it('rejects an ID whose month cannot exist as invalid_id, before any lookup (#98)', async () => {
+    const ctx = createMockContext({ errors: paperResource.errors! }) as Parameters<
+      typeof paperResource.handler
+    >[1];
+
+    await expect(paperResource.handler({ paperId: '2400.00001' }, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_id', paperId: '2400.00001' },
+    });
+    expect(mockGetPapers).not.toHaveBeenCalled();
   });
 });

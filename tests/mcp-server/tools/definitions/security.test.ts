@@ -17,7 +17,11 @@ import type {
   PaperMetadata,
   SearchResult,
 } from '@/services/arxiv/types.js';
-import { COMMONMARK_PRESETS, readCommonMarkText } from '../../../helpers/commonmark-text.js';
+import {
+  COMMONMARK_PRESETS,
+  readCommonMarkFences,
+  readCommonMarkText,
+} from '../../../helpers/commonmark-text.js';
 
 vi.mock('@/services/arxiv/arxiv-service.js', () => ({
   getArxivService: vi.fn(),
@@ -177,7 +181,8 @@ describe('arxivReadPaper — output safety', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Paper text in content[] reads back as structuredContent carries it (#87).
+// Paper text in content[] reads back as structuredContent carries it (#87),
+// and the author-written fields sit in code literals byte-for-byte (#91).
 // formatPaper() renders every paper for arxiv_search_papers and
 // arxiv_get_metadata, so its encoding is tabled here once, through the
 // assembled CallToolResult; the tool files prove each tool's wiring.
@@ -199,12 +204,17 @@ const BASE_META = 'arXiv:2401.00001v1 | cs.AI | 2024-01-01';
 
 /**
  * One paper block as a CommonMark parse reads it, from the paper's
- * structuredContent values: the bold title, meta, and author lines; the
- * abstract alone in a quote; then the labelled lines in a paragraph of their own.
+ * structuredContent values: the bold title span, meta, and author span lines
+ * (no author line for an empty list); the abstract fence; a `Comment:` label
+ * and its fence; then the labelled lines in a paragraph of their own.
  */
 function paperReadsAs(p: PaperMetadata, meta: string): string {
+  const head = [
+    `⟨strong⟩⟨code_inline:${p.title}⟩⟨/strong⟩`,
+    meta,
+    ...(p.authors.length > 0 ? [`⟨code_inline:${p.authors.join(', ')}⟩`] : []),
+  ];
   const labelled = [
-    p.comment !== undefined && `Comment: ${p.comment}`,
     p.journal_ref !== undefined && `Journal: ${p.journal_ref}`,
     p.doi !== undefined && `DOI: ${p.doi}`,
     `Published: ${p.published} | Updated: ${p.updated}`,
@@ -212,12 +222,19 @@ function paperReadsAs(p: PaperMetadata, meta: string): string {
     `PDF: ⟨a href=${p.pdf_url}⟩${p.pdf_url}⟨/a⟩`,
   ].filter(Boolean);
   return [
-    `⟨strong⟩${p.title}⟨/strong⟩\n${meta}\n${p.authors.join(', ')}`,
-    '⟨blockquote_open⟩',
-    p.abstract,
-    '⟨blockquote_close⟩',
+    head.join('\n'),
+    '⟨fence:text⟩',
+    ...(p.comment ? ['Comment:', '⟨fence:text⟩'] : []),
     labelled.join('\n'),
   ].join('\n\n');
+}
+
+/** The `text` fences of one paper block — abstract, then comment — each literal its value plus a line end, CR and CRLF read as LF. */
+function paperFences(p: PaperMetadata): { info: string; literal: string }[] {
+  return [p.abstract, ...(p.comment ? [p.comment] : [])].map((value) => ({
+    info: 'text',
+    literal: `${value.replace(/\r\n?/g, '\n')}\n`,
+  }));
 }
 
 const UPSTREAM_TEXT_CASES: { name: string; paper: PaperMetadata; meta?: string }[] = [
@@ -241,8 +258,8 @@ const UPSTREAM_TEXT_CASES: { name: string; paper: PaperMetadata; meta?: string }
     },
   },
   {
-    // No comment, so Journal: is the first line after the quote, where a lazy continuation line would join it.
-    name: 'cond-mat/0305687 keeps [(FeTaN)/(TaN)](n), and Journal: stays out of the abstract quote',
+    // No comment, so Journal: is the first line after the abstract fence.
+    name: 'cond-mat/0305687 keeps [(FeTaN)/(TaN)](n), and Journal: stays out of the abstract fence',
     meta: 'arXiv:cond-mat/0305687v2 | cond-mat.mtrl-sci | 2003-05-29 (updated 2003-05-30)',
     paper: {
       id: 'cond-mat/0305687v2',
@@ -354,16 +371,58 @@ const UPSTREAM_TEXT_CASES: { name: string; paper: PaperMetadata; meta?: string }
     },
   },
   {
-    name: 'an abstract with line breaks keeps every line in the quote',
+    name: 'an abstract with line breaks keeps every line in its fence',
     paper: { ...BASE_PAPER, abstract: 'line one\n> line two\n# line three' },
   },
   {
     name: 'a sparse paper with no comment, journal, or DOI',
     paper: BASE_PAPER,
   },
+  // TeX an inline escape cannot keep: a backslash before punctuation, `_{`, and `~` (#91).
+  {
+    name: "2610.09954: $1.84\\ R_{\\oplus}$ in the abstract and Barrag\\'an among the authors",
+    paper: {
+      ...BASE_PAPER,
+      authors: ["M. C. D'Arpa", "O. Barrag\\'an"],
+      abstract:
+        '($R_p \\sim 1.71$-$1.84\\ R_{\\oplus}$) and ,\\\\ 0 =Δv_{\\varepsilon}-v_\\varepsilon',
+    },
+  },
+  {
+    name: '2610.09965: ~17 pc in the abstract',
+    paper: { ...BASE_PAPER, abstract: 'located at a distance of ~17 pc' },
+  },
+  {
+    name: "2610.37667: The 't Hooft model on (A)dS$_2$, and $a*b*c$ in a title",
+    paper: { ...BASE_PAPER, title: "The 't Hooft model on (A)dS$_2$ with $a*b*c$" },
+  },
+  {
+    name: '2610.37653: a comment URL holding ~',
+    paper: { ...BASE_PAPER, comment: 'Code at https://web.math.princeton.edu/~hc9325/' },
+  },
+  {
+    name: "a ``` run and ``x'' quotes in the abstract",
+    paper: { ...BASE_PAPER, abstract: "A ``` run, a ```` run, and ``quoted'' text" },
+  },
+  {
+    name: 'a title opening on a backtick',
+    paper: { ...BASE_PAPER, title: '`code` opens the title' },
+  },
+  {
+    name: 'a title closing on a backtick run',
+    paper: { ...BASE_PAPER, title: 'The title closes on ``code``' },
+  },
+  {
+    name: 'a title padded by spaces on both sides',
+    paper: { ...BASE_PAPER, title: ' padded title ' },
+  },
+  {
+    name: 'an empty author list emits no author line',
+    paper: { ...BASE_PAPER, authors: [] },
+  },
 ];
 
-describe('paper text in content[] reads back as structuredContent carries it (#87)', () => {
+describe('paper text in content[] reads back as structuredContent carries it (#87, #91)', () => {
   it.each(UPSTREAM_TEXT_CASES)('$name', async ({ paper, meta }) => {
     mockSearch.mockResolvedValue({
       total_results: 1,
@@ -378,16 +437,26 @@ describe('paper text in content[] reads back as structuredContent carries it (#8
     expect(structured).toEqual(paper);
     const block = result.content[0];
     const text = block?.type === 'text' ? block.text : '';
+    // The raw text carries each author-written value as written, before any parse.
+    for (const value of [
+      paper.title,
+      paper.authors.join(', '),
+      paper.abstract,
+      paper.comment ?? '',
+    ]) {
+      expect(text).toContain(value);
+    }
     for (const preset of COMMONMARK_PRESETS) {
       expect(readCommonMarkText(text, preset), preset).toBe(
         paperReadsAs(structured as PaperMetadata, meta ?? BASE_META),
       );
+      expect(readCommonMarkFences(text, preset), preset).toEqual(paperFences(paper));
     }
   });
 
   // CommonMark reads CR and CRLF as LF, so such a value reads back with LF line
   // breaks; what matters is that no break opens a block of its own.
-  it('reads a CRLF line break inside a value as LF and opens no block from it', async () => {
+  it('reads a CR or CRLF line break inside a value as LF and opens no block from it', async () => {
     const paper = { ...BASE_PAPER, comment: 'Accepted\r\n# Forged\r- item' };
     mockSearch.mockResolvedValue({
       total_results: 1,
@@ -399,8 +468,13 @@ describe('paper text in content[] reads back as structuredContent carries it (#8
 
     const block = result.content[0];
     const text = block?.type === 'text' ? block.text : '';
-    expect(readCommonMarkText(text)).toBe(
-      paperReadsAs({ ...paper, comment: 'Accepted\n# Forged\n- item' }, BASE_META),
-    );
+    expect(text).toContain(paper.comment);
+    for (const preset of COMMONMARK_PRESETS) {
+      expect(readCommonMarkText(text, preset), preset).toBe(paperReadsAs(paper, BASE_META));
+      expect(readCommonMarkFences(text, preset), preset).toEqual([
+        { info: 'text', literal: `${paper.abstract}\n` },
+        { info: 'text', literal: 'Accepted\n# Forged\n- item\n' },
+      ]);
+    }
   });
 });

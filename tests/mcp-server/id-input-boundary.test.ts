@@ -133,10 +133,10 @@ const CANONICAL_ID = /^(?:\d{4}\.\d{4,5}|[a-z]+(?:-[a-z]+)?\/\d{7})(?:v\d+)?$/;
 /**
  * Answer the way arXiv does: one entry per `id_list` member spelled the way
  * arXiv spells IDs (an unversioned ID resolves to v1), no entry for any other
- * spelling, and HTTP 400 for a batch holding a foreign identifier. Any request
- * off the API host is an HTML render of the paper.
+ * spelling or for an `absent` member, and HTTP 400 for a batch holding a
+ * foreign identifier. Any request off the API host is an HTML render of the paper.
  */
-function serveArxiv(): void {
+function serveArxiv(absent: readonly string[] = []): void {
   mockFetch.mockImplementation(async (request) => {
     const url = new URL(String(request));
     if (url.hostname !== 'export.arxiv.org') {
@@ -153,7 +153,7 @@ function serveArxiv(): void {
       });
     }
     const entries = requested
-      .filter((id) => CANONICAL_ID.test(id))
+      .filter((id) => CANONICAL_ID.test(id) && !absent.includes(id))
       .map((id) => (/v\d+$/.test(id) ? id : `${id}v1`))
       .map(
         (id) => `<entry><id>http://arxiv.org/abs/${id}</id><title>Paper ${id}</title>
@@ -187,6 +187,7 @@ function textOf(result: { content: { type: string; text?: string }[] }): string 
 
 type MetadataOutput = {
   papers: { id: string }[];
+  totalSucceeded: number;
   not_found?: { id: string; reason: string; detail?: string }[];
   remaining_ids?: string[];
 };
@@ -297,6 +298,10 @@ describe('a malformed ID fails invalid_id before any upstream request (#41)', ()
     '1706.03762v7 | cs.CL',
     'https://example.org/abs/1706.03762',
     '1706.0376',
+    // A month that cannot exist can only be a typo (#98).
+    '9999.99999',
+    '2400.00001',
+    'hep-th/9913001',
   ];
 
   for (const input of malformed) {
@@ -479,7 +484,7 @@ describe('arxiv_get_metadata looks up the first 10 well-formed IDs and names the
     const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
     expect(output.remaining_ids).toHaveLength(15);
     expect(textOf(result).split('\n')[0]).toBe(
-      'Found 10 of 10 papers. Looked up the first 10 well-formed IDs; 15 more IDs are listed under Remaining IDs below.',
+      'Found 10 of 10 papers. Looked up the first 10 distinct well-formed IDs; 15 more IDs are listed under Remaining IDs below.',
     );
   });
 
@@ -493,7 +498,7 @@ describe('arxiv_get_metadata looks up the first 10 well-formed IDs and names the
       }) ?? [])[0] as { text: string }
     ).text;
     expect(text.split('\n')[0]).toBe(
-      'Found 0 of 10 papers. Looked up the first 10 well-formed IDs; 1 more ID is listed under Remaining IDs below.',
+      'Found 0 of 10 papers. Looked up the first 10 distinct well-formed IDs; 1 more ID is listed under Remaining IDs below.',
     );
   });
 
@@ -599,6 +604,242 @@ describe('arxiv_get_metadata looks up the first 10 well-formed IDs and names the
       ['2401.00003', 'not_in_arxiv'],
     ]);
   });
+});
+
+describe('arxiv_get_metadata keeps distinct versions of one paper as distinct lookups (#28)', () => {
+  it('an unversioned ID and a pin on the same paper are two entries from one request', async () => {
+    serveArxiv();
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762', '1706.03762v7'],
+    });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    // The feed's latest version answers the unversioned ID; the pin is its own entry.
+    expect(output.papers.map((paper) => paper.id)).toEqual(['1706.03762v7', '1706.03762v7']);
+    expect(idLists()).toEqual(['1706.03762,1706.03762v7']);
+    expect(textOf(result)).toContain('Found 2 of 2 papers.');
+  });
+});
+
+describe('arxiv_get_metadata looks up each distinct ID once (#92)', () => {
+  it('one paper in three spellings is one lookup and one record', async () => {
+    serveArxiv();
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762', 'arXiv:1706.03762', 'https://arxiv.org/abs/1706.03762'],
+    });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    expect(output.papers.map((paper) => paper.id)).toEqual(['1706.03762v1']);
+    expect(output.totalSucceeded).toBe(1);
+    expect(output.not_found).toBeUndefined();
+    expect(idLists()).toEqual(['1706.03762']);
+    expect(textOf(result).split('\n')[0]).toBe('Found 1 of 1 papers.');
+  });
+
+  it('a repeat spends no lookup slot: 12 IDs with one repeat look up 10 and leave 1', async () => {
+    serveArxiv();
+    const ids = wellFormedIds(10);
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762', '1706.03762', ...ids],
+    });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    expect(output.papers.map((paper) => paper.id)).toEqual([
+      '1706.03762v1',
+      ...ids.slice(0, 9).map((id) => `${id}v1`),
+    ]);
+    expect(output.remaining_ids).toEqual(['2401.00010']);
+    expect(idLists()).toEqual([['1706.03762', ...ids.slice(0, 9)].join(',')]);
+    expect(textOf(result).split('\n')[0]).toBe(
+      'Found 10 of 10 papers. Looked up the first 10 distinct well-formed IDs; 1 more ID is listed under Remaining IDs below.',
+    );
+  });
+
+  it('repeated pins collapse to their first position; distinct versions stay distinct', async () => {
+    serveArxiv();
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762v1', '1706.03762v7', '1706.03762v1'],
+    });
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    expect(output.papers.map((paper) => paper.id)).toEqual(['1706.03762v1', '1706.03762v7']);
+    expect(idLists()).toEqual(['1706.03762v1,1706.03762v7']);
+  });
+
+  it('a repeat of an ID past the cap is listed once in remaining_ids', async () => {
+    serveArxiv();
+    const ids = wellFormedIds(12);
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: [...ids, 'arXiv:2401.00011', ids[11]!],
+    });
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    expect(output.papers).toHaveLength(10);
+    expect(output.remaining_ids).toEqual(['2401.00011', '2401.00012']);
+    expect(textOf(result)).toContain(
+      'Remaining IDs (not looked up; pass as paper_ids in the next call): ["2401.00011","2401.00012"]',
+    );
+  });
+
+  it('a repeated miss is one not_found entry; a repeated malformed ID keeps one per occurrence', async () => {
+    serveArxiv(['2312.99999']);
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762', 'bad one', '2312.99999', 'bad one', 'arXiv:2312.99999'],
+    });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+    expect(output.papers.map((paper) => paper.id)).toEqual(['1706.03762v1']);
+    expect(output.not_found?.map((miss) => [miss.id, miss.reason])).toEqual([
+      ['bad one', 'invalid_id'],
+      ['2312.99999', 'not_in_arxiv'],
+      ['bad one', 'invalid_id'],
+    ]);
+    expect(idLists()).toEqual(['1706.03762,2312.99999']);
+    expect(textOf(result).split('\n')[0]).toBe('Found 1 of 4 papers.');
+  });
+
+  it('an all-miss call fails no_match naming each distinct ID once in data.ids and data.not_found', async () => {
+    serveArxiv(['2312.99999']);
+    const result = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['2312.99999', 'https://arxiv.org/abs/2312.99999', '2312.99999'],
+    });
+    expect(result.isError).toBe(true);
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'no_match',
+        ids: ['2312.99999'],
+        not_found: [{ id: '2312.99999', reason: 'not_in_arxiv' }],
+      },
+    });
+    expect(idLists()).toEqual(['2312.99999']);
+  });
+});
+
+/** The no_match recovery every ID surface declares (#93). */
+const NO_MATCH_RECOVERY =
+  'Find the paper with arxiv_search_papers, or recheck the ID against its source; if the ID pins a version, retry without the suffix.';
+
+describe('a well-formed ID arXiv has no paper for is never told to check its format (#93)', () => {
+  /** Assert one failed tool call's no_match wire text: message, hint, and content[]. */
+  function expectNoMatch(
+    result: Awaited<ReturnType<typeof runToolContract>>,
+    message: string,
+    data: Record<string, unknown>,
+  ): void {
+    expect(result.isError).toBe(true);
+    const error = errorOf(result) as {
+      code: number;
+      message: string;
+      data: Record<string, unknown> & { recovery?: { hint: string } };
+    };
+    expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+    expect(error.message).toBe(message);
+    expect(error.data).toMatchObject({ reason: 'no_match', ...data });
+    expect(error.data.recovery?.hint).toBe(NO_MATCH_RECOVERY);
+    const text = readCommonMarkText(textOf(result));
+    expect(text).toContain(message);
+    expect(text).toContain(NO_MATCH_RECOVERY);
+    expect(text.toLowerCase()).not.toContain('format');
+  }
+
+  it('arxiv_read_paper names the missing paper, and "paper or version" for a pin', async () => {
+    serveArxiv(['2312.99999', '1706.03762v99']);
+    expectNoMatch(
+      await runToolContract(arxivReadPaper, { paper_id: '2312.99999' }),
+      "arXiv has no paper with ID '2312.99999'.",
+      { paperId: '2312.99999' },
+    );
+    expectNoMatch(
+      await runToolContract(arxivReadPaper, { paper_id: 'arXiv:1706.03762v99' }),
+      "arXiv has no paper or version with ID '1706.03762v99'.",
+      { paperId: '1706.03762v99' },
+    );
+    expect(idLists()).toEqual(['2312.99999', '1706.03762v99']);
+  });
+
+  it('arxiv_get_metadata keeps its message and takes the new recovery', async () => {
+    serveArxiv(['2312.99999']);
+    expectNoMatch(
+      await runToolContract(arxivGetMetadata, { paper_ids: ['2312.99999'] }),
+      'No papers found for the given IDs.',
+      { ids: ['2312.99999'], not_found: [{ id: '2312.99999', reason: 'not_in_arxiv' }] },
+    );
+  });
+
+  it('arxiv://paper/{paperId} names the missing paper, and "paper or version" for a pin', async () => {
+    serveArxiv(['2312.99999', '1706.03762v99']);
+    await expect(readResource('2312.99999')).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: "arXiv has no paper with ID '2312.99999'.",
+      data: { reason: 'no_match', paperId: '2312.99999' },
+    });
+    await expect(readResource('1706.03762v99')).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: "arXiv has no paper or version with ID '1706.03762v99'.",
+      data: { reason: 'no_match', paperId: '1706.03762v99' },
+    });
+  });
+
+  it('declares the same no_match recovery on all three surfaces, with no format hint', () => {
+    for (const errors of [arxivReadPaper.errors, arxivGetMetadata.errors, paperResource.errors]) {
+      const entry = errors?.find((candidate) => candidate.reason === 'no_match');
+      expect(entry?.recovery).toBe(NO_MATCH_RECOVERY);
+      expect(`${entry?.when} ${entry?.recovery}`.toLowerCase()).not.toContain('format');
+    }
+  });
+});
+
+describe('every reason but no_match keeps its recovery wording on all three surfaces (#93)', () => {
+  type Contract = readonly { reason: string; recovery: string }[] | undefined;
+  const unchanged: [name: string, errors: Contract, recovery: Record<string, string>][] = [
+    [
+      'arxiv_get_metadata',
+      arxivGetMetadata.errors,
+      {
+        invalid_id:
+          'Send IDs like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works.',
+        version_unavailable:
+          'Request the version named in the error detail, or drop the version suffix to get the latest.',
+        version_not_served:
+          'Request the latest version each not_found detail names, or drop the version suffix; a version whose detail says to request it alone may be served that way.',
+        invalid_request: 'Verify the ID format (e.g., "2401.12345" or "2401.12345v2") and retry.',
+      },
+    ],
+    [
+      'arxiv_read_paper',
+      arxivReadPaper.errors,
+      {
+        invalid_id:
+          'Send an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works.',
+        version_unavailable:
+          'Retry once arXiv is reachable, or request the version reported in error.data.mirrorVersion.',
+        version_not_served:
+          'Read the latest version the error message names, or download this version from error.data.pdfUrl.',
+        invalid_request:
+          'Verify the paper ID format (e.g., "2401.12345" or "2401.12345v2") and retry.',
+      },
+    ],
+    [
+      'arxiv://paper/{paperId}',
+      paperResource.errors,
+      {
+        invalid_id:
+          'Read the URI with an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it; percent-encode the slash).',
+        version_unavailable:
+          'Read the version named in the error detail, or drop the version suffix to get the latest.',
+        version_not_served:
+          'Read the latest version named in the error detail, or drop the version suffix to get the latest.',
+        invalid_request: 'Verify the paper ID format (e.g., "2401.12345") and retry.',
+      },
+    ],
+  ];
+
+  for (const [name, errors, recovery] of unchanged) {
+    it(name, () => {
+      for (const [reason, text] of Object.entries(recovery)) {
+        expect(errors?.find((entry) => entry.reason === reason)?.recovery, reason).toBe(text);
+      }
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

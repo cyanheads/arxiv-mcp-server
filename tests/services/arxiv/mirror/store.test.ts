@@ -2164,4 +2164,62 @@ describe('rawToRow', () => {
     expect(row.primary_category).toBe('physics.optics');
     expect(row.categories).toBe('physics.optics cs.LG');
   });
+
+  // Issue #89 — the row holds the text the arXiv API serves, not arXivRaw's TeX.
+  it('converts TeX in the five text columns after collapsing their whitespace, and leaves the DOI', () => {
+    const row = rawToRow(
+      mkRecord({
+        title: 'From Sm{\\o}r-re-br{\\o}d\n  to Subwords',
+        authors: "O. Barrag\\'an and\n  A. Petralia",
+        abstract:
+          'Optical (3300-9700 \\AA) spectra\nof [$\\alpha$/Fe] stars at $\\ell_\\phi$, $\\varphi$.',
+        comments: '\\copyright 2026 IEEE;  {\\dag} equal',
+        journal_ref: "Proc. Vald\\'es 3 (1999)",
+        doi: "10.1/a\\'b",
+      }),
+    );
+    expect(row).toMatchObject({
+      title: 'From Smør-re-brød to Subwords',
+      authors: 'O. Barragán and A. Petralia',
+      abstract: 'Optical (3300-9700 Å) spectra of [$α$/Fe] stars at $\\ell_φ$, $\\varphi$.',
+      comment: '©2026 IEEE; † equal',
+      journal_ref: 'Proc. Valdés 3 (1999)',
+      doi: "10.1/a\\'b",
+    });
+  });
+
+  it('keeps the space a name-ending macro would take from the and after it', () => {
+    expect(rawToRow(mkRecord({ authors: 'K. Gr\\o and \\ss & B. Lee' })).authors).toBe(
+      'K. Grø and ß & B. Lee',
+    );
+  });
+
+  it('indexes the converted text, so a search meets either spelling of an accented name', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'arxiv-store-tex-'));
+    const store = await MirrorStore.open(join(dir, 'mirror.db'));
+    try {
+      store.applyBatch(
+        [
+          mkRecord({
+            paper_id: '2504.01540',
+            title: 'From Sm{\\o}r-re-br{\\o}d to Subwords',
+            authors: "O. Barrag\\'an and A. Petralia",
+          }),
+        ],
+        [],
+      );
+      const ids = (matchExpr: string) =>
+        store
+          .search({ matchExpr, limit: 10, offset: 0, sortBy: 'relevance', sortOrder: 'descending' })
+          .papers.map((paper) => paper.id);
+      expect(ids('authors:barragan')).toEqual(['2504.01540']);
+      expect(ids('authors:"Barragán"')).toEqual(['2504.01540']);
+      expect(ids('title:"Smør-re-brød"')).toEqual(['2504.01540']);
+      // arXiv's own search matches no TeX spelling; neither does the index now.
+      expect(ids('authors:"barrag an"')).toEqual([]);
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

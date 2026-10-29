@@ -15,27 +15,15 @@ import {
 } from '@/services/arxiv/types.js';
 
 /**
- * `title` as ATX heading text that reads back as written: escaped inline, and a
- * trailing run of `#` after a space escaped too, since a heading strips such a
- * run as its closing sequence ("C #" would read as "C").
- */
-function headingText(title: string): string {
-  const text = escapeMarkdownInline(title);
-  let run = text.length;
-  while (run > 0 && text[run - 1] === '#') run--;
-  return run < text.length && (text[run - 1] === ' ' || text[run - 1] === '\t')
-    ? `${text.slice(0, run)}\\${text.slice(run)}`
-    : text;
-}
-
-/**
  * Outline as text: one list item per heading, nested under the nearest
- * shallower heading before it, with its level and start. Nesting follows the
- * open headings rather than the level number: a list item indented 4 columns
- * past its parent's content is not a sub-item but a continuation of the
- * parent's text, so a jump such as level 1 to level 4 would merge two entries.
- * Each cap notice takes a blank line before it, for the same reason: a line
- * right after the last item continues that item's text.
+ * shallower heading before it, with its title in a code span (TeX reads back
+ * byte-for-byte, #91), then its level and start. A heading with no text gets no
+ * span, since an empty one reads as two backticks. Nesting follows the open
+ * headings rather than the level number: a list item indented 4 columns past
+ * its parent's content is not a sub-item but a continuation of the parent's
+ * text, so a jump such as level 1 to level 4 would merge two entries. Each cap
+ * notice takes a blank line before it, for the same reason: a line right after
+ * the last item continues that item's text.
  */
 function formatOutline(
   outline: OutlineEntry[],
@@ -48,7 +36,8 @@ function formatOutline(
     while (open.length > 0 && (open.at(-1) ?? 0) >= entry.level) open.pop();
     const indent = '  '.repeat(open.length);
     open.push(entry.level);
-    return `${indent}- ${escapeMarkdownInline(entry.title)} (level ${entry.level}, start=${entry.start})`;
+    const title = entry.title === '' ? '' : `${markdown().inlineCode(entry.title).build()} `;
+    return `${indent}- ${title}(level ${entry.level}, start=${entry.start})`;
   });
   const lines =
     outline.length === 0
@@ -88,9 +77,9 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Paper ID is not present in the arXiv index.',
+      when: 'arXiv has no paper with this ID, or no such version when the ID pins one.',
       recovery:
-        'Verify the paper ID format (e.g., "2401.12345") and confirm via arxiv_search_papers before retrying.',
+        'Find the paper with arxiv_search_papers, or recheck the ID against its source; if the ID pins a version, retry without the suffix.',
       thrownBy: 'service',
       severity: 'notice',
     },
@@ -200,7 +189,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     body_characters: z
       .number()
       .describe(
-        'Character count of the full cleaned body. Use with start and max_characters to page. Typically 3-4× smaller than total_characters for math-heavy HTML papers.',
+        'Character count of the full cleaned body. Use with start and max_characters to page. Typically 2-8× smaller than total_characters for HTML papers, most for math-heavy ones.',
       ),
     pdf_url: z.string().describe('Direct PDF download URL.'),
     abstract_url: z.string().describe('arXiv abstract page URL for attribution.'),
@@ -260,7 +249,9 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     const paperId = escapeMarkdownInline(result.paper_id);
     const pdfUrl = markdownLink(result.pdf_url, result.pdf_url);
     const lines = [
-      `# ${headingText(result.title)}`,
+      // A code span keeps the title's TeX byte-for-byte, and ends on a backtick,
+      // so no trailing # run reads as the heading's closing sequence (#91).
+      `# ${markdown().inlineCode(result.title).build()}`,
       // Raw integer values in the header so both character counts are discoverable
       // by text-only clients (format-parity) without locale formatting interfering.
       `arXiv:${paperId} | Source: ${result.source} | Raw: ${result.total_characters} chars | Body: ${result.body_characters} chars${result.truncated ? ' (truncated)' : ''}`,

@@ -280,9 +280,9 @@ describe('ArxivService.getPapers — additional cases', () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
     const service = getArxivService();
-    const result = await service.getPapers(['9999.99999'], ctx);
+    const result = await service.getPapers(['2312.99999'], ctx);
     expect(result.papers).toHaveLength(0);
-    expect(result.not_found).toEqual([{ id: '9999.99999', reason: 'not_in_arxiv' }]);
+    expect(result.not_found).toEqual([{ id: '2312.99999', reason: 'not_in_arxiv' }]);
   });
 
   it('classifies 400 from getPapers as InvalidRequest', async () => {
