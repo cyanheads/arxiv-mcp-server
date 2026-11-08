@@ -1,6 +1,6 @@
 # arxiv-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 15:19:14
+Generated on: 2026-11-08 18:00:36
 
 ```text
 arxiv-mcp-server/
@@ -176,6 +176,7 @@ arxiv-mcp-server/
 │   ├── services/
 │   │   └── arxiv/
 │   │       ├── mirror/
+│   │       │   ├── author-fold.ts
 │   │       │   ├── harvester.ts
 │   │       │   ├── index.ts
 │   │       │   ├── query.ts
@@ -243,7 +244,8 @@ arxiv-mcp-server/
 │   │       ├── meta.json
 │   │       └── oai-arxivraw.xml.gz
 │   ├── helpers/
-│   │   └── commonmark-text.ts
+│   │   ├── commonmark-text.ts
+│   │   └── pre-v7-fts-statements.ts
 │   ├── mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
@@ -264,6 +266,7 @@ arxiv-mcp-server/
 │   └── services/
 │       └── arxiv/
 │           ├── mirror/
+│           │   ├── author-fold.test.ts
 │           │   ├── harvester.test.ts
 │           │   ├── migration.test.ts
 │           │   ├── parity.test.ts

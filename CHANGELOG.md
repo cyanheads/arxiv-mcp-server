@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [1.8.2](changelog/1.8.x/1.8.2.md) — 2026-11-08
+
+Mirror and live answers agree on alias category codes and on author names with ł, ø, ß, and similar (mirror schema v7, a one-time full-text index rebuild). A pinned read of the mirror's version skips the live lookup, arxiv_get_metadata accepts paper_id and its siblings, and sort_by accepts arXiv's own names.
+
 ## [1.8.1](changelog/1.8.x/1.8.1.md) — 2026-10-29
 
 Mirror and live answers read a paper the same: TeX is converted to Unicode at harvest (mirror schema v6), authors split like the API, and multi-word au: queries go live. content[] keeps TeX verbatim in code literals, repeated IDs are looked up once, and read_paper bodies shed LaTeXML presentation markup.
