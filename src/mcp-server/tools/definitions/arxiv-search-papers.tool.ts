@@ -11,6 +11,7 @@ import {
   ARXIV_API_RESULT_LIMIT,
   formatPaper,
   PaperMetadataSchema,
+  SORT_BY_MAP,
 } from '@/services/arxiv/types.js';
 
 /**
@@ -35,6 +36,26 @@ const CAP_TEXT = MIRROR_SEARCH_MATCH_CAP.toLocaleString('en-US');
 /** Optional `YYYY-MM-DD`. Empty string passes so form-based clients that submit
  * the whole schema shape aren't punished; the handler treats it as unset. */
 const OPTIONAL_DATE = /^(\d{4}-\d{2}-\d{2})?$/;
+
+/** The lowercased spellings `sort_by` reads as each criterion: its own name and arXiv's. */
+const SORT_BY_SPELLINGS = new Map(
+  Object.entries(SORT_BY_MAP).flatMap(([sortBy, apiName]) => [
+    [sortBy, sortBy],
+    [apiName.toLowerCase(), sortBy],
+  ]),
+);
+
+/**
+ * `sort_by` preprocess: a value is read without regard to case or surrounding
+ * whitespace, and arXiv's own `submittedDate` / `lastUpdatedDate` as the
+ * criterion they name, so the handler, both search paths, and the recency
+ * bypass see only a canonical value. Anything else passes through unchanged
+ * for the enum to reject. The advertised schema is the inner enum's.
+ */
+function canonicalSortBy(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  return SORT_BY_SPELLINGS.get(value.trim().toLowerCase()) ?? value;
+}
 
 export const arxivSearchPapers = tool('arxiv_search_papers', {
   description:
@@ -107,13 +128,13 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
       // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — this regex filters them out.
       .regex(/^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$/, 'Query contains control characters.')
       .describe(
-        `Search query. Field prefixes: ti: (title), au: (author — search the surname and narrow a common one with a category or topic: au:hinton AND cat:cs.LG; a quoted name such as au:"geoffrey hinton" matches when one author's name holds every quoted word, in any order, and an initial does not match a spelled-out first name), abs: (abstract), cat: (category — a leaf code matches exactly, a bare archive code such as cat:astro-ph matches its whole subtree), co: (comment), jr: (journal ref), all: (all fields). Boolean operators, uppercase only: AND, OR, ANDNOT. Space-separated terms are joined with OR, so "quantum computing" matches papers with either word; AND requires every term ("quantum AND computing"). The operators share one precedence and group to the right ("a AND b OR c" reads as "a AND (b OR c)"), so use parentheses for any other grouping. Quote a multi-word topic to match it as a phrase, and put alternatives in parentheses before a filter so the filter applies to all of them: '"graph neural networks" AND cat:cs.LG', '(ti:transformer OR ti:attention) AND cat:cs.CL'. arXiv ignores common words such as of, the, and, for, in, so leave them out or keep them inside a quoted phrase. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
+        `Search query. Field prefixes: ti: (title), au: (author — search the surname and narrow a common one with a category or topic: au:hinton AND cat:cs.LG; a quoted name such as au:"geoffrey hinton" matches when one author's name holds every quoted word, in any order, and an initial does not match a spelled-out first name), abs: (abstract), cat: (category — a leaf code matches exactly, an alias code such as cat:cs.NA matches its canonical code, math.NA, and a bare archive code such as cat:astro-ph matches its whole subtree), co: (comment), jr: (journal ref), all: (all fields). Boolean operators, uppercase only: AND, OR, ANDNOT. Space-separated terms are joined with OR, so "quantum computing" matches papers with either word; AND requires every term ("quantum AND computing"). The operators share one precedence and group to the right ("a AND b OR c" reads as "a AND (b OR c)"), so use parentheses for any other grouping. Quote a multi-word topic to match it as a phrase, and put alternatives in parentheses before a filter so the filter applies to all of them: '"graph neural networks" AND cat:cs.LG', '(ti:transformer OR ti:attention) AND cat:cs.CL'. arXiv ignores common words such as of, the, and, for, in, so leave them out or keep them inside a quoted phrase. Examples: "au:bengio AND ti:attention", "all:transformer AND cat:cs.CL".`,
       ),
     category: z
       .string()
       .optional()
       .describe(
-        'Restrict results to an arXiv category. A leaf code ("cs.CL", "math.AG") matches exactly. A bare archive code ("astro-ph", "cond-mat", "cs", "math") matches the whole archive — its subject classes plus the legacy flat papers filed before the archive was subdivided. Note "physics" is the general-physics archive (physics.*), not the wider physics group: astro-ph, cond-mat, hep-*, quant-ph and the rest are separate archive codes. Use arxiv_list_categories to discover subject classes.',
+        'Restrict results to an arXiv category. A leaf code ("cs.CL", "math.AG") matches exactly. An alias code matches the papers of the canonical code arXiv lists in its place: "cs.NA" matches math.NA, "cs.SY" eess.SY, "math.IT" cs.IT, "math.MP" math-ph, "stat.TH" math.ST, "q-fin.EC" econ.GN. A bare archive code ("astro-ph", "cond-mat", "cs", "math") matches the whole archive — its subject classes plus the legacy flat papers filed before the archive was subdivided — and the canonical codes of the aliases in it, so "cs" also matches math.NA and eess.SY. Note "physics" is the general-physics archive (physics.*), not the wider physics group: astro-ph, cond-mat, hep-*, quant-ph and the rest are separate archive codes. Use arxiv_list_categories to discover subject classes.',
       ),
     max_results: z
       .number()
@@ -124,9 +145,12 @@ export const arxivSearchPapers = tool('arxiv_search_papers', {
       .describe(
         `Maximum results to return. Default 10. At most ${PAGE_CAP} are returned per call: a larger value returns the first ${PAGE_CAP}, and when more matches exist the response says how to reach them — the start of the next page, or date windows once paging cannot reach them all. arXiv serves only the first ${ARXIV_API_RESULT_LIMIT} results of a query, so a page reaching past result ${ARXIV_API_RESULT_LIMIT} can come back cut short at it, and the response says so. Each result includes title, authors, abstract, and metadata — keep low to limit response size.`,
       ),
+    // lint:mcp reads .describe() on the preprocess; tools/list drops a .default() outside it.
     sort_by: z
-      .enum(['relevance', 'submitted', 'updated'])
-      .default('relevance')
+      .preprocess(
+        canonicalSortBy,
+        z.enum(['relevance', 'submitted', 'updated']).default('relevance'),
+      )
       .describe(
         'Sort criterion. Use "submitted" for newest papers, "relevance" for best query matches.',
       ),

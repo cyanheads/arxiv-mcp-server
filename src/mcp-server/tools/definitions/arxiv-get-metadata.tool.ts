@@ -11,7 +11,7 @@ import {
   partialResultSchema,
 } from '@cyanheads/mcp-ts-core/utils';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
-import { normalizePaperId, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
+import { normalizePaperId, PAPER_ID_FORMS, PAPER_SEARCH_HINT } from '@/services/arxiv/paper-id.js';
 import {
   formatPaper,
   type PaperLookupMiss,
@@ -78,8 +78,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       reason: 'invalid_id',
       code: JsonRpcErrorCode.ValidationError,
       when: 'None of the requested IDs is an arXiv identifier in an accepted form.',
-      recovery:
-        'Send IDs like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works.',
+      recovery: `Send IDs like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works. ${PAPER_SEARCH_HINT}`,
     },
     {
       reason: 'no_match',
@@ -141,6 +140,9 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
       ),
   }),
 
+  // One input, so each key can only name the IDs; paper_id is arxiv_read_paper's spelling.
+  inputAliases: { paper_id: 'paper_ids', arxiv_id: 'paper_ids', id: 'paper_ids', ids: 'paper_ids' },
+
   output: OutputSchema,
 
   async handler(input, ctx) {
@@ -171,7 +173,7 @@ export const arxivGetMetadata = tool('arxiv_get_metadata', {
           {
             id: entry.raw,
             reason: 'invalid_id',
-            detail: `Not an arXiv ID. Use ${PAPER_ID_FORMS}.`,
+            detail: `Not an arXiv ID. Use ${PAPER_ID_FORMS}. ${PAPER_SEARCH_HINT}`,
           },
         ];
       }

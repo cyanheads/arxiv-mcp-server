@@ -32,6 +32,7 @@ import {
 } from '@/services/arxiv/mirror/schema.js';
 import { MirrorStore, normalizeDateToIso, rawToRow } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
+import { PRE_V7_FTS_STATEMENTS } from '../../../helpers/pre-v7-fts-statements.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -955,6 +956,7 @@ describe('v3→v4 migration (#78)', () => {
     for (const sql of [
       ...MIRROR_PRAGMA_STATEMENTS,
       ...MIRROR_SCHEMA_STATEMENTS,
+      ...PRE_V7_FTS_STATEMENTS,
       ...V3_DATE_INDEX_SQL,
     ]) {
       db.prepare(sql).run();
@@ -1184,6 +1186,11 @@ describe('v3→v4 migration (#78)', () => {
       'index papers_revised_early_idx: ok',
       'index paper_categories_paper_id_idx: ok',
       'trigger paper_categories_published_fill: ok',
+      'view papers_fts_source: ok',
+      'table papers_fts: ok',
+      'trigger papers_ai: ok',
+      'trigger papers_ad: ok',
+      'trigger papers_au: ok',
     ]);
   });
 
@@ -1445,6 +1452,7 @@ describe('v4→v5 migration (#88, #85)', () => {
       ...MIRROR_PRAGMA_STATEMENTS,
       ...MIRROR_SCHEMA_STATEMENTS,
       ...MIRROR_V4_STATEMENTS,
+      ...PRE_V7_FTS_STATEMENTS,
     ]) {
       db.prepare(sql).run();
     }
@@ -1780,17 +1788,6 @@ describe('v4→v5 migration (#88, #85)', () => {
       return { columns, ...(sql !== undefined && { sql }) };
     }
 
-    /** SQLite's schema cookie, which every CREATE or DROP advances. */
-    async function schemaCookie(): Promise<number> {
-      const { Database } = await import('bun:sqlite');
-      const db = new Database(dbPath, { readonly: true });
-      const { schema_version } = db.query('PRAGMA schema_version').get() as {
-        schema_version: number;
-      };
-      db.close();
-      return schema_version;
-    }
-
     /** The index as the harvest runner built it before v5. */
     const RUNNER_INDEX =
       'CREATE INDEX IF NOT EXISTS paper_categories_paper_id_idx ON paper_categories(paper_id)';
@@ -1863,17 +1860,22 @@ describe('v4→v5 migration (#88, #85)', () => {
     it('rebuilds nothing on a file that already holds the v5 definition', async () => {
       await buildV4Db(10);
       await runOnFile(MIRROR_PAPER_ID_INDEX[1]);
-      const before = await schemaCookie();
+      const { Database } = await import('bun:sqlite');
+      const prepared = vi.spyOn(Database.prototype, 'prepare');
 
       const lines = await v5Lines(async () => {
         (await MirrorStore.open(dbPath)).close();
       });
+      const ran = prepared.mock.calls.map(([sql]) => String(sql));
+      prepared.mockRestore();
 
-      // The repair ran and the index part found its work done: no DDL ran.
+      // The repair ran and the index part found its work done: neither its drop
+      // nor its create ran. (The schema cookie cannot show it: v7's FTS rebuild,
+      // later in the same open, runs DDL of its own.)
       expect(lines.map((l) => l.replace(/:.*/s, ''))).toEqual([
         'mirror migration v4→v5 (quote references)',
       ]);
-      expect(await schemaCookie()).toBe(before);
+      expect(ran.filter((sql) => MIRROR_PAPER_ID_INDEX.includes(sql))).toEqual([]);
       expect(await paperIdIndex()).toEqual({
         columns: ['paper_id', 'category'],
         sql: MIRROR_PAPER_ID_INDEX[1],
@@ -1940,6 +1942,7 @@ describe('v5→v6 migration (#89)', () => {
       ...MIRROR_SCHEMA_STATEMENTS,
       ...MIRROR_V4_STATEMENTS,
       ...MIRROR_V5_STATEMENTS,
+      ...PRE_V7_FTS_STATEMENTS,
     ]) {
       db.prepare(sql).run();
     }
@@ -2264,7 +2267,9 @@ describe('v5→v6 migration (#89)', () => {
       code: JsonRpcErrorCode.Conflict,
       data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 5 },
     });
-    expect((failure as McpError).message).toContain('from schema v5 to v6 by another writer');
+    expect((failure as McpError).message).toContain(
+      `from schema v5 to v${MIRROR_SCHEMA_VERSION} by another writer`,
+    );
     expect(await rows()).toEqual(before);
     expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 5 });
   });
@@ -2289,6 +2294,350 @@ describe('v5→v6 migration (#89)', () => {
     expect(partial.slice(0, 5_000)).toEqual(before.papers.slice(0, 5_000).map(converted));
     expect(partial.slice(5_000)).toEqual(before.papers.slice(5_000));
     expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 5 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v6 → v7 migration (issue #100) — the FTS index folds the letters arXiv's
+// author search spells in ASCII, in `authors` alone.
+// ---------------------------------------------------------------------------
+
+describe('v6→v7 migration (#100)', () => {
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-migration-v7-test-'));
+    dbPath = join(dir, 'mirror.db');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  type Row = Record<string, string | number | null>;
+  const LAPSED = '2000-01-01T00:00:00.000Z';
+  const PAPERS = 12_000;
+
+  /**
+   * A v6 mirror of `count` papers as a pre-v7 writer left it: the schema through
+   * v6 with the v3–v6 FTS index, rows written with raw SQL through its
+   * triggers, one junction row each, and schema_version 6. Every 4th paper's
+   * authors hold `Tworzydło` and `Atılgan`, the paper after each `Tworzydlo`, and
+   * every 6th title `Łojasiewicz`.
+   */
+  async function buildV6Db(count: number): Promise<void> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    for (const sql of [
+      ...MIRROR_PRAGMA_STATEMENTS,
+      ...MIRROR_SCHEMA_STATEMENTS,
+      ...MIRROR_V4_STATEMENTS,
+      ...MIRROR_V5_STATEMENTS,
+      ...PRE_V7_FTS_STATEMENTS,
+    ]) {
+      db.prepare(sql).run();
+    }
+    db.prepare(
+      `INSERT INTO schema_version(version, applied_at) VALUES (6, '2026-11-01T00:00:00.000Z')`,
+    ).run();
+    db.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+       INSERT INTO papers(id, version, title, authors, abstract, primary_category, categories,
+                          published, updated, latest_version, comment, journal_ref, doi)
+       SELECT printf('2401.%05d', i), '1',
+              'Paper ' || i || CASE WHEN i % 6 = 0 THEN ' on Łojasiewicz gradients' ELSE '' END,
+              CASE i % 4 WHEN 0 THEN 'J. Tworzydło and Y. C. Atılgan' WHEN 1 THEN 'J. Tworzydlo'
+                         ELSE 'A. Author' END,
+              'Abstract ' || i, 'cs.LG', 'cs.LG',
+              '2024-01-01T00:00:00.000Z', '2024-01-02T00:00:00.000Z', '2024-01-02T00:00:00.000Z',
+              CASE WHEN i % 2 = 0 THEN '12 pages' END, NULL, NULL
+       FROM n`,
+    ).run(count);
+    db.prepare(
+      `INSERT INTO paper_categories(category, paper_id, updated, published)
+       SELECT 'cs.LG', id, updated, published FROM papers`,
+    ).run();
+    db.close();
+  }
+
+  async function rows(): Promise<{ junction: Row[]; papers: Row[] }> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath, { readonly: true });
+    const result = {
+      papers: db.query('SELECT rowid, * FROM papers ORDER BY rowid').all() as Row[],
+      junction: db.query('SELECT rowid, * FROM paper_categories ORDER BY rowid').all() as Row[],
+    };
+    db.close();
+    return result;
+  }
+
+  async function fileState(): Promise<{
+    ftsIntegrity: string;
+    integrity: unknown;
+    leases: string[];
+    version: number | undefined;
+  }> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    let ftsIntegrity = 'ok';
+    try {
+      db.run(`INSERT INTO papers_fts(papers_fts, rank) VALUES ('integrity-check', 1)`);
+    } catch (err) {
+      ftsIntegrity = String((err as { message?: string }).message ?? err);
+    }
+    const integrity = db.query('PRAGMA integrity_check').all();
+    const leases = (
+      db.query('SELECT holder FROM migration_lease').all() as { holder: string }[]
+    ).map((l) => l.holder);
+    const version = (db.query('SELECT version FROM schema_version').get() as { version: number })
+      ?.version;
+    db.close();
+    return { ftsIntegrity, integrity, leases, version };
+  }
+
+  /** Papers whose index row matches `matchExpr` as written, with no fold applied to it. */
+  async function indexed(matchExpr: string): Promise<number> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath, { readonly: true });
+    const { n } = db
+      .query('SELECT COUNT(*) AS n FROM papers_fts WHERE papers_fts MATCH ?')
+      .get(matchExpr) as { n: number };
+    db.close();
+    return n;
+  }
+
+  /** The SQL the file stores for the FTS index, its content view, and its triggers. */
+  async function ftsSchemaOf(path: string): Promise<unknown[]> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(path, { readonly: true });
+    const objects = db
+      .query(
+        `SELECT type, name, sql FROM sqlite_master
+         WHERE name IN ('papers_fts', 'papers_fts_source', 'papers_ai', 'papers_ad', 'papers_au')
+         ORDER BY name`,
+      )
+      .all();
+    db.close();
+    return objects;
+  }
+
+  /** Run `fn`, returning the FTS rebuild's progress lines it wrote to stdout. */
+  async function rebuildLines(fn: () => Promise<unknown>): Promise<string[]> {
+    const writes = vi.spyOn(process.stdout, 'write');
+    try {
+      await fn();
+      return writes.mock.calls
+        .map(([chunk]) => String(chunk))
+        .filter((l) => l.includes('fts rebuild'));
+    } finally {
+      writes.mockRestore();
+    }
+  }
+
+  /** Record another writer's migration lease, last renewed at `renewedAt`. */
+  async function setLease(renewedAt: string): Promise<void> {
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.run(
+      `INSERT OR REPLACE INTO migration_lease(id, holder, pid, started_at, renewed_at)
+       VALUES (1, 'another-writer', 4242, '2026-01-01T00:00:00.000Z', ?)`,
+      [renewedAt],
+    );
+    db.close();
+  }
+
+  it('starts from a v6 file whose index holds each name as written', async () => {
+    await buildV6Db(PAPERS);
+    expect(await indexed('authors:"Tworzydło"')).toBe(3_000);
+    expect(await indexed('authors:"Tworzydlo"')).toBe(3_000);
+    expect(await indexed('authors:"Atilgan"')).toBe(0);
+    expect(await fileState()).toMatchObject({ ftsIntegrity: 'ok', version: 6 });
+  });
+
+  it('refills the index with authors folded, one 5,000-row batch at a time, and leaves every row byte for byte', async () => {
+    await buildV6Db(PAPERS);
+    const before = await rows();
+
+    const lines = await rebuildLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    expect(lines).toEqual([
+      'mirror migration v6→v7 (fts rebuild): 5000/12000 rows\n',
+      'mirror migration v6→v7 (fts rebuild): 10000/12000 rows\n',
+      'mirror migration v6→v7 (fts rebuild): 12000/12000 rows\n',
+    ]);
+    expect(await rows()).toEqual(before);
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      integrity: [{ integrity_check: 'ok' }],
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
+    expect(await indexed('authors:"Tworzydlo"')).toBe(6_000);
+    expect(await indexed('authors:"Tworzydło"')).toBe(0);
+    expect(await indexed('authors:"Atilgan"')).toBe(3_000);
+    // Titles keep their letters, as arXiv's title search does.
+    expect(await indexed('title:"Łojasiewicz"')).toBe(2_000);
+    expect(await indexed('title:"Lojasiewicz"')).toBe(0);
+
+    const freshPath = join(dir, 'fresh.db');
+    (await MirrorStore.open(freshPath)).close();
+    expect(await ftsSchemaOf(dbPath)).toEqual(await ftsSchemaOf(freshPath));
+
+    const opened = await MirrorStore.openReader(dbPath);
+    if (opened.status !== 'open') throw new Error(`expected an open store, got ${opened.status}`);
+    const search = (matchExpr: string) =>
+      opened.store.search({
+        matchExpr,
+        limit: 1,
+        offset: 0,
+        sortBy: 'published',
+        sortOrder: 'ascending',
+      }).total;
+    expect([search('authors:"Atilgan"'), search('authors:"Tworzydlo"')]).toEqual([3_000, 6_000]);
+    opened.store.close();
+  });
+
+  it('runs no rebuild on a file it creates', async () => {
+    const lines = await rebuildLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+    expect(lines).toEqual([]);
+    expect(await fileState()).toMatchObject({ ftsIntegrity: 'ok', leases: [], version: 7 });
+  });
+
+  it('rebuilds the index once, folded, on a file below v3', async () => {
+    const store = await MirrorStore.open(dbPath);
+    store.applyBatch(
+      [
+        mkRecord({ paper_id: '2605.22701', authors: 'J. Tworzydło' }),
+        mkRecord({ paper_id: '2605.22702', authors: 'J. Tworzydlo', comments: 'With ICML' }),
+      ],
+      [],
+    );
+    store.close();
+    const { Database } = await import('bun:sqlite');
+    const db = new Database(dbPath);
+    db.exec(`
+      DROP TRIGGER papers_ai;
+      DROP TRIGGER papers_ad;
+      DROP TRIGGER papers_au;
+      DROP TABLE papers_fts;
+      DROP VIEW IF EXISTS papers_fts_source;
+      ${V2_FTS_SQL}
+      INSERT INTO papers_fts(rowid, title, authors, abstract)
+        SELECT rowid, title, authors, abstract FROM papers;
+      DELETE FROM schema_version;
+      INSERT INTO schema_version(version, applied_at) VALUES (2, '2025-06-01T00:00:00.000Z');
+    `);
+    db.close();
+
+    const lines = await rebuildLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    expect(lines).toEqual(['mirror migration v2→v3 (fts rebuild): 2/2 rows\n']);
+    expect(await indexed('authors:"Tworzydlo"')).toBe(2);
+    expect(await indexed('comment:"ICML"')).toBe(1);
+    expect(await fileState()).toMatchObject({ ftsIntegrity: 'ok', leases: [], version: 7 });
+  });
+
+  it('restarts the refill from the top after an interruption', async () => {
+    await buildV6Db(PAPERS);
+    const before = await rows();
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    // The second renewal — the commit of the refill's first batch — hands the lease away.
+    raw.exec(`
+      CREATE TABLE renewals (n INTEGER NOT NULL);
+      CREATE TRIGGER steal_lease AFTER UPDATE OF renewed_at ON migration_lease BEGIN
+        INSERT INTO renewals(n) VALUES (1);
+        UPDATE migration_lease SET holder = 'another-writer', pid = 4242
+        WHERE id = 1 AND (SELECT COUNT(*) FROM renewals) = 2;
+      END;
+    `);
+    raw.close();
+
+    let failure: unknown;
+    const stopped = await rebuildLines(async () => {
+      failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+    });
+
+    expect(failure).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'migration_lease_lost', holderPid: 4242 },
+    });
+    expect(stopped).toEqual(['mirror migration v6→v7 (fts rebuild): 5000/12000 rows\n']);
+    expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 6 });
+    // Half an index: the first batch's papers only.
+    expect(await indexed('authors:"Tworzydlo"')).toBe(2_500);
+
+    const fix = new Database(dbPath);
+    fix.exec('DROP TRIGGER steal_lease; DROP TABLE renewals;');
+    fix.close();
+    await setLease(LAPSED);
+    const resumed = await rebuildLines(async () => {
+      (await MirrorStore.open(dbPath)).close();
+    });
+
+    expect(resumed).toEqual([
+      'mirror migration v6→v7 (fts rebuild): 5000/12000 rows\n',
+      'mirror migration v6→v7 (fts rebuild): 10000/12000 rows\n',
+      'mirror migration v6→v7 (fts rebuild): 12000/12000 rows\n',
+    ]);
+    expect(await rows()).toEqual(before);
+    expect(await indexed('authors:"Tworzydlo"')).toBe(6_000);
+    expect(await fileState()).toEqual({
+      ftsIntegrity: 'ok',
+      integrity: [{ integrity_check: 'ok' }],
+      leases: [],
+      version: MIRROR_SCHEMA_VERSION,
+    });
+  });
+
+  it('changes nothing and names the holder when another writer holds a live lease', async () => {
+    await buildV6Db(10);
+    const before = await rows();
+    await setLease(new Date().toISOString());
+    expect(await MirrorStore.openReader(dbPath)).toEqual({ status: 'migrating', version: 6 });
+
+    const failure = await MirrorStore.open(dbPath).catch((err: unknown) => err);
+
+    expect(failure).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      data: { reason: 'migration_in_progress', holderPid: 4242, schemaVersion: 6 },
+    });
+    expect((failure as McpError).message).toContain('from schema v6 to v7 by another writer');
+    expect(await rows()).toEqual(before);
+    expect(await indexed('authors:"Tworzydło"')).toBe(2);
+    expect(await fileState()).toMatchObject({ leases: ['another-writer'], version: 6 });
+  });
+
+  it('keeps the index folded when a pre-v7 writer writes to the migrated file', async () => {
+    await buildV6Db(10);
+    (await MirrorStore.open(dbPath)).close();
+    const migrated = await ftsSchemaOf(dbPath);
+
+    // A pre-v7 writer's schema pass is IF NOT EXISTS throughout, so it finds the
+    // v7 objects and leaves them; its writes go through the v7 triggers.
+    const { Database } = await import('bun:sqlite');
+    const raw = new Database(dbPath);
+    for (const sql of PRE_V7_FTS_STATEMENTS.filter((s) => s.startsWith('CREATE'))) raw.run(sql);
+    raw.run(
+      `INSERT INTO papers(id, version, title, authors, abstract, primary_category, categories,
+                          published, updated, latest_version)
+       VALUES ('2605.22701', '1', 'T', 'J. Tworzydło', 'X', 'cs.LG', 'cs.LG',
+               '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z')`,
+    );
+    raw.run(`UPDATE papers SET authors = 'J. Tworzydło, Y. Atılgan' WHERE id = '2401.00001'`);
+    raw.close();
+
+    expect(await ftsSchemaOf(dbPath)).toEqual(migrated);
+    expect(await indexed('authors:"Tworzydło"')).toBe(0);
+    expect(await indexed('authors:"Atilgan"')).toBe(3);
+    expect(await fileState()).toMatchObject({ ftsIntegrity: 'ok', version: 7 });
   });
 });
 

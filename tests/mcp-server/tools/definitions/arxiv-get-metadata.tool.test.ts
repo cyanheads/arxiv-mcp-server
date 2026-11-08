@@ -7,6 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
+import { PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
 import type { PaperLookupResult, PaperMetadata } from '@/services/arxiv/types.js';
 import {
   COMMONMARK_PRESETS,
@@ -348,7 +349,8 @@ describe('arxivGetMetadata', () => {
       {
         id: '*bad* [x](y) <b>',
         reason: 'invalid_id',
-        detail: expect.stringMatching(/^Not an arXiv ID\. Use /),
+        // The accepted forms, then the route for a title or query sent as an ID (#104).
+        detail: `Not an arXiv ID. Use ${PAPER_ID_FORMS}. To find a paper by title, author, or topic, search with arxiv_search_papers.`,
       },
       {
         id: '2401.00002',

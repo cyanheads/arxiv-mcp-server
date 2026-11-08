@@ -26,6 +26,7 @@ import {
 import { XMLParser } from 'fast-xml-parser';
 import { getServerConfig } from '@/config/server-config.js';
 import {
+  canonicalCategory,
   categorySearchTerm,
   categorySubtree,
   SEARCHABLE_CATEGORY_CODES,
@@ -66,17 +67,12 @@ import {
   type ReadContentOptions,
   type SearchOptions,
   type SearchResult,
+  SORT_BY_MAP,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const SORT_BY_MAP: Record<string, string> = {
-  relevance: 'relevance',
-  submitted: 'submittedDate',
-  updated: 'lastUpdatedDate',
-};
 
 /**
  * User-Agent identifying this client to arXiv. arXiv's API guidance and
@@ -912,18 +908,24 @@ const apiInstant = (stored: string) => stored.replace(/\.000Z$/, 'Z');
  * as the live API returns the same paper (issue #89). The mirror stores the
  * latest version only — the returned `id` reflects that. The stored author
  * line is split with arXiv's own rule ({@link splitAuthors}): `,`, ` and `,
- * `&`, and `:` separate names, and parenthesized affiliations drop out.
+ * `&`, and `:` separate names, and parenthesized affiliations drop out. The
+ * stored arXivRaw codes read as the API reports them ({@link canonicalCategory},
+ * issue #99): the canonical primary first, then the other codes canonicalized,
+ * de-duplicated, without the primary, and sorted, so `chem-ph cs.NA math.NA`
+ * reads as `physics.chem-ph math.NA`. The row and its junction keep the raw codes.
  */
 function rowToMetadata(row: PaperRow): PaperMetadata {
   const versionedId = row.version ? `${row.id}v${row.version}` : row.id;
-  const categories = row.categories.split(/\s+/).filter(Boolean);
+  const primary = canonicalCategory(row.primary_category);
+  const others = new Set(row.categories.split(/\s+/).filter(Boolean).map(canonicalCategory));
+  others.delete(primary);
   return {
     id: versionedId,
     title: row.title,
     authors: splitAuthors(row.authors),
     abstract: row.abstract,
-    primary_category: row.primary_category,
-    categories,
+    primary_category: primary,
+    categories: [primary, ...[...others].sort()].filter(Boolean),
     published: apiInstant(row.published),
     updated: apiInstant(row.updated),
     ...(row.comment && { comment: row.comment }),
@@ -1253,7 +1255,7 @@ export class ArxivService {
       search_query: searchQuery,
       start: String(start),
       max_results: String(Math.min(options.maxResults ?? 10, ARXIV_API_RESULT_LIMIT - start)),
-      sortBy: SORT_BY_MAP[options.sortBy ?? 'relevance'] ?? 'relevance',
+      sortBy: SORT_BY_MAP[options.sortBy ?? 'relevance'],
       sortOrder: options.sortOrder ?? 'descending',
     });
 
@@ -1734,8 +1736,17 @@ export class ArxivService {
 
   /**
    * The metadata a read fetches its body for, and whether the mirror supplied
-   * it. The live API answers first, for per-version fidelity: the mirror stores
-   * the latest version only, as of its last refresh.
+   * it. The mirror stores one version per paper, the latest as of its last
+   * refresh, so the live lookup goes first for every read but a pin of that
+   * version.
+   *
+   * A pinned read with the mirror enabled reads the stored row first, and a row
+   * at exactly the pinned version answers with no live lookup: the read takes
+   * only the version and title from it, which for that version are what the
+   * live API returns. Any other outcome sends the lookup, and that one mirror
+   * read answers its failure fallback. Starting the lookup and withdrawing it on
+   * a match was rejected: on an idle queue its request goes out before the row
+   * is read, and holds the queue for the etiquette delay after it. See #103.
    *
    * An unversioned read with the mirror enabled waits on that lookup for at most
    * `ARXIV_API_TIMEOUT_MS` from the read's start, its wait for the API queue
@@ -1748,8 +1759,8 @@ export class ArxivService {
    * A lookup that fails is answered from a mirror holding the paper: an
    * unversioned read takes the stored version, and a pin the stored version does
    * not match fails `version_unavailable` (#33). A paper the mirror lacks keeps
-   * the live error (#68). A cancelled read fails as cancelled and never reads the
-   * mirror.
+   * the live error (#68). A cancelled read fails as cancelled and reads nothing
+   * from the mirror once cancelled.
    */
   private async readMetadata(
     paperId: string,
@@ -1757,19 +1768,28 @@ export class ArxivService {
     deadline: ReadDeadline,
   ): Promise<{ fromMirror: boolean; paper: PaperMetadata }> {
     const config = getServerConfig();
-    const withdraw = new AbortController();
-    const lookup = this.fetchLivePapers([paperId], ctx, {
-      exceeded: deadline.exceeded,
-      signal: AbortSignal.any([deadline.signal, withdraw.signal]),
-    });
-    // The cap and the failure fallback share one mirror read.
+    const pinned = parseVersion(paperId) !== undefined;
+    // A pin's first read, the cap, and the failure fallback share one mirror read.
     let stored: Promise<PaperRow | undefined> | undefined;
     const readStored = () => {
       stored ??= this.readMirrorRow(paperId, ctx);
       return stored;
     };
 
-    if (parseVersion(paperId) === undefined && config.mirrorEnabled) {
+    if (pinned && config.mirrorEnabled) {
+      if (ctx.signal.aborted) throw ctx.signal.reason;
+      const row = await readStored();
+      const paper = row && rowToMetadata(row);
+      if (paper?.id === paperId) return { paper, fromMirror: true };
+    }
+
+    const withdraw = new AbortController();
+    const lookup = this.fetchLivePapers([paperId], ctx, {
+      exceeded: deadline.exceeded,
+      signal: AbortSignal.any([deadline.signal, withdraw.signal]),
+    });
+
+    if (!pinned && config.mirrorEnabled) {
       let cap: ReturnType<typeof setTimeout> | undefined;
       const capReached = await Promise.race([
         lookup.then(

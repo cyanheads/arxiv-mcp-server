@@ -43,6 +43,16 @@ export interface SearchOptions {
   submittedTo?: string;
 }
 
+/**
+ * arXiv API `sortBy` value for each sort criterion. The search tool's `sort_by`
+ * also reads each value as its criterion.
+ */
+export const SORT_BY_MAP = {
+  relevance: 'relevance',
+  submitted: 'submittedDate',
+  updated: 'lastUpdatedDate',
+} as const satisfies Record<NonNullable<SearchOptions['sortBy']>, string>;
+
 export interface SearchResult {
   /**
    * The query carrying every filter the search actually applied — the category

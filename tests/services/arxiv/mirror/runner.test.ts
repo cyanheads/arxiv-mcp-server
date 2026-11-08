@@ -1149,7 +1149,7 @@ describe('runHarvest', () => {
   });
 
   // -------------------------------------------------------------------------
-  // mirror:verify against the schema's indexes and trigger (#78, #85)
+  // mirror:verify against the schema's indexes, fill trigger, and FTS index (#78, #85, #100)
   // -------------------------------------------------------------------------
 
   describe('mirror:verify script (real process)', () => {
@@ -1193,7 +1193,7 @@ describe('runHarvest', () => {
       return row?.sql ?? null;
     }
 
-    it('passes a current file, listing each index and the fill trigger as ok', async () => {
+    it('passes a current file, listing each index, the fill trigger, and each part of the FTS index as ok', async () => {
       await currentFileAfter();
 
       const { code, stderr, stdout } = await runVerify();
@@ -1207,6 +1207,11 @@ describe('runHarvest', () => {
         'index papers_revised_early_idx',
         'index paper_categories_paper_id_idx',
         'trigger paper_categories_published_fill',
+        'view papers_fts_source',
+        'table papers_fts',
+        'trigger papers_ai',
+        'trigger papers_ad',
+        'trigger papers_au',
       ]) {
         expect(stdout).toContain(`  ${object}: ok\n`);
       }
@@ -1296,6 +1301,74 @@ describe('runHarvest', () => {
       },
       30_000,
     );
+
+    it('exits 1 on an unfolded and a missing FTS sync trigger, printing the version rewind once, which makes the next verify rebuild the index (#100)', async () => {
+      await currentFileAfter(
+        'DROP TRIGGER papers_ad',
+        'DROP TRIGGER papers_au',
+        // The update trigger as v3 through v6 define it: `authors` indexed as written.
+        `CREATE TRIGGER papers_au AFTER UPDATE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+END`,
+      );
+      const paper = (authors: string) => ({
+        paper_id: '2605.22701',
+        identifier: 'oai:arXiv.org:2605.22701',
+        datestamp: '2026-05-21',
+        title: 'Monitored transport',
+        authors,
+        abstract: 'X',
+        categories: 'cond-mat.mes-hall',
+        versions: [{ version: 'v1', date: '2026-05-21T00:00:00Z' }],
+      });
+      const writer = await MirrorStore.open(config.mirrorPath);
+      writer.applyBatch([paper('A. Author')], []);
+      writer.applyBatch([paper('J. Tworzydło')], []);
+      writer.close();
+      const before = storedSql('papers_au');
+      const indexed = (matchExpr: string) => {
+        const db = new Database(config.mirrorPath, { readonly: true });
+        const { n } = db
+          .query('SELECT COUNT(*) AS n FROM papers_fts WHERE papers_fts MATCH ?')
+          .get(matchExpr) as { n: number };
+        db.close();
+        return n;
+      };
+      expect([indexed('authors:"Tworzydło"'), indexed('authors:"Tworzydlo"')]).toEqual([1, 0]);
+
+      const failed = await runVerify();
+
+      expect(failed.code, failed.stdout).toBe(1);
+      expect(failed.stdout).toContain('  trigger papers_ad: missing\n');
+      expect(failed.stdout).toContain(
+        `  trigger papers_au: differs from schema v${MIRROR_SCHEMA_VERSION}\n`,
+      );
+      expect(failed.stderr).toContain(
+        `Schema objects FAILED: trigger papers_ad is missing; trigger papers_au differs from schema v${MIRROR_SCHEMA_VERSION}.`,
+      );
+      // Both parts restore through the same rewind, printed once.
+      const printed = failed.stderr.split('\n').filter((line) => line.endsWith(';'));
+      expect(printed).toEqual(['UPDATE schema_version SET version = 6;']);
+      expect(storedSql('papers_au')).toBe(before);
+
+      const db = new Database(config.mirrorPath);
+      for (const statement of printed) db.run(statement);
+      db.close();
+      const repaired = await runVerify();
+
+      expect(repaired.code, repaired.stderr).toBe(0);
+      expect(repaired.stdout).toContain('mirror migration v6→v7 (fts rebuild): 1/1 rows\n');
+      expect(repaired.stdout).toContain('  trigger papers_ad: ok\n');
+      expect(repaired.stdout).toContain('  trigger papers_au: ok\n');
+      expect(repaired.stdout).toContain(
+        `Schema version: ${MIRROR_SCHEMA_VERSION} (expected ${MIRROR_SCHEMA_VERSION})`,
+      );
+      expect(repaired.stdout).toContain('Mirror OK');
+      expect([indexed('authors:"Tworzydło"'), indexed('authors:"Tworzydlo"')]).toEqual([0, 1]);
+    }, 30_000);
   });
 
   // -------------------------------------------------------------------------

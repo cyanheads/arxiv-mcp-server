@@ -768,6 +768,32 @@ describe('ArxivService.search', () => {
     expect(url.searchParams.get('start')).toBe('10');
   });
 
+  it("sends each sort criterion as arXiv's sortBy name, relevance when none is given", async () => {
+    const ctx = createMockContext();
+    const service = getArxivService();
+    for (const sortBy of ['relevance', 'submitted', 'updated', undefined] as const) {
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+      await service.search('ti:attention', sortBy ? { sortBy } : {}, ctx);
+    }
+    expect(
+      mockFetch.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('sortBy')),
+    ).toEqual(['relevance', 'submittedDate', 'lastUpdatedDate', 'relevance']);
+  });
+
+  it("sends the sortBy for arXiv's own name given to the tool as sort_by (#105)", async () => {
+    for (const sort_by of ['submittedDate', 'LastUpdatedDate', ' Updated ']) {
+      mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
+      const result = await runToolContract(arxivSearchPapers, {
+        query: 'ti:transformer',
+        sort_by,
+      } as never);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    }
+    expect(
+      mockFetch.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('sortBy')),
+    ).toEqual(['submittedDate', 'lastUpdatedDate', 'lastUpdatedDate']);
+  });
+
   it('appends category filter to query with user query wrapped in parens', async () => {
     // Parens scope AND to the whole expression, not just the last bare token —
     // prevents "mixture of experts AND cat:cs.CL" from leaking across categories.
@@ -835,7 +861,8 @@ describe('ArxivService.search', () => {
   });
 
   // Issue #32: `cat:math*` also prefix-matches math-ph, a physics archive with
-  // 91,063 papers of its own. The spelled-out subtree keeps it out.
+  // 91,063 papers of its own. The spelled-out subtree keeps the prefix out;
+  // math-ph comes back only as the canonical code of the math.MP alias (#99).
   it('avoids the math / math-ph prefix collision', async () => {
     mockFetch.mockResolvedValueOnce(atomResponse(ATOM_EMPTY));
     const ctx = createMockContext();
@@ -845,7 +872,7 @@ describe('ArxivService.search', () => {
     const searchQuery = new URL(String(mockFetch.mock.calls[0]?.[0])).searchParams.get(
       'search_query',
     );
-    expect(searchQuery).toBe('(manifold) AND (cat:math.* OR cat:math)');
+    expect(searchQuery).toBe('(manifold) AND (cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)');
     expect(searchQuery).not.toContain('cat:math*');
   });
 

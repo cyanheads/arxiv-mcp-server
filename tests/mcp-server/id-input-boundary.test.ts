@@ -17,6 +17,7 @@ import { paperResource } from '@/mcp-server/resources/definitions/paper.resource
 import { arxivGetMetadata } from '@/mcp-server/tools/definitions/arxiv-get-metadata.tool.js';
 import { arxivReadPaper } from '@/mcp-server/tools/definitions/arxiv-read-paper.tool.js';
 import { initArxivService } from '@/services/arxiv/arxiv-service.js';
+import { PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
 import { readCommonMarkText } from '../helpers/commonmark-text.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -378,6 +379,52 @@ describe('a malformed ID fails invalid_id before any upstream request (#41)', ()
     expect(idLists()).toEqual(['2303.08774,hep-th/9901001', '2303.08774']);
   });
 
+  it('looks up the IDs sent as paper_id, arxiv_id, id, or ids as if sent as paper_ids (#102)', async () => {
+    serveArxiv();
+    const calls: [args: Record<string, unknown>, ids: string[]][] = [
+      [{ paper_id: '1706.03762' }, ['1706.03762v1']],
+      [{ arxiv_id: 'arXiv:1706.03762' }, ['1706.03762v1']],
+      [{ id: '1706.03762' }, ['1706.03762v1']],
+      [{ ids: ['1706.03762', '2401.12345'] }, ['1706.03762v1', '2401.12345v1']],
+      // The lone-string wrap and the stringified-array decode, as under paper_ids.
+      [{ ids: '["1706.03762","2401.12345"]' }, ['1706.03762v1', '2401.12345v1']],
+      [{ ids: '1706.03762\n' }, ['1706.03762v1']],
+    ];
+    for (const [args, ids] of calls) {
+      const result = await runToolContract(arxivGetMetadata, args as never);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      const output = arxivGetMetadata.output.parse(result.structuredContent) as MetadataOutput;
+      expect(output.papers.map((paper) => paper.id)).toEqual(ids);
+    }
+    expect(idLists()).toEqual([
+      '1706.03762',
+      '1706.03762',
+      '1706.03762',
+      '1706.03762,2401.12345',
+      '1706.03762,2401.12345',
+      '1706.03762',
+    ]);
+  });
+
+  it('refuses under ids what it refuses under paper_ids, and an alias beside paper_ids, before any fetch (#102)', async () => {
+    serveArxiv();
+    const joined = await runToolContract(arxivGetMetadata, {
+      ids: '1706.03762,2401.12345',
+    } as never);
+    expect(joined.isError).toBe(true);
+    expect(errorOf(joined)).toMatchObject({ code: JsonRpcErrorCode.InvalidParams });
+    expect(textOf(joined)).toContain('Send paper_ids as an array, not a string.');
+
+    const both = await runToolContract(arxivGetMetadata, {
+      paper_ids: ['1706.03762'],
+      id: '2401.12345',
+    } as never);
+    expect(both.isError).toBe(true);
+    expect(errorOf(both)).toMatchObject({ code: JsonRpcErrorCode.InvalidParams });
+    expect(textOf(both)).toContain('id is an alias of paper_ids; send one of them, not both.');
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it('resolves a lone string whose only line breaks sit at its edges', async () => {
     const edges: [input: string, canonical: string][] = [
       ['hep-th/9901001\n', 'hep-th/9901001'],
@@ -457,6 +504,28 @@ describe('a malformed ID fails invalid_id before any upstream request (#41)', ()
       items: { type: 'string', minLength: 1 },
     });
     expect(description).toEqual(expect.stringContaining('arXiv paper IDs, up to 100.'));
+  });
+
+  it('advertises paper_ids as its one key, required, with no other key allowed', () => {
+    // The inputSchema tools/list carries; a key alias must not change it (#102).
+    const schema = arxivGetMetadata.input['~standard'].jsonSchema.input({
+      target: 'draft-2020-12',
+    });
+    expect(schema).toStrictEqual({
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties: {
+        paper_ids: {
+          description: expect.stringContaining('arXiv paper IDs, up to 100.'),
+          type: 'array',
+          minItems: 1,
+          maxItems: 100,
+          items: { type: 'string', minLength: 1 },
+        },
+      },
+      required: ['paper_ids'],
+      additionalProperties: false,
+    });
   });
 });
 
@@ -788,15 +857,68 @@ describe('a well-formed ID arXiv has no paper for is never told to check its for
   });
 });
 
-describe('every reason but no_match keeps its recovery wording on all three surfaces (#93)', () => {
+/** The sentence every invalid_id recovery closes with (#104). */
+const SEARCH_ROUTE = 'To find a paper by title, author, or topic, search with arxiv_search_papers.';
+
+describe('invalid_id sends a title, author, or query to arxiv_search_papers on all three surfaces (#104)', () => {
+  const metadataRecovery = `Send IDs like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works. ${SEARCH_ROUTE}`;
+  const readRecovery = `Send an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works. ${SEARCH_ROUTE}`;
+  const resourceRecovery = `Read the URI with an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it; percent-encode the slash). ${SEARCH_ROUTE}`;
+
+  it('declares the accepted forms, then the search route, as each invalid_id recovery', () => {
+    const recoveryOf = (errors: readonly { reason: string; recovery: string }[] | undefined) =>
+      errors?.find((entry) => entry.reason === 'invalid_id')?.recovery;
+    expect(recoveryOf(arxivGetMetadata.errors)).toBe(metadataRecovery);
+    expect(recoveryOf(arxivReadPaper.errors)).toBe(readRecovery);
+    expect(recoveryOf(paperResource.errors)).toBe(resourceRecovery);
+  });
+
+  it('arxiv_read_paper carries the route in its hint and its text, message and data unchanged', async () => {
+    const result = await runToolContract(arxivReadPaper, { paper_id: 'attention is all you need' });
+    expect(result.isError).toBe(true);
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: `'attention is all you need' is not an arXiv ID. Use ${PAPER_ID_FORMS}.`,
+      data: {
+        reason: 'invalid_id',
+        paperId: 'attention is all you need',
+        recovery: { hint: readRecovery },
+      },
+    });
+    expect(readCommonMarkText(textOf(result))).toContain(`Recovery: ${readRecovery}`);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('arxiv_get_metadata carries the route in its hint and its text, message and data unchanged', async () => {
+    const query = 'au:vaswani AND ti:attention';
+    const result = await runToolContract(arxivGetMetadata, { paper_ids: [query] });
+    expect(result.isError).toBe(true);
+    expect(errorOf(result)).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: `None of the requested IDs is an arXiv ID: '${query}'. Use ${PAPER_ID_FORMS}.`,
+      data: { reason: 'invalid_id', ids: [query], recovery: { hint: metadataRecovery } },
+    });
+    expect(readCommonMarkText(textOf(result))).toContain(`Recovery: ${metadataRecovery}`);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('arxiv://paper/{paperId} fails with its message and data unchanged', async () => {
+    await expect(readResource('attention%20is%20all%20you%20need')).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: `'attention is all you need' is not an arXiv ID. Use ${PAPER_ID_FORMS}.`,
+      data: { reason: 'invalid_id', paperId: 'attention is all you need' },
+    });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('every reason but no_match and invalid_id keeps its recovery wording on all three surfaces (#93, #104)', () => {
   type Contract = readonly { reason: string; recovery: string }[] | undefined;
   const unchanged: [name: string, errors: Contract, recovery: Record<string, string>][] = [
     [
       'arxiv_get_metadata',
       arxivGetMetadata.errors,
       {
-        invalid_id:
-          'Send IDs like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works.',
         version_unavailable:
           'Request the version named in the error detail, or drop the version suffix to get the latest.',
         version_not_served:
@@ -808,8 +930,6 @@ describe('every reason but no_match keeps its recovery wording on all three surf
       'arxiv_read_paper',
       arxivReadPaper.errors,
       {
-        invalid_id:
-          'Send an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works.',
         version_unavailable:
           'Retry once arXiv is reachable, or request the version reported in error.data.mirrorVersion.',
         version_not_served:
@@ -822,8 +942,7 @@ describe('every reason but no_match keeps its recovery wording on all three surf
       'arxiv://paper/{paperId}',
       paperResource.errors,
       {
-        invalid_id:
-          'Read the URI with an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it; percent-encode the slash).',
+        empty_id: 'Supply a non-blank arXiv ID such as "2401.12345" and read the URI again.',
         version_unavailable:
           'Read the version named in the error detail, or drop the version suffix to get the latest.',
         version_not_served:

@@ -29,6 +29,7 @@ import {
 } from '@/services/arxiv/mirror/reader.js';
 import { MirrorStore, resetStore } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
+import { readCommonMarkText } from '../../helpers/commonmark-text.js';
 
 const configOverrides: {
   apiTimeoutMs: number;
@@ -706,6 +707,175 @@ describe('ArxivService — mirror integration', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Alias and subsumed category codes read and search as the API's (#99)
+  // -------------------------------------------------------------------------
+
+  describe('alias and subsumed category codes (#99)', () => {
+    /**
+     * Each paper's arXivRaw category list, as the harvest stores it, and the
+     * `primary_category` and `categories` the Atom API returns for it.
+     */
+    const PAIRS: [id: string, raw: string, primary: string, categories: string[]][] = [
+      [
+        'funct-an/9707004',
+        'funct-an cs.NA math-ph math.CA math.FA math.MP math.NA',
+        'math.FA',
+        ['math.FA', 'math-ph', 'math.CA', 'math.NA'],
+      ],
+      ['chao-dyn/9301001', 'chao-dyn nlin.CD', 'nlin.CD', ['nlin.CD']],
+      [
+        'hep-th/9212019',
+        'hep-th chao-dyn cond-mat nlin.CD',
+        'hep-th',
+        ['hep-th', 'cond-mat', 'nlin.CD'],
+      ],
+      [
+        // `atom-ph` → `physics.atom-ph` sorts after `math.NA`.
+        'chem-ph/9603001',
+        'chem-ph atom-ph cs.NA hep-lat math.NA physics.chem-ph quant-ph',
+        'physics.chem-ph',
+        ['physics.chem-ph', 'hep-lat', 'math.NA', 'physics.atom-ph', 'quant-ph'],
+      ],
+      [
+        '2611.06665',
+        'math.NA cs.CE cs.NA cs.SY eess.SY',
+        'math.NA',
+        ['math.NA', 'cs.CE', 'eess.SY'],
+      ],
+    ];
+    const PAIR_IDS = PAIRS.map(([id]) => id);
+    /** A math.NA paper listing no cs.NA, and an eess.SY paper listing no cs.SY. */
+    const CANONICAL_ONLY: [id: string, raw: string][] = [
+      ['2401.30001', 'math.NA'],
+      ['2401.30002', 'eess.SY'],
+    ];
+
+    beforeEach(async () => {
+      const store = await MirrorStore.open(configOverrides.mirrorPath);
+      store.applyBatch(
+        [...PAIRS, ...CANONICAL_ONLY].map(([paper_id, categories]) =>
+          mkRecord({ paper_id, identifier: `oai:arXiv.org:${paper_id}`, categories }),
+        ),
+        [],
+      );
+      store.close();
+    });
+
+    const categoriesOf = (papers: { categories: string[]; primary_category: string }[]) =>
+      papers.map(({ primary_category, categories }) => ({ primary_category, categories }));
+
+    it.each(PAIRS)(
+      'reads %s with the categories the API returns',
+      async (id, _raw, primary, categories) => {
+        const result = await service.getPapers([id], createMockContext());
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(categoriesOf(result.papers)).toEqual([{ primary_category: primary, categories }]);
+      },
+    );
+
+    it('carries the canonical codes to both tool surfaces', async () => {
+      initArxivService({ mirrorSearcher: searchInThread });
+      const result = await runToolContract(arxivGetMetadata, { paper_ids: PAIR_IDS });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      const papers = (
+        result.structuredContent as {
+          papers: { categories: string[]; id: string; primary_category: string }[];
+        }
+      ).papers;
+      expect(categoriesOf(papers)).toEqual(
+        PAIRS.map(([, , primary_category, categories]) => ({ primary_category, categories })),
+      );
+      const text = readCommonMarkText(
+        result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n'),
+      );
+      for (const [id, , , categories] of PAIRS) {
+        expect(text).toContain(`arXiv:${id}v1 | ${categories.join(', ')} |`);
+      }
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('leaves the stored categories and the junction rows as harvested', async () => {
+      await service.getPapers(PAIR_IDS, createMockContext());
+      const db = new Database(configOverrides.mirrorPath, { readonly: true });
+      try {
+        const marks = PAIR_IDS.map(() => '?').join(', ');
+        const rows = db
+          .query<{ categories: string; id: string; primary_category: string }, string[]>(
+            `SELECT id, primary_category, categories FROM papers WHERE id IN (${marks}) ORDER BY id`,
+          )
+          .all(...PAIR_IDS);
+        const junction = db
+          .query<{ category: string; paper_id: string }, string[]>(
+            `SELECT paper_id, category FROM paper_categories WHERE paper_id IN (${marks})
+             ORDER BY paper_id, category`,
+          )
+          .all(...PAIR_IDS);
+        const sorted = [...PAIRS].sort(([a], [b]) => (a < b ? -1 : 1));
+        expect(rows).toEqual(
+          sorted.map(([id, raw]) => ({
+            id,
+            primary_category: raw.split(' ')[0],
+            categories: raw,
+          })),
+        );
+        expect(junction).toEqual(
+          sorted.flatMap(([paper_id, raw]) =>
+            [...raw.split(' ')].sort().map((category) => ({ paper_id, category })),
+          ),
+        );
+      } finally {
+        db.close();
+      }
+    });
+
+    it.each([
+      // Every seeded paper titled by `mkRecord` matches the term.
+      [
+        'the category parameter',
+        'ti:default',
+        { category: 'cs.NA' },
+        '(ti:default) AND cat:math.NA',
+      ],
+      // Term-less and one code: the count that is exact by construction.
+      ['a query cat:', 'cat:cs.NA', {}, 'cat:math.NA'],
+    ])(
+      'reads an alias in %s as its canonical code, counted exactly',
+      async (_case, query, options, echo) => {
+        const result = await service.search(
+          query,
+          { maxResults: 50, ...options },
+          createMockContext(),
+        );
+        expect(mockFetch).not.toHaveBeenCalled();
+        // Every math.NA paper, the one listing no cs.NA included.
+        expect(result.papers.map((p) => p.id).sort()).toEqual([
+          '2401.30001v1',
+          '2611.06665v1',
+          'chem-ph/9603001v1',
+          'funct-an/9707004v1',
+        ]);
+        expect(result.total_results).toBe(4);
+        expect(result.total_is_lower_bound).toBeUndefined();
+        expect(result.effective_query).toBe(echo);
+      },
+    );
+
+    it('takes in the canonical codes of the aliases an archive holds', async () => {
+      const result = await service.search('cat:cs', { maxResults: 50 }, createMockContext());
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(result.papers.map((p) => p.id).sort()).toEqual([
+        '2401.10001v1',
+        '2401.30001v1',
+        '2401.30002v1',
+        '2611.06665v1',
+        'chem-ph/9603001v1',
+        'funct-an/9707004v1',
+      ]);
+      expect(result.effective_query).toBe('(cat:cs* OR cat:math.NA OR cat:eess.SY)');
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // getPapers — a failed live patch-up keeps what the mirror served (#67)
   // -------------------------------------------------------------------------
 
@@ -1309,12 +1479,19 @@ describe('ArxivService — mirror integration', () => {
         return http503();
       });
 
-    it('fails a call cancelled during the live lookup, never reading the mirror', async () => {
+    it('fails a call cancelled during the live lookup, reading no mirror row after the cancellation', async () => {
       const lookupSpy = vi.spyOn(MirrorStore.prototype, 'getPapersByIds');
       try {
-        // Each paper the mirror lacks, holds at another version (#33), or holds outright.
-        for (const id of ['0704.0001v1', '2401.10002v1', '2401.10002']) {
+        // Each paper the mirror lacks, holds at another version (#33), or holds
+        // outright, with the row a pin reads before its lookup (#103).
+        const cases: [id: string, mirrorReads: string[][][]][] = [
+          ['0704.0001v1', [[['0704.0001']]]],
+          ['2401.10002v1', [[['2401.10002']]]],
+          ['2401.10002', []],
+        ];
+        for (const [id, mirrorReads] of cases) {
           mockFetch.mockClear();
+          lookupSpy.mockClear();
           const controller = new AbortController();
           abortDuringLookup(controller);
 
@@ -1323,8 +1500,14 @@ describe('ArxivService — mirror integration', () => {
             message: 'The client cancelled the call.',
           });
           expect(hosts(), id).toEqual(['export.arxiv.org']);
+          expect(lookupSpy.mock.calls, id).toEqual(mirrorReads);
+          // The cancellation lands inside the lookup's request; every mirror read came first.
+          const cancelledAt = mockFetch.mock.invocationCallOrder[0] ?? 0;
+          expect(
+            lookupSpy.mock.invocationCallOrder.filter((order) => order > cancelledAt),
+            id,
+          ).toEqual([]);
         }
-        expect(lookupSpy).not.toHaveBeenCalled();
       } finally {
         lookupSpy.mockRestore();
       }
@@ -1540,15 +1723,16 @@ describe('ArxivService — mirror integration', () => {
     it('carries the capped read and its ar5iv flag on both surfaces of arxiv_read_paper', async () => {
       initArxivService();
       route(hang, { html: false, ar5iv: true });
-      // A pinned read holds the queue, so this read's lookup is still unsent at
-      // the cap: no request timeout or failure fallback can answer it at 15 s.
-      timed(runToolContract(arxivReadPaper, { paper_id: '2401.10002v3' }));
+      // A pin of a version the mirror lacks holds the queue, so this read's lookup
+      // is still unsent at the cap: no request timeout or failure fallback can
+      // answer it at 15 s.
+      timed(runToolContract(arxivReadPaper, { paper_id: '2401.10002v1' }));
       await advance(0);
       const call = timed(runToolContract(arxivReadPaper, { paper_id: '2401.10001' }));
 
       await advance(15_000);
       expect(call.at).toBe(15_000);
-      expect(apiRequests).toEqual([{ at: 0, idList: '2401.10002v3' }]);
+      expect(apiRequests).toEqual([{ at: 0, idList: '2401.10002v1' }]);
       const result = call.value;
       if (!result) throw new Error(`arxiv_read_paper failed: ${String(call.error)}`);
       expect(result.isError, JSON.stringify(result)).toBeFalsy();
@@ -1641,28 +1825,215 @@ describe('ArxivService — mirror integration', () => {
       }
     });
 
-    it('leaves version-pinned reads to their live lookups, the #33 fallback after them (#33, #69)', async () => {
-      route();
-      const reads = ['2401.10001v1', '2401.10002v3', '2401.10002v1'].map((id) =>
-        timed(service.readContent(id, {}, createMockContext())),
-      );
+    describe('a pin the mirror holds at that version sends no lookup (#103)', () => {
+      it('answers four concurrent pins from their rows, leaving a pin of another version to its lookup and the #33 fallback (#33)', async () => {
+        const readSpy = vi.spyOn(MirrorStore.prototype, 'getPapersByIds');
+        try {
+          route();
+          const held = ['2401.10001v1', '2401.10002v3', '2401.10003v1', '2401.10004v2'];
+          const reads = held.map((id) => timed(service.readContent(id, {}, createMockContext())));
+          const other = timed(service.readContent('2401.10002v1', {}, createMockContext()));
 
-      await advance(15_000);
-      expect(reads[0]).toMatchObject({ at: 15_000, value: { paper_id: '2401.10001v1' } });
-      await advance(18_000);
-      expect(reads[1]).toMatchObject({ at: 33_000, value: { paper_id: '2401.10002v3' } });
-      await advance(16_999);
-      expect(reads[2]?.at).toBeUndefined();
-      await advance(1);
-      expect(reads[2]).toMatchObject({
-        at: 50_000,
-        error: {
-          code: JsonRpcErrorCode.Timeout,
-          message:
-            "Reading arXiv paper '2401.10002v1' timed out after 50000ms; the request to arXiv API was still open.",
-        },
+          await advance(0);
+          expect(
+            reads.map((r) => ({
+              at: r.at,
+              error: r.error,
+              paper_id: r.value?.paper_id,
+              title: r.value?.title,
+              pdf_url: r.value?.pdf_url,
+              source: r.value?.source,
+            })),
+          ).toEqual(
+            [
+              ['2401.10001v1', 'Mirror Paper One on Transformers'],
+              ['2401.10002v3', 'Mirror Paper Two on Astrophysics'],
+              ['2401.10003v1', 'Mirror Paper Three'],
+              ['2401.10004v2', 'Mirror Paper Four'],
+            ].map(([paper_id, title]) => ({
+              at: 0,
+              error: undefined,
+              paper_id,
+              title,
+              pdf_url: `https://arxiv.org/pdf/${paper_id}`,
+              source: 'arxiv_html',
+            })),
+          );
+          expect([...contentRequests].sort()).toEqual(
+            held.map((id) => `https://arxiv.org/html/${id}`),
+          );
+          // The pin the mirror holds at v3 only sends the one lookup, at once.
+          expect(other.at).toBeUndefined();
+          expect(apiRequests).toEqual([{ at: 0, idList: '2401.10002v1' }]);
+
+          await advance(15_000);
+          expect(other).toMatchObject({
+            at: 15_000,
+            error: {
+              code: JsonRpcErrorCode.ServiceUnavailable,
+              data: { reason: 'version_unavailable', paperId: '2401.10002v1', mirrorVersion: '3' },
+            },
+          });
+          await advance(60_000);
+          expect(apiRequests).toEqual([{ at: 0, idList: '2401.10002v1' }]);
+          expect(contentRequests).toHaveLength(4);
+          // One mirror read per read: the failed lookup's fallback reused the row
+          // its pin read before the lookup.
+          expect(readSpy.mock.calls.map(([ids]) => ids).sort()).toEqual([
+            ['2401.10001'],
+            ['2401.10002'],
+            ['2401.10002'],
+            ['2401.10003'],
+            ['2401.10004'],
+          ]);
+        } finally {
+          readSpy.mockRestore();
+        }
       });
-      expect(apiRequests.map((r) => r.at)).toEqual([0, 18_000, 36_000]);
+
+      it('answers a held pin on both surfaces of arxiv_read_paper, its ar5iv body still flagged', async () => {
+        initArxivService();
+        route(hang, { html: false, ar5iv: true });
+        const call = timed(runToolContract(arxivReadPaper, { paper_id: '2401.10002v3' }));
+
+        await advance(0);
+        expect(call.at).toBe(0);
+        expect(apiRequests).toEqual([]);
+        const result = call.value;
+        if (!result) throw new Error(`arxiv_read_paper failed: ${String(call.error)}`);
+        expect(result.isError, JSON.stringify(result)).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          paper_id: '2401.10002v3',
+          title: 'Mirror Paper Two on Astrophysics',
+          pdf_url: 'https://arxiv.org/pdf/2401.10002v3',
+          abstract_url: 'https://arxiv.org/abs/2401.10002v3',
+          source: 'ar5iv',
+          revision_unconfirmed: true,
+        });
+        const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(text).toContain('Mirror Paper Two on Astrophysics');
+        expect(text).toContain('arXiv:2401.10002v3 | Source: ar5iv');
+        expect(text).toContain('https://arxiv.org/abs/2401.10002v3');
+        expect(text).toContain(
+          '[Revision unconfirmed: ar5iv keeps one render per paper, so this body may be another revision than arXiv:2401.10002v3.',
+        );
+        expect(text).toContain('Body text.');
+        expect(contentRequests).toEqual([
+          'https://arxiv.org/html/2401.10002v3',
+          'https://ar5iv.labs.arxiv.org/html/2401.10002v3',
+        ]);
+      });
+
+      it('sends the lookup once a mirror read throws, logging one warning, and keeps the live error (#76)', async () => {
+        const readSpy = vi.spyOn(MirrorStore.prototype, 'getPapersByIds').mockImplementation(() => {
+          throw corrupt();
+        });
+        try {
+          route();
+          const ctx = createMockContext();
+          const warning = vi.spyOn(ctx.log, 'warning');
+          const read = timed(service.readContent('2401.10001v1', {}, ctx));
+
+          await advance(0);
+          // The row was read, and failed, before the lookup went out.
+          expect(warning.mock.calls).toEqual([
+            [
+              'Mirror read failed for readContent metadata; using the live lookup',
+              { paperId: '2401.10001v1', error: 'database disk image is malformed' },
+            ],
+          ]);
+          expect(apiRequests).toEqual([{ at: 0, idList: '2401.10001v1' }]);
+
+          await advance(15_000);
+          expect(read).toMatchObject({
+            at: 15_000,
+            error: { code: JsonRpcErrorCode.Timeout, message: 'arXiv API timed out after 15000ms' },
+          });
+          expect(JSON.stringify(read.error)).not.toContain('malformed');
+          expect(warning).toHaveBeenCalledTimes(1);
+          expect(readSpy).toHaveBeenCalledTimes(1);
+          expect(contentRequests).toEqual([]);
+        } finally {
+          readSpy.mockRestore();
+        }
+      });
+
+      it('answers no pin from a mirror whose harvest has not completed, sending the lookup (#21)', async () => {
+        resetStore();
+        const coldDir = await mkdtemp(join(tmpdir(), 'arxiv-svc-cold-pin-test-'));
+        configOverrides.mirrorPath = join(coldDir, 'mirror.db');
+        const cold = await MirrorStore.open(configOverrides.mirrorPath);
+        cold.applyBatch([mkRecord({ paper_id: '2401.10001', title: 'Partial Cold Harvest' })], []);
+        cold.writeHarvestState({ status: 'in_progress', started_at: '2024-02-22T00:00:00Z' });
+        cold.close();
+        resetStore();
+        try {
+          route();
+          const read = timed(service.readContent('2401.10001v1', {}, createMockContext()));
+
+          await advance(0);
+          expect(apiRequests).toEqual([{ at: 0, idList: '2401.10001v1' }]);
+          await advance(15_000);
+          expect(read).toMatchObject({
+            at: 15_000,
+            error: { code: JsonRpcErrorCode.Timeout, message: 'arXiv API timed out after 15000ms' },
+          });
+          expect(contentRequests).toEqual([]);
+        } finally {
+          resetStore();
+          await rm(coldDir, { recursive: true, force: true });
+        }
+      });
+
+      it('answers no pin from a disabled mirror, sending the lookup and reading no row', async () => {
+        configOverrides.mirrorEnabled = false;
+        const readSpy = vi.spyOn(MirrorStore.prototype, 'getPapersByIds');
+        try {
+          route();
+          const read = timed(service.readContent('2401.10001v1', {}, createMockContext()));
+
+          await advance(0);
+          expect(apiRequests).toEqual([{ at: 0, idList: '2401.10001v1' }]);
+          await advance(15_000);
+          expect(read).toMatchObject({
+            at: 15_000,
+            error: { code: JsonRpcErrorCode.Timeout, message: 'arXiv API timed out after 15000ms' },
+          });
+          expect(readSpy).not.toHaveBeenCalled();
+          expect(contentRequests).toEqual([]);
+        } finally {
+          readSpy.mockRestore();
+        }
+      });
+
+      it('fails a pin cancelled before it starts as cancelled, reading no mirror row (#68)', async () => {
+        const readSpy = vi.spyOn(MirrorStore.prototype, 'getPapersByIds');
+        try {
+          route();
+          const controller = new AbortController();
+          controller.abort(new DOMException('The client cancelled the call.', 'AbortError'));
+          const read = timed(
+            service.readContent(
+              '2401.10001v1',
+              {},
+              createMockContext({ signal: controller.signal }),
+            ),
+          );
+
+          await advance(0);
+          expect(read.at).toBe(0);
+          expect(read.error).toMatchObject({
+            name: 'AbortError',
+            message: 'The client cancelled the call.',
+          });
+          await advance(60_000);
+          expect(readSpy).not.toHaveBeenCalled();
+          expect(apiRequests).toEqual([]);
+          expect(contentRequests).toEqual([]);
+        } finally {
+          readSpy.mockRestore();
+        }
+      });
     });
 
     it('fails a read cancelled before the cap as cancelled, reading no mirror row (#68)', async () => {
@@ -1701,9 +2072,11 @@ describe('ArxivService — mirror integration', () => {
         route((init, idList) =>
           idList === '2401.10002' ? Promise.resolve(atomResponse(ATOM_LIVE_10002_V4)) : hang(init),
         );
-        // A pinned read holds the queue for one slot; the unversioned read's lookup waits behind it.
+        // A pinned read holds the queue for one slot; the unversioned read's lookup
+        // waits behind it. The pin reads the mirror before it queues its lookup (#103).
         const blockerCtx = createMockContext();
         const blocker = timed(service.readContent('2401.10001v1', {}, blockerCtx));
+        await advance(0);
         const ctx = createMockContext();
         const warning = vi.spyOn(ctx.log, 'warning');
         const read = timed(service.readContent('2401.10002', {}, ctx));
@@ -1714,7 +2087,7 @@ describe('ArxivService — mirror integration', () => {
           'Mirror read failed for readContent metadata; using the live lookup',
           { paperId: '2401.10002', error: 'database disk image is malformed' },
         );
-        // The blocker's own lookup timed out, and its fallback read threw too:
+        // The blocker's mirror read threw before its lookup, which then timed out:
         // the live failure stands.
         expect(blocker).toMatchObject({
           at: 15_000,
@@ -1815,6 +2188,38 @@ describe('ArxivService — mirror integration', () => {
 
       expect(mockFetch).not.toHaveBeenCalled();
       expect(result.papers).toHaveLength(1);
+    });
+
+    // Issue #105: the API's own sortBy spelling, sent as sort_by, reaches the
+    // mirror as the canonical value's published-date sort.
+    it('sorts a sort_by of submittedDate by published date on the mirror (#105)', async () => {
+      configOverrides.mirrorRecentDaysLive = 0;
+      initArxivService({ mirrorSearcher: searchInThread });
+      const searchSpy = vi.spyOn(MirrorStore.prototype, 'search');
+      try {
+        const result = await runToolContract(arxivSearchPapers, {
+          query: 'all:mirror',
+          sort_by: 'submittedDate',
+          sort_order: 'ascending',
+        });
+
+        expect(result.isError, JSON.stringify(result)).toBeFalsy();
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(searchSpy).toHaveBeenCalledTimes(1);
+        expect(searchSpy.mock.calls[0]?.[0]).toMatchObject({
+          sortBy: 'published',
+          sortOrder: 'ascending',
+        });
+        const ids = (result.structuredContent as { papers: { id: string }[] }).papers.map(
+          (p) => p.id,
+        );
+        expect(ids).toEqual(['2401.10002v3', '2401.10001v1']);
+        const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('\n');
+        expect(text).toContain('2401.10002v3');
+        expect(text.indexOf('2401.10002v3')).toBeLessThan(text.indexOf('2401.10001v1'));
+      } finally {
+        searchSpy.mockRestore();
+      }
     });
 
     // -----------------------------------------------------------------------
@@ -2060,11 +2465,12 @@ describe('ArxivService — mirror integration', () => {
           ['2403.10001', '2403.10004'],
         ],
         // The echoed form of a query cat: beside `category: "math"`: two groups.
-        // The bare `cat:math` in it echoes as its subtree, as on the live path.
+        // Each cat: in it echoes as its subtree, as on the live path, the
+        // canonical codes of the math aliases included (#99).
         [
-          '(cat:cs.LG OR cat:cs.AI) AND (cat:math.* OR cat:math)',
+          '(cat:cs.LG OR cat:cs.AI) AND (cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)',
           ['2403.10001'],
-          '(cat:cs.LG OR cat:cs.AI) AND (cat:math.* OR (cat:math.* OR cat:math))',
+          '(cat:cs.LG OR cat:cs.AI) AND ((cat:math.* OR cat:cs.IT OR cat:math-ph) OR (cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph) OR cat:cs.IT OR cat:math-ph)',
         ],
         // No cat: at all: operators group to the right, so this is
         // alpha ∧ ¬(beta ∧ gamma), never (alpha ∧ ¬beta) ∧ gamma.
@@ -2128,7 +2534,7 @@ describe('ArxivService — mirror integration', () => {
         expect(none).toMatchObject({ total_results: 0, papers: [] });
         expect(ids(one)).toEqual(['2403.10001']);
         expect(one.effective_query).toBe(
-          '(cat:cs.LG AND cat:math.AG) AND (cat:math.* OR cat:math)',
+          '(cat:cs.LG AND cat:math.AG) AND (cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)',
         );
       });
 
@@ -2556,9 +2962,11 @@ describe('ArxivService — mirror integration', () => {
 
         const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
         // A bare `cat:cs` matches nothing upstream — arXiv never assigns the
-        // bare group name — so the operand has to carry the subtree.
-        expect(url.searchParams.get('search_query')).toBe('ti:attention AND cat:cs*');
-        expect(result.effective_query).toBe('ti:attention AND cat:cs*');
+        // bare group name — so the operand has to carry the subtree, and the
+        // canonical codes of the cs aliases with it (#99).
+        const sent = 'ti:attention AND (cat:cs* OR cat:math.NA OR cat:eess.SY)';
+        expect(url.searchParams.get('search_query')).toBe(sent);
+        expect(result.effective_query).toBe(sent);
       });
 
       it('spells out an archive whose wildcard would leak a neighbour', async () => {
@@ -2569,7 +2977,9 @@ describe('ArxivService — mirror integration', () => {
         await service.search('cat:math', { maxResults: 10 }, ctx);
 
         const url = new URL(String(mockFetch.mock.calls[0]?.[0]));
-        expect(url.searchParams.get('search_query')).toBe('(cat:math.* OR cat:math)');
+        expect(url.searchParams.get('search_query')).toBe(
+          '(cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)',
+        );
       });
 
       it('leaves a leaf code and the rest of the query untouched', async () => {

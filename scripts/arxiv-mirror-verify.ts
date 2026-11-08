@@ -1,18 +1,24 @@
 /**
  * @fileoverview Verify the mirror SQLite file: its schema version (opening it
  * runs any migration it still needs, so this upgrades an older file first),
- * each index and trigger the schema defines against the schema module's
- * definition, then PRAGMA integrity_check and quick_check. Exits non-zero on
- * any failure so cron / health-check jobs can surface it immediately. A missing
- * or redefined index or trigger is reported with the statements that rebuild
- * it; no open rebuilds one, this script's included.
+ * each object a migration redefines — the date and paper_id indexes, the fill
+ * trigger, and the FTS index with its content view and sync triggers — against
+ * the schema module's definition, then PRAGMA integrity_check and quick_check.
+ * Exits non-zero on any failure so cron / health-check jobs can surface it
+ * immediately. A missing or redefined object is reported with the statements
+ * that restore it, each printed once; no open restores one, this script's
+ * included. For an index or the fill trigger they are its drop and its create.
+ * For a part of the FTS index they rewind the recorded schema version to 6, so
+ * the next writer open, this script's included, rebuilds the index under the
+ * migration lease: the index may have drifted from `papers` meanwhile, and only
+ * a rebuild repairs that.
  *
  * Usage:
  *   bun run mirror:verify
  *
  * Exit status:
- *   0   the file is on the current schema, holds every index and trigger as the
- *       schema defines it, and passes both checks
+ *   0   the file is on the current schema, holds every object a migration
+ *       redefines as the schema defines it, and passes both checks
  *   1   a check or the schema migration failed
  *   75  another writer is migrating the mirror file's schema; nothing changed,
  *       verify again once it finishes (the message names its pid)
@@ -54,7 +60,7 @@ async function main(): Promise<void> {
       console.error(
         `Schema objects FAILED: ${named.join('; ')}. Opening the file does not rebuild them; run these statements against it, then verify again:`,
       );
-      for (const sql of broken.flatMap((o) => o.restore)) console.error(`${sql};`);
+      for (const sql of new Set(broken.flatMap((o) => o.restore))) console.error(`${sql};`);
       process.exit(1);
     }
     const result = store.integrityCheck();

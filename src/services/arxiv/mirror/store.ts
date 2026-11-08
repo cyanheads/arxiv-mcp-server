@@ -26,6 +26,10 @@
  *   - `rawToRow` converts arXiv's TeX to Unicode in the text columns, and the
  *     migration converts the rows a pre-v6 harvester stored with TeX.
  *
+ * Schema v7 (issue #100):
+ *   - `papers_fts` indexes `authors` folded to arXiv's ASCII spellings, read
+ *     through the view `papers_fts_source`; the migration rebuilds the index.
+ *
  * Writers own the file (issue #55). `MirrorStore.open` is the writers' open
  * (`runHarvest`, `mirror:verify`): it creates the file, applies the schema, and
  * runs the in-place migrations an existing DB still needs, in order, before
@@ -191,34 +195,56 @@ function updateOpening(
   };
 }
 
-/** An index or trigger the schema defines, as a file holds it ({@link MirrorStore.checkSchemaObjects}). */
+/** A schema object a migration redefines, as a file holds it ({@link MirrorStore.checkSchemaObjects}). */
 export interface SchemaObjectCheck {
   name: string;
-  /** The statements that rebuild it as the schema module defines it, in order. */
+  /**
+   * The statements that restore it, in order: for an index or the fill trigger,
+   * its drop and its create. For a part of the FTS index, the record of the
+   * version before v7's rebuild: an index whose trigger or view went missing or
+   * changed can have drifted from `papers`, which only a rebuild repairs, and
+   * the next writer open repeats it, in rowid batches under the lease.
+   */
   restore: readonly string[];
   /** `differs`: the file holds an object of that name under another definition. */
   status: 'ok' | 'missing' | 'differs';
-  type: 'index' | 'trigger';
+  /** Its `sqlite_master` type, where an FTS5 table is a `table`. */
+  type: 'index' | 'table' | 'trigger' | 'view';
 }
 
-/** The name a `CREATE INDEX` or `CREATE TRIGGER` statement gives its object. */
-function createdName(create: string): string {
-  const name = /^CREATE (?:INDEX|TRIGGER) (?:IF NOT EXISTS )?(\w+)/.exec(create)?.[1];
-  if (name === undefined) throw new Error(`Not a CREATE INDEX or TRIGGER statement: ${create}`);
-  return name;
+const CREATED_TYPE = {
+  INDEX: 'index',
+  TRIGGER: 'trigger',
+  VIEW: 'view',
+  'VIRTUAL TABLE': 'table',
+} as const satisfies Record<string, SchemaObjectCheck['type']>;
+
+/** The `sqlite_master` type and the name a `CREATE` statement gives its object. */
+function createdObject(create: string): Pick<SchemaObjectCheck, 'name' | 'type'> {
+  const [, kind, name] =
+    /^CREATE (INDEX|TRIGGER|VIEW|VIRTUAL TABLE) (?:IF NOT EXISTS )?(\w+)/.exec(create) ?? [];
+  if (kind === undefined || name === undefined) {
+    throw new Error(`Not a CREATE INDEX, TRIGGER, VIEW, or VIRTUAL TABLE statement: ${create}`);
+  }
+  return { type: CREATED_TYPE[kind as keyof typeof CREATED_TYPE], name };
 }
 
-const FILL_TRIGGER = createdName(MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL);
+const FILL_TRIGGER = createdObject(MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL).name;
 
 /**
- * The indexes and the trigger v4 and v5 define, each with the statements that
- * rebuild it: everything a migration redefines, which `IF NOT EXISTS` would
- * never repair.
+ * The version a file records before v7's FTS rebuild, the last step `migrate`
+ * runs before it ({@link SchemaObjectCheck.restore}).
+ */
+const BEFORE_FTS_REBUILD = 6;
+
+/**
+ * The indexes and the trigger v4 and v5 define, and the FTS index, its content
+ * view, and its triggers v7 defines, each with the statements that restore it:
+ * everything a migration redefines, which `IF NOT EXISTS` would never repair.
  */
 const SCHEMA_OBJECTS: readonly (Omit<SchemaObjectCheck, 'status'> & { create: string })[] = [
   ...[...MIRROR_DATE_INDEXES, MIRROR_PAPER_ID_INDEX].map(([drop, create]) => ({
-    type: 'index' as const,
-    name: createdName(create),
+    ...createdObject(create),
     create,
     restore: [drop, create],
   })),
@@ -228,6 +254,11 @@ const SCHEMA_OBJECTS: readonly (Omit<SchemaObjectCheck, 'status'> & { create: st
     create: MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL,
     restore: [`DROP TRIGGER IF EXISTS ${FILL_TRIGGER}`, MIRROR_JUNCTION_PUBLISHED_TRIGGER_SQL],
   },
+  ...MIRROR_FTS_STATEMENTS.map((create) => ({
+    ...createdObject(create),
+    create,
+    restore: [`UPDATE schema_version SET version = ${BEFORE_FTS_REBUILD}`],
+  })),
 ];
 
 /** `sql` with `IF NOT EXISTS` removed, as SQLite stores it, and its whitespace collapsed. */
@@ -395,7 +426,7 @@ export class MirrorStore {
   /**
    * The writers' open (`runHarvest`, `mirror:verify`): open or create the store
    * at `path`, apply the schema, and run each migration the file still needs
-   * (v1→v2, v2→v3, v3→v4, v4→v5) before returning. A failed open closes its
+   * (v1→v2 through v6→v7) before returning. A failed open closes its
    * connection.
    *
    * One writer migrates a file (issue #71). The schema is applied in one write
@@ -1002,14 +1033,15 @@ export class MirrorStore {
   }
 
   /**
-   * Each index and trigger v4 and v5 define, as this file holds it against the
-   * schema module's definition. A file can record its version and still lack
-   * one an operator or another build dropped or redefined — a search naming a
-   * missing index fails with a driver error and goes live — and no open
-   * recreates it: the module runs these definitions only when it creates a file
-   * and as the migration that introduced each. Text is compared with
-   * `IF NOT EXISTS`, which SQLite does not store, removed and whitespace
-   * collapsed.
+   * Each index and trigger v4 and v5 define, and each part of the FTS index v7
+   * defines, as this file holds it against the schema module's definition. A
+   * file can record its version and still lack one an operator or another
+   * build dropped or redefined — a search naming a missing index fails with a
+   * driver error and goes live, and an unfolded sync trigger leaves `au:`
+   * missing the names it writes — and no open recreates it: the module runs
+   * these definitions only when it creates a file and as the migration that
+   * introduced each. Text is compared with `IF NOT EXISTS`, which SQLite does
+   * not store, removed and whitespace collapsed.
    */
   checkSchemaObjects(): SchemaObjectCheck[] {
     const stored = this.db.prepare<{ sql: string | null }>(
@@ -1246,6 +1278,7 @@ function applySchema(db: SqliteHandle, path: string): ClaimedMigration | undefin
       if (created) {
         db.exec(MIRROR_V4_STATEMENTS);
         db.exec(MIRROR_V5_STATEMENTS);
+        db.exec(MIRROR_FTS_STATEMENTS);
         writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
       }
       const from = readSchemaVersion(db) ?? 0;
@@ -1309,7 +1342,7 @@ function migrate(db: SqliteHandle, path: string, { from, lease }: ClaimedMigrati
       fenced(() => writeSchemaVersion(db, 2));
     }
     if (from < 3) {
-      migrateToV3(db, fenced);
+      rebuildFtsIndex(db, fenced, 'v2→v3');
       fenced(() => writeSchemaVersion(db, 3));
     }
     if (from < 4) {
@@ -1320,7 +1353,12 @@ function migrate(db: SqliteHandle, path: string, { from, lease }: ClaimedMigrati
       migrateToV5(db, fenced);
       fenced(() => writeSchemaVersion(db, 5));
     }
-    if (from < 6) convertTexText(db, fenced);
+    if (from < 6) {
+      convertTexText(db, fenced);
+      fenced(() => writeSchemaVersion(db, 6));
+    }
+    // The v3 step builds the index as v7 defines it, so a file it ran on is done.
+    if (from >= 3 && from < 7) rebuildFtsIndex(db, fenced, 'v6→v7');
     db.transaction(() => {
       assertHeld();
       writeSchemaVersion(db, MIRROR_SCHEMA_VERSION);
@@ -1422,16 +1460,18 @@ function migrateToV2(db: SqliteHandle, inTransaction: InTransaction, batchSize =
 }
 
 /**
- * Migrate a v2 mirror DB to v3 in place: rebuild `papers_fts` with the
- * `comment` and `journal_ref` columns so the documented `co:` and `jr:` field
- * prefixes resolve on the mirror path (issue #37).
+ * Rebuild `papers_fts` as {@link MIRROR_FTS_STATEMENTS} defines it, in place:
+ * the v2→v3 step, which adds the `comment` and `journal_ref` columns so the
+ * documented `co:` and `jr:` field prefixes resolve on the mirror path (issue
+ * #37), and the v6→v7 step, which folds `authors` (issue #100). A file below
+ * v3 gets the current definition from the v3 step and skips the v7 one.
  *
- * FTS5 has no `ALTER TABLE ADD COLUMN`, so the index and its three sync
- * triggers are dropped ({@link MIRROR_FTS_DROP_STATEMENTS}) and recreated from
- * {@link MIRROR_FTS_STATEMENTS} — the same definition a fresh database gets, so
- * the two paths cannot drift. Dropping the triggers first matters: they
- * enumerate their columns, and a v2 trigger firing against a v3 index would
- * leave the index diverging from `papers` on every subsequent write.
+ * FTS5 has no `ALTER TABLE`, so the index, its three sync triggers, and its
+ * content view are dropped ({@link MIRROR_FTS_DROP_STATEMENTS}) and recreated
+ * — the same definition a fresh database gets, so the two paths cannot drift.
+ * Dropping the triggers first matters: they enumerate their columns and fold
+ * `authors`, and an older trigger firing against the new index would leave the
+ * index diverging from `papers` on every subsequent write.
  *
  * Refill is batched by rowid window rather than FTS5's one-shot `'rebuild'`
  * command, for the same reasons as the v2 backfill: the WAL stays bounded on a
@@ -1439,13 +1479,18 @@ function migrateToV2(db: SqliteHandle, inTransaction: InTransaction, batchSize =
  * The drop and the recreate commit together, and every batch commits on its
  * own, each through `inTransaction` (the lease-fenced transaction of
  * {@link migrate}), so no other writer's rebuild can interleave with this one
- * (issue #71).
+ * (issue #71). No `papers` row is written.
  *
  * Idempotent by construction — a re-run after a partial failure drops the
- * half-filled index and starts from an empty one. The caller writes
- * schema_version 3 only after this returns, so an interrupted run repeats.
+ * half-filled index and starts from an empty one. The caller writes the step's
+ * version only after this returns, so an interrupted run repeats.
  */
-function migrateToV3(db: SqliteHandle, inTransaction: InTransaction, batchSize = 5_000): void {
+function rebuildFtsIndex(
+  db: SqliteHandle,
+  inTransaction: InTransaction,
+  step: 'v2→v3' | 'v6→v7',
+  batchSize = 5_000,
+): void {
   inTransaction(() => {
     db.exec(MIRROR_FTS_DROP_STATEMENTS);
     db.exec(MIRROR_FTS_STATEMENTS);
@@ -1460,12 +1505,13 @@ function migrateToV3(db: SqliteHandle, inTransaction: InTransaction, batchSize =
   const select = db.prepare<{ rowid: number }>(
     `SELECT rowid FROM papers WHERE rowid > ? ORDER BY rowid LIMIT ?`,
   );
-  // Reads straight from the content table, so the indexed text is by
-  // construction the text `papers` holds.
+  // Reads the index's external content, the view that folds `authors`, so the
+  // indexed text is by construction what FTS5's own `'rebuild'` and
+  // `'integrity-check'` read.
   const fill = db.prepare(
     `INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
-     SELECT rowid, title, authors, abstract, comment, journal_ref
-     FROM papers WHERE rowid > ? AND rowid <= ?`,
+     SELECT rid, title, authors, abstract, comment, journal_ref
+     FROM papers_fts_source WHERE rid > ? AND rid <= ?`,
   );
 
   while (true) {
@@ -1478,7 +1524,7 @@ function migrateToV3(db: SqliteHandle, inTransaction: InTransaction, batchSize =
     });
     processed += rows.length;
     lastRowid = upperRowid;
-    process.stdout.write(`mirror migration v2→v3 (fts rebuild): ${processed}/${total} rows\n`);
+    process.stdout.write(`mirror migration ${step} (fts rebuild): ${processed}/${total} rows\n`);
     if (rows.length < batchSize) break;
   }
 }
@@ -1570,7 +1616,7 @@ function definePaperIdIndex(db: SqliteHandle, inTransaction: InTransaction): voi
       .prepare<{ sql: string | null }>(
         `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
       )
-      .get(createdName(create))?.sql;
+      .get(createdObject(create).name)?.sql;
     if (stored != null && comparableSql(stored) === comparableSql(create)) return false;
     db.exec([drop, create]);
     return true;

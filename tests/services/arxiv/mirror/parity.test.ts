@@ -73,7 +73,41 @@ const records: ArxivRawRecord[] = [
     journal_ref: '007',
     versions: [{ version: 'v1', date: '2024-01-12T00:00:00.000Z' }],
   },
+  // Issue #99: one paper per alias pair, listed as arXivRaw lists it (both codes).
+  ...(
+    [
+      ['2401.10005', 'Polytopic Splines', 'math.NA cs.NA', '2024-01-13'],
+      ['2401.10006', 'Polytopic Controllers', 'eess.SY cs.SY', '2024-01-14'],
+      ['2401.10007', 'Polytopic Codes', 'cs.IT math.IT', '2024-01-16'],
+      ['2401.10008', 'Polytopic Operators', 'math-ph math.MP', '2024-01-17'],
+      ['2401.10009', 'Polytopic Estimators', 'math.ST stat.TH', '2024-01-18'],
+      ['2401.10010', 'Polytopic Markets', 'econ.GN q-fin.EC', '2024-01-19'],
+    ] as const
+  ).map(([paper_id, title, categories, date]) => ({
+    paper_id,
+    identifier: `oai:arXiv.org:${paper_id}`,
+    datestamp: date,
+    title,
+    authors: 'Grace Hopper',
+    abstract: 'Bounds on a polytope.',
+    categories,
+    versions: [{ version: 'v1', date: `${date}T00:00:00.000Z` }],
+  })),
 ];
+
+/**
+ * The `<category>` terms the Atom API lists for the alias-pair papers: the
+ * canonical code alone (arxiv-base `CATEGORY_ALIASES`). Every other record's
+ * Atom terms are its arXivRaw list.
+ */
+const ATOM_CATEGORIES = new Map([
+  ['2401.10005', 'math.NA'],
+  ['2401.10006', 'eess.SY'],
+  ['2401.10007', 'cs.IT'],
+  ['2401.10008', 'math-ph'],
+  ['2401.10009', 'math.ST'],
+  ['2401.10010', 'econ.GN'],
+]);
 
 /** An instant in the arXiv API's form: whole seconds, no fraction (`2024-01-10T00:00:00Z`). */
 const apiDate = (iso: string) => iso.replace(/\.000Z$/, 'Z');
@@ -89,7 +123,7 @@ function atom(record: ArxivRawRecord): string {
       .split(', ')
       .map((name) => `<author><name>${name}</name></author>`)
       .join('')}
-    ${record.categories
+    ${(ATOM_CATEGORIES.get(record.paper_id) ?? record.categories)
       .split(' ')
       .map((category) => `<category term="${category}"/>`)
       .join('')}
@@ -148,7 +182,7 @@ describe('mirror and live search contract parity', () => {
     {
       query: 'ti:transformer',
       category: 'cs',
-      expectedQuery: '(ti:transformer) AND cat:cs*',
+      expectedQuery: '(ti:transformer) AND (cat:cs* OR cat:math.NA OR cat:eess.SY)',
       ids: [0, 2],
     },
     {
@@ -173,7 +207,11 @@ describe('mirror and live search contract parity', () => {
     { query: 'ti:unfindable', expectedQuery: 'ti:unfindable', ids: [] },
     // Boolean operators around lifted operands keep arXiv's meaning (#65): each
     // AND-ed cat: is its own filter, and every operator groups to the right (#82).
-    { query: 'cat:cs AND cat:cs.CL', expectedQuery: 'cat:cs* AND cat:cs.CL', ids: [0] },
+    {
+      query: 'cat:cs AND cat:cs.CL',
+      expectedQuery: '(cat:cs* OR cat:math.NA OR cat:eess.SY) AND cat:cs.CL',
+      ids: [0],
+    },
     // An OR-ed set of cat: operands is one filter: each code admits one paper,
     // and together they keep out the third paper the residual matches.
     {
@@ -188,7 +226,8 @@ describe('mirror and live search contract parity', () => {
     },
     {
       query: 'ti:transformer AND cat:cs ANDNOT abs:language',
-      expectedQuery: 'ti:transformer AND cat:cs* ANDNOT abs:language',
+      expectedQuery:
+        'ti:transformer AND (cat:cs* OR cat:math.NA OR cat:eess.SY) ANDNOT abs:language',
       ids: [2],
     },
     // arXiv's grammar (#82): adjacency is OR, and everything right of an ANDNOT
@@ -198,6 +237,57 @@ describe('mirror and live search contract parity', () => {
       query: 'ti:transformer ANDNOT abs:vision OR ti:dark',
       expectedQuery: 'ti:transformer ANDNOT abs:vision OR ti:dark',
       ids: [0],
+    },
+    // Issue #99: an alias code means its canonical code on both paths, and each
+    // paper lists the canonical code alone, as the API lists it.
+    {
+      query: 'ti:polytopic AND cat:cs.NA',
+      expectedQuery: 'ti:polytopic AND cat:math.NA',
+      ids: [4],
+    },
+    {
+      query: 'ti:polytopic',
+      category: 'cs.SY',
+      expectedQuery: '(ti:polytopic) AND cat:eess.SY',
+      ids: [5],
+    },
+    {
+      query:
+        'ti:polytopic AND (cat:cs.NA OR cat:cs.SY OR cat:math.IT OR cat:math.MP OR cat:stat.TH OR cat:q-fin.EC)',
+      expectedQuery:
+        'ti:polytopic AND (cat:math.NA OR cat:eess.SY OR cat:cs.IT OR cat:math-ph OR cat:math.ST OR cat:econ.GN)',
+      ids: [4, 5, 6, 7, 8, 9],
+    },
+    // An archive, or a wildcard the caller wrote, reaches the canonical codes of
+    // the aliases inside it.
+    {
+      query: 'ti:polytopic',
+      category: 'cs',
+      expectedQuery: '(ti:polytopic) AND (cat:cs* OR cat:math.NA OR cat:eess.SY)',
+      ids: [4, 5, 6],
+    },
+    {
+      query: 'ti:polytopic AND cat:cs.*',
+      expectedQuery: 'ti:polytopic AND (cat:cs.* OR cat:math.NA OR cat:eess.SY)',
+      ids: [4, 5, 6],
+    },
+    {
+      query: 'ti:polytopic',
+      category: 'math',
+      expectedQuery: '(ti:polytopic) AND (cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)',
+      ids: [4, 6, 7, 8],
+    },
+    {
+      query: 'ti:polytopic',
+      category: 'stat',
+      expectedQuery: '(ti:polytopic) AND (cat:stat* OR cat:math.ST)',
+      ids: [8],
+    },
+    {
+      query: 'ti:polytopic',
+      category: 'q-fin',
+      expectedQuery: '(ti:polytopic) AND (cat:q-fin* OR cat:econ.GN)',
+      ids: [9],
     },
   ];
 
@@ -262,8 +352,61 @@ describe('mirror and live search contract parity', () => {
     });
   });
 
+  // Issue #99: the echo of a filter that reaches alias canonicals replays to the same papers.
+  it('replays the effective query of an archive holding aliases to the same papers on both paths', async () => {
+    const order = { sort_by: 'submitted' as const, sort_order: 'ascending' as const };
+    const sent: string[] = [];
+    const fetch = vi.fn(async (request: string | URL | Request) => {
+      const url = new URL(request instanceof Request ? request.url : String(request));
+      sent.push(url.searchParams.get('search_query') ?? '');
+      return new Response(
+        `<feed xmlns="http://www.w3.org/2005/Atom"
+        xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+        xmlns:arxiv="http://arxiv.org/schemas/atom">
+        <opensearch:totalResults>3</opensearch:totalResults>
+        <opensearch:startIndex>0</opensearch:startIndex>
+        ${[4, 5, 6].map((index) => atom(records[index]!)).join('')}</feed>`,
+        { headers: { 'content-type': 'application/atom+xml' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetch);
+    const effectiveQuery = (result: { structuredContent?: unknown }) =>
+      (result.structuredContent as { effectiveQuery: string }).effectiveQuery;
+    const ids = (result: { structuredContent?: unknown }) =>
+      (result.structuredContent as { papers: { id: string }[] }).papers.map((paper) => paper.id);
+
+    const live = await runToolContract(arxivSearchPapers, {
+      query: 'ti:polytopic',
+      category: 'cs',
+      ...order,
+    });
+    const echo = effectiveQuery(live);
+    expect(echo).toBe('(ti:polytopic) AND (cat:cs* OR cat:math.NA OR cat:eess.SY)');
+    await runToolContract(arxivSearchPapers, { query: echo, ...order });
+    // The replay expands its `cat:cs*` once more: the OR set it sends names the same codes.
+    expect(sent).toEqual([
+      echo,
+      '(ti:polytopic) AND ((cat:cs* OR cat:math.NA OR cat:eess.SY) OR cat:math.NA OR cat:eess.SY)',
+    ]);
+
+    vi.stubEnv('ARXIV_MIRROR_ENABLED', 'true');
+    resetServerConfig();
+    initArxivService();
+    const mirror = await runToolContract(arxivSearchPapers, {
+      query: 'ti:polytopic',
+      category: 'cs',
+      ...order,
+    });
+    const replayed = await runToolContract(arxivSearchPapers, { query: echo, ...order });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(mirror.structuredContent).toEqual(live.structuredContent);
+    expect(ids(mirror)).toEqual(['2401.10005v1', '2401.10006v1', '2401.10007v1']);
+    expect(ids(replayed)).toEqual(ids(mirror));
+    expect(effectiveQuery(replayed)).toBe(sent[1]);
+  });
+
   for (const example of cases) {
-    it(`${example.query}, start=${example.start ?? 0}, limit=${example.max_results ?? 10}`, async () => {
+    it(`${example.query}${example.category ? `, category=${example.category}` : ''}, start=${example.start ?? 0}, limit=${example.max_results ?? 10}`, async () => {
       const { ids, expectedQuery, ...args } = example;
       const input = { ...args, sort_by: 'submitted' as const, sort_order: 'ascending' as const };
       const start = example.start ?? 0;
@@ -361,8 +504,7 @@ describe('mirror and live metadata parity on arXiv-served record pairs (#89)', (
   /**
    * Papers whose arXivRaw categories list both codes of an alias pair
    * (`math.NA cs.NA`, `math-ph math.MP`, `math.ST stat.TH`, …) where the API
-   * lists one. A category difference, not a text one: these are compared with
-   * their categories set aside.
+   * lists the canonical code alone (#99).
    */
   const ALIAS_PAPERS = [
     '2403.00682',
@@ -470,11 +612,12 @@ describe('mirror and live metadata parity on arXiv-served record pairs (#89)', (
     expect([...entries.keys()].sort()).toEqual([...ids].sort());
   });
 
-  it('returns the same structuredContent and content on both paths for every pair with matching categories', async () => {
-    const same = compared.filter((id) => !ALIAS_PAPERS.includes(id));
-    expect(same).toHaveLength(162);
-    const { live, mirror } = await bothPaths(tenEach(same));
-    expect(mirror.flatMap(papersOf).map((paper) => paper.id.replace(/v\d+$/, ''))).toEqual(same);
+  it('returns the same structuredContent and content on both paths for every pair', async () => {
+    expect(compared).toHaveLength(173);
+    const { live, mirror } = await bothPaths(tenEach(compared));
+    expect(mirror.flatMap(papersOf).map((paper) => paper.id.replace(/v\d+$/, ''))).toEqual(
+      compared,
+    );
     for (const [k, result] of mirror.entries()) {
       expect(result.isError, JSON.stringify(result)).not.toBe(true);
       expect(result.structuredContent).toEqual(live[k]?.structuredContent);
@@ -482,13 +625,25 @@ describe('mirror and live metadata parity on arXiv-served record pairs (#89)', (
     }
   });
 
-  it('returns the same metadata on both paths for the alias-category pairs, categories aside', async () => {
+  it('lists the canonical code alone for every alias pair, where arXivRaw lists both (#99)', async () => {
     const { live, mirror } = await bothPaths(tenEach(ALIAS_PAPERS));
-    const withoutCategories = ({ categories: _categories, ...rest }: Paper) => rest;
-    expect(mirror.flatMap(papersOf).map(withoutCategories)).toEqual(
-      live.flatMap(papersOf).map(withoutCategories),
+    const pick = ({ id, primary_category, categories }: Paper) => ({
+      id,
+      primary_category,
+      categories,
+    });
+    expect(mirror.flatMap(papersOf).map(pick)).toEqual(live.flatMap(papersOf).map(pick));
+    const aliases = new Set(['cs.NA', 'cs.SY', 'math.IT', 'math.MP', 'q-fin.EC', 'stat.TH']);
+    const listed = mirror.flatMap(papersOf).flatMap((paper) => paper.categories as string[]);
+    expect(listed.filter((code) => aliases.has(code))).toEqual([]);
+    // Not vacuous: every one of these papers stores an alias code.
+    const stored = parseListRecords(oai).records.filter((record) =>
+      ALIAS_PAPERS.includes(record.paper_id),
     );
-    expect(mirror.flatMap(papersOf)).toHaveLength(ALIAS_PAPERS.length);
+    expect(stored).toHaveLength(ALIAS_PAPERS.length);
+    for (const record of stored) {
+      expect(record.categories.split(' ').some((code) => aliases.has(code))).toBe(true);
+    }
   });
 
   it.each([

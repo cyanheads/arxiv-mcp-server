@@ -8,14 +8,16 @@
 
 import { Database } from 'bun:sqlite';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, fstatSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, fstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { categorySubtree } from '@/services/arxiv/categories.js';
+import { parseListRecords } from '@/services/arxiv/mirror/harvester.js';
 import { translateQuery } from '@/services/arxiv/mirror/query.js';
 import { fromWireError, toWireError } from '@/services/arxiv/mirror/reader.js';
 import {
@@ -35,6 +37,7 @@ import {
   rawToRow,
 } from '@/services/arxiv/mirror/store.js';
 import type { ArxivRawRecord } from '@/services/arxiv/mirror/types.js';
+import { PRE_V7_FTS_STATEMENTS } from '../../../helpers/pre-v7-fts-statements.js';
 
 const mkRecord = (overrides: Partial<ArxivRawRecord> = {}): ArxivRawRecord => ({
   paper_id: '2401.00001',
@@ -534,9 +537,9 @@ describe('MirrorStore', () => {
     expect(result.results.length).toBeGreaterThan(0);
   });
 
-  // `mirror:verify` checks each index and the fill trigger the schema defines
-  // against the schema module: a file can record its version and still lack
-  // one, and no open recreates it.
+  // `mirror:verify` checks each index, the fill trigger, and each part of the
+  // FTS index the schema defines against the schema module: a file can record
+  // its version and still lack one, and no open recreates it.
   describe('schema objects', () => {
     const SCHEMA_OBJECTS = [
       'index paper_categories_cat_published_idx',
@@ -546,6 +549,11 @@ describe('MirrorStore', () => {
       'index papers_revised_early_idx',
       'index paper_categories_paper_id_idx',
       'trigger paper_categories_published_fill',
+      'view papers_fts_source',
+      'table papers_fts',
+      'trigger papers_ai',
+      'trigger papers_ad',
+      'trigger papers_au',
     ];
     const statuses = () =>
       store.checkSchemaObjects().map((o) => `${o.type} ${o.name}: ${o.status}`);
@@ -579,6 +587,11 @@ describe('MirrorStore', () => {
         'index papers_revised_early_idx: ok',
         'index paper_categories_paper_id_idx: differs',
         'trigger paper_categories_published_fill: differs',
+        'view papers_fts_source: ok',
+        'table papers_fts: ok',
+        'trigger papers_ai: ok',
+        'trigger papers_ad: ok',
+        'trigger papers_au: ok',
       ];
       expect(statuses()).toEqual(damaged);
 
@@ -668,18 +681,25 @@ describe('MirrorStore', () => {
       raw.run('CREATE TABLE papers_fts_data (id INTEGER PRIMARY KEY, block BLOB)');
       raw.close();
 
+      // A new file runs these, in order, in its schema transaction.
+      const creation = [
+        ...MIRROR_SCHEMA_STATEMENTS,
+        ...MIRROR_V4_STATEMENTS,
+        ...MIRROR_V5_STATEMENTS,
+        ...MIRROR_FTS_STATEMENTS,
+      ];
       const prepared = vi.spyOn(Database.prototype, 'prepare');
       const failure = await MirrorStore.open(brokenPath).catch((err: unknown) => err);
       const ran = prepared.mock.calls
         .map(([sql]) => String(sql))
-        .filter((sql) => MIRROR_SCHEMA_STATEMENTS.includes(sql));
+        .filter((sql) => creation.includes(sql));
       prepared.mockRestore();
 
       expect(failure).toBeInstanceOf(McpError);
       expect(String((failure as McpError).cause)).toMatch(/papers_fts_data/);
-      // Nothing after the index ran: no sync triggers, no junction, no harvest state.
-      const failedAt = MIRROR_SCHEMA_STATEMENTS.indexOf(MIRROR_FTS_STATEMENTS[0] as string);
-      expect(ran).toEqual(MIRROR_SCHEMA_STATEMENTS.slice(0, failedAt + 1));
+      // Nothing after the index ran: no sync triggers.
+      const failedAt = creation.indexOf(MIRROR_FTS_STATEMENTS[1] as string);
+      expect(ran).toEqual(creation.slice(0, failedAt + 1));
       // …and the schema runs in one transaction (#71), so what ran before it is
       // rolled back too: the file holds only what it held before the open.
       expect(tableNames(brokenPath)).toEqual(['papers_fts_data']);
@@ -1881,6 +1901,220 @@ describe('isDriverError (#76)', () => {
   });
 });
 
+// Issue #100 — the index folds the letters arXiv's author search spells in ASCII
+// (ł, ø, ß, …) in `authors` alone, through a view FTS5 reads as its content.
+describe('MirrorStore — author names folded to ASCII (#100)', () => {
+  let dir: string;
+  let dbPath: string;
+  let store: MirrorStore;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'arxiv-mirror-fold-'));
+    dbPath = join(dir, 'mirror.db');
+    store = await MirrorStore.open(dbPath);
+  });
+
+  afterEach(async () => {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** The ids `query` returns through the translator, sorted; fails the test when it goes live. */
+  const idsFor = (query: string): string[] => {
+    const translated = translateQuery(query);
+    if (translated.route === 'live') throw new Error(`${query} routes live (${translated.reason})`);
+    return store
+      .search({
+        ...(translated.matchExpr !== undefined && { matchExpr: translated.matchExpr }),
+        categoryGroups: translated.categoryGroups,
+        limit: 50,
+        offset: 0,
+        sortBy: 'relevance',
+        sortOrder: 'descending',
+      })
+      .papers.map((p) => p.id)
+      .sort();
+  };
+
+  /** Papers whose index row matches `matchExpr` as written, with no fold applied to it. */
+  const indexed = (matchExpr: string): number => {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      return (
+        db
+          .query('SELECT COUNT(*) AS n FROM papers_fts WHERE papers_fts MATCH ?')
+          .get(matchExpr) as {
+          n: number;
+        }
+      ).n;
+    } finally {
+      db.close();
+    }
+  };
+
+  /** FTS5's check of the index against what its external content holds, or the error it raises. */
+  const contentCheck = (): string => {
+    const db = new Database(dbPath);
+    try {
+      db.run(`INSERT INTO papers_fts(papers_fts, rank) VALUES ('integrity-check', 1)`);
+      return 'ok';
+    } catch (err) {
+      return (err as Error).message;
+    } finally {
+      db.close();
+    }
+  };
+
+  it('matches either spelling of the names in the papers the issue names', () => {
+    const fixtures = fileURLToPath(new URL('../../../fixtures/arxiv-metadata/', import.meta.url));
+    const captured = parseListRecords(
+      gunzipSync(readFileSync(join(fixtures, 'oai-arxivraw.xml.gz'))).toString('utf8'),
+    ).records.filter((r) => ['2605.22701', '2607.23034', '2610.24554'].includes(r.paper_id));
+    expect(captured).toHaveLength(3);
+    store.applyBatch(
+      [
+        ...captured,
+        mkRecord({
+          paper_id: '2610.24165',
+          title: 'On condensations of $C_p(X)$ spaces onto Banach spaces with the weak topology',
+          authors: 'Mikołaj Krupski, Witold Marciszewski',
+          categories: 'math.FA math.GN',
+        }),
+      ],
+      [],
+    );
+    // Each row keeps its own spelling; only the index folds it.
+    expect(store.getPapersByIds(['2605.22701', '2610.24554']).map((p) => p.authors)).toEqual([
+      'J. Sánchez Fernán, J. Tworzydło, and C. W. J. Beenakker',
+      'Yiğit C. Atılgan, Aleyna Demirci, Nazım Aksaker, Ammar Abbas Elmas, Mehmet Sarıgül, and Aysun Akyüz',
+    ]);
+
+    expect(idsFor('au:Tworzydlo')).toEqual(['2605.22701']);
+    expect(idsFor('au:Tworzydło')).toEqual(['2605.22701']);
+    expect(idsFor('au:Atilgan')).toEqual(['2610.24554']);
+    expect(idsFor('au:Atılgan')).toEqual(['2610.24554']);
+    expect(idsFor('au:Mikolaj AND au:Krupski')).toEqual(['2607.23034', '2610.24165']);
+    expect(idsFor('au:Mikołaj AND au:Krupski')).toEqual(['2607.23034', '2610.24165']);
+    expect(idsFor('Tworzydlo')).toEqual(['2605.22701']);
+    expect(idsFor('all:Tworzydło')).toEqual(['2605.22701']);
+    expect(contentCheck()).toBe('ok');
+  });
+
+  it('keeps the index folded through inserts, rewrites, and tombstones', () => {
+    const paper = (authors: string, abstract = 'Monitored transport.') =>
+      mkRecord({ paper_id: '2605.22701', title: 'On Łojasiewicz gradients', authors, abstract });
+
+    store.applyBatch([paper('J. Tworzydło')], []);
+    expect([indexed('authors:"Tworzydło"'), indexed('authors:"Tworzydlo"')]).toEqual([0, 1]);
+    // The title keeps its letter, as arXiv's title search does.
+    expect([indexed('title:"Łojasiewicz"'), indexed('title:"Lojasiewicz"')]).toEqual([1, 0]);
+    expect(contentCheck()).toBe('ok');
+
+    // A rewrite that leaves the authors as they were, then one that changes them.
+    store.applyBatch([paper('J. Tworzydło', 'Revised abstract.')], []);
+    expect(contentCheck()).toBe('ok');
+    store.applyBatch([paper('J. Tworzydło, Y. C. Atılgan', 'Revised abstract.')], []);
+    expect([indexed('authors:"Tworzydło"'), indexed('authors:"Atılgan"')]).toEqual([0, 0]);
+    expect([indexed('authors:"Tworzydlo"'), indexed('authors:"Atilgan"')]).toEqual([1, 1]);
+    expect(contentCheck()).toBe('ok');
+    store.applyBatch([paper('A. Other')], []);
+    expect([indexed('authors:"Tworzydlo"'), indexed('authors:"Other"')]).toEqual([0, 1]);
+    expect(contentCheck()).toBe('ok');
+
+    store.applyBatch([], [{ paper_id: '2605.22701' }]);
+    expect([indexed('authors:"Other"'), indexed('title:"Łojasiewicz"')]).toEqual([0, 0]);
+    expect(contentCheck()).toBe('ok');
+    expect(store.integrityCheck().ok).toBe(true);
+  });
+
+  it('keeps the fold when FTS5 rebuilds the index from its content', () => {
+    store.applyBatch(
+      [
+        mkRecord({ paper_id: '2605.22701', authors: 'J. Tworzydło' }),
+        mkRecord({ paper_id: '2602.00002', authors: 'Jens K. Nørskov' }),
+      ],
+      [],
+    );
+    const db = new Database(dbPath);
+    db.run(`INSERT INTO papers_fts(papers_fts) VALUES ('rebuild')`);
+    db.close();
+
+    expect([indexed('authors:"Tworzydlo"'), indexed('authors:"Norskov"')]).toEqual([1, 1]);
+    expect([indexed('authors:"Tworzydło"'), indexed('authors:"Nørskov"')]).toEqual([0, 0]);
+    expect(contentCheck()).toBe('ok');
+  });
+
+  it('reports an unfolded or missing sync trigger, no open repairs the index, and the version rewind its restore records does', async () => {
+    const ftsObjects = new Set([
+      'papers_fts_source',
+      'papers_fts',
+      'papers_ai',
+      'papers_ad',
+      'papers_au',
+    ]);
+    const ftsStatuses = () =>
+      store
+        .checkSchemaObjects()
+        .filter((o) => ftsObjects.has(o.name))
+        .map((o) => `${o.type} ${o.name}: ${o.status}`);
+    const raw = new Database(dbPath);
+    raw.run('DROP TRIGGER papers_au');
+    // The update trigger as v3 through v6 define it: `authors` indexed as written.
+    raw.run(`CREATE TRIGGER papers_au AFTER UPDATE ON papers BEGIN
+  INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
+  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
+  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+END`);
+    raw.run('DROP TRIGGER papers_ad');
+    raw.close();
+    store.applyBatch([mkRecord({ paper_id: '2605.22701', authors: 'A. Author' })], []);
+    store.applyBatch([mkRecord({ paper_id: '2605.22701', authors: 'J. Tworzydło' })], []);
+
+    const damaged = [
+      'view papers_fts_source: ok',
+      'table papers_fts: ok',
+      'trigger papers_ai: ok',
+      'trigger papers_ad: missing',
+      'trigger papers_au: differs',
+    ];
+    expect(ftsStatuses()).toEqual(damaged);
+    // The rewrite indexed the unfolded name, so the index no longer matches its content.
+    expect([indexed('authors:"Tworzydło"'), indexed('authors:"Tworzydlo"')]).toEqual([1, 0]);
+    expect(contentCheck()).not.toBe('ok');
+
+    store.close();
+    store = await MirrorStore.open(dbPath);
+    expect(ftsStatuses()).toEqual(damaged);
+    expect(indexed('authors:"Tworzydło"')).toBe(1);
+
+    const restore = [
+      ...new Set(store.checkSchemaObjects().flatMap((o) => (o.status === 'ok' ? [] : o.restore))),
+    ];
+    expect(restore).toEqual(['UPDATE schema_version SET version = 6']);
+    const rewind = new Database(dbPath);
+    for (const sql of restore) rewind.run(sql);
+    rewind.close();
+    store.close();
+    const writes = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    let printed: string[];
+    try {
+      store = await MirrorStore.open(dbPath);
+      printed = writes.mock.calls
+        .map(([line]) => String(line))
+        .filter((line) => line.startsWith('mirror migration'));
+    } finally {
+      writes.mockRestore();
+    }
+
+    expect(printed).toEqual(['mirror migration v6→v7 (fts rebuild): 1/1 rows\n']);
+    expect(ftsStatuses()).toEqual(damaged.map((s) => s.replace(/: \w+$/, ': ok')));
+    expect([indexed('authors:"Tworzydło"'), indexed('authors:"Tworzydlo"')]).toEqual([0, 1]);
+    expect(contentCheck()).toBe('ok');
+    expect(store.schemaVersion()).toEqual({ current: MIRROR_SCHEMA_VERSION, expected: 7 });
+  });
+});
+
 // The suite runs on Bun, so the store's better-sqlite3 driver, the one a server
 // started with `node` uses, runs only here: the store bundled for Node and
 // driven by a `node` child, which reports what each open did.
@@ -1910,6 +2144,15 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
     throw new Error('No Node.js on PATH: the better-sqlite3 tests need a `node` binary');
   }
 
+  /** What the FTS index holds, read on a separate connection. */
+  interface IndexState {
+    /** FTS5's rank-1 `'integrity-check'` against the content view: `ok`, or the error it raised. */
+    content: string;
+    integrity: string;
+    /** Index rows holding the unfolded token `tworzydło` in `authors`. */
+    unfolded: number;
+  }
+
   /** Each scenario's outcome, as the `node` child reports it. */
   interface NodeReport {
     created: { exists: boolean; version: number };
@@ -1920,11 +2163,25 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
       reader: { cause?: string; code: number } | null;
       writer: { cause?: string; code: number } | null;
     };
+    folded: IndexState & {
+      afterRebuild: IndexState & { tworzydlo: string[] };
+      atilgan: string[];
+      lojasiewicz: [string[], string[]];
+      tworzydlo: string[];
+    };
     locked: {
       completedAt?: string;
       ids?: string[];
       status: string;
       write?: string | null;
+    };
+    migrated: IndexState & {
+      atilgan: number;
+      before: { atilgan: number; unfolded: number };
+      lines: string[];
+      rowsKept: boolean;
+      tworzydlo: number;
+      version: number;
     };
     overwrittenPage: {
       byCategory: DriverFailure | null;
@@ -1942,6 +2199,15 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
     code: string;
     name: string;
   }
+
+  /** A v6 file's schema as a pre-v7 writer left it: the FTS index holds `authors` as stored. */
+  const V6_FIXTURE_STATEMENTS = [
+    ...MIRROR_PRAGMA_STATEMENTS,
+    ...MIRROR_SCHEMA_STATEMENTS,
+    ...MIRROR_V4_STATEMENTS,
+    ...MIRROR_V5_STATEMENTS,
+    ...PRE_V7_FTS_STATEMENTS,
+  ];
 
   const SCRIPT = `
     import { createRequire } from 'node:module';
@@ -2060,6 +2326,97 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
     };
     reading.store.close();
 
+    // #100: the index folds author names on every write path, and FTS5's own
+    // 'rebuild' and rank-1 'integrity-check' agree with it.
+    const idsFor = (store, matchExpr) => store.search({
+      matchExpr, limit: 10, offset: 0, sortBy: 'published', sortOrder: 'ascending',
+    }).papers.map((p) => p.id).sort();
+    const tokens = (db, matchExpr) =>
+      db.prepare('SELECT COUNT(*) AS n FROM papers_fts WHERE papers_fts MATCH ?').get(matchExpr).n;
+    const indexState = (path) => {
+      const db = new Database(path);
+      let content = 'ok';
+      try {
+        db.prepare("INSERT INTO papers_fts(papers_fts, rank) VALUES ('integrity-check', 1)").run();
+      } catch (err) { content = err.message; }
+      const state = {
+        content,
+        integrity: db.prepare('PRAGMA integrity_check').get().integrity_check,
+        unfolded: tokens(db, 'authors:"Tworzydło"'),
+      };
+      db.close();
+      return state;
+    };
+    const folded = join(dir, 'folded.db');
+    const folding = await MirrorStore.open(folded);
+    const paper = (paper_id, authors, title = 'Paper') => ({
+      paper_id, identifier: 'oai:arXiv.org:' + paper_id, datestamp: '2024-03-01', title, authors,
+      abstract: 'X', categories: 'cs.LG', versions: [{ version: 'v1', date: '2024-03-01T00:00:00Z' }],
+    });
+    folding.applyBatch([
+      paper('2605.22701', 'A. Author', 'On Łojasiewicz gradients'),
+      paper('2605.22702', 'J. Tworzydlo'),
+      paper('2610.24554', 'Yiğit C. Atılgan'),
+      paper('2605.99999', 'J. Tworzydło'),
+    ], []);
+    // A rewrite and a tombstone, through the update and delete triggers.
+    folding.applyBatch(
+      [paper('2605.22701', 'J. Tworzydło', 'On Łojasiewicz gradients')], [{ paper_id: '2605.99999' }],
+    );
+    report.folded = {
+      tworzydlo: idsFor(folding, 'authors:"Tworzydlo"'),
+      atilgan: idsFor(folding, 'authors:"Atilgan"'),
+      lojasiewicz: [idsFor(folding, 'title:"Łojasiewicz"'), idsFor(folding, 'title:"Lojasiewicz"')],
+      ...indexState(folded),
+    };
+    folding.close();
+    const rebuilding = new Database(folded);
+    rebuilding.prepare("INSERT INTO papers_fts(papers_fts) VALUES ('rebuild')").run();
+    rebuilding.close();
+    const rebuilt = await MirrorStore.open(folded);
+    report.folded.afterRebuild = {
+      tworzydlo: idsFor(rebuilt, 'authors:"Tworzydlo"'), ...indexState(folded),
+    };
+    rebuilt.close();
+
+    // #100: a v6 file as a pre-v7 writer left it, migrated by this driver.
+    const v6 = join(dir, 'v6.db');
+    const building = new Database(v6);
+    for (const sql of ${JSON.stringify(V6_FIXTURE_STATEMENTS)}) building.prepare(sql).run();
+    building.prepare("INSERT INTO schema_version(version, applied_at) VALUES (6, '2026-11-01T00:00:00.000Z')").run();
+    building.prepare("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6000) INSERT INTO papers(id, version, title, authors, abstract, primary_category, categories, published, updated, latest_version) SELECT printf('2401.%05d', i), '1', 'Paper ' || i, CASE i % 4 WHEN 0 THEN 'J. Tworzydło and Y. C. Atılgan' WHEN 1 THEN 'J. Tworzydlo' ELSE 'A. Author' END, 'Abstract ' || i, 'cs.LG', 'cs.LG', '2024-01-01T00:00:00.000Z', '2024-01-02T00:00:00.000Z', '2024-01-02T00:00:00.000Z' FROM n").run();
+    building.prepare("INSERT INTO paper_categories(category, paper_id, updated, published) SELECT 'cs.LG', id, updated, published FROM papers").run();
+    const dump = (db) => JSON.stringify([
+      db.prepare('SELECT rowid, * FROM papers ORDER BY rowid').all(),
+      db.prepare('SELECT rowid, * FROM paper_categories ORDER BY rowid').all(),
+    ]);
+    const rowsBefore = dump(building);
+    const before = {
+      unfolded: tokens(building, 'authors:"Tworzydło"'), atilgan: tokens(building, 'authors:"Atilgan"'),
+    };
+    building.close();
+    const stdoutWrite = process.stdout.write;
+    const lines = [];
+    process.stdout.write = (chunk, ...rest) => {
+      if (!String(chunk).includes('fts rebuild')) return stdoutWrite.call(process.stdout, chunk, ...rest);
+      lines.push(String(chunk));
+      return true;
+    };
+    const migrating = await MirrorStore.open(v6);
+    process.stdout.write = stdoutWrite;
+    const total = (matchExpr) => migrating.search({
+      matchExpr, limit: 1, offset: 0, sortBy: 'published', sortOrder: 'ascending',
+    }).total;
+    report.migrated = {
+      before, lines, version: migrating.schemaVersion().current,
+      tworzydlo: total('authors:"Tworzydlo"'), atilgan: total('authors:"Atilgan"'),
+    };
+    migrating.close();
+    const reading6 = new Database(v6, { readonly: true });
+    report.migrated.rowsKept = dump(reading6) === rowsBefore;
+    reading6.close();
+    Object.assign(report.migrated, indexState(v6));
+
     console.log(JSON.stringify(report));
   `;
 
@@ -2138,6 +2495,35 @@ describe('MirrorStore under Node (better-sqlite3)', () => {
       byId: corrupt,
       byTerm: corrupt,
       byCategory: corrupt,
+    });
+  });
+
+  it('keeps author names folded through inserts, a rewrite, a tombstone, and an FTS5 rebuild (#100)', () => {
+    const intact = { content: 'ok', integrity: 'ok', unfolded: 0 };
+    expect(report.folded).toEqual({
+      tworzydlo: ['2605.22701', '2605.22702'],
+      atilgan: ['2610.24554'],
+      // Titles keep their letters, as arXiv's title search does.
+      lojasiewicz: [['2605.22701'], []],
+      ...intact,
+      afterRebuild: { tworzydlo: ['2605.22701', '2605.22702'], ...intact },
+    });
+  });
+
+  it('migrates a v6 file to v7 in 5,000-row batches, every row as it was and the index folded (#100)', () => {
+    expect(report.migrated).toEqual({
+      before: { unfolded: 1_500, atilgan: 0 },
+      lines: [
+        'mirror migration v6→v7 (fts rebuild): 5000/6000 rows\n',
+        'mirror migration v6→v7 (fts rebuild): 6000/6000 rows\n',
+      ],
+      version: MIRROR_SCHEMA_VERSION,
+      rowsKept: true,
+      tworzydlo: 3_000,
+      atilgan: 1_500,
+      content: 'ok',
+      integrity: 'ok',
+      unfolded: 0,
     });
   });
 });

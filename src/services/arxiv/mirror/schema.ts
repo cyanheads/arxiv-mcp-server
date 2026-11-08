@@ -26,7 +26,7 @@
  *     authors, and abstract, so the documented `co:` and `jr:` field prefixes
  *     resolve on the mirror path the way they already do on the live API.
  *     FTS5 has no `ALTER TABLE`, so the migration drops and rebuilds the index
- *     and its sync triggers — see `migrateToV3` in `store.ts`.
+ *     and its sync triggers — see `rebuildFtsIndex` in `store.ts`.
  *
  * v4 changes (issue #78):
  *   - `paper_categories.published`, the paper's submission instant, beside the
@@ -53,57 +53,80 @@
  *     after arXiv's TeX-to-Unicode conversion (`tex2utf.ts`), as the arXiv API
  *     serves it; the migration converts the rows a pre-v6 harvester stored with
  *     TeX in place (`convertTexText` in `store.ts`). No DDL changes.
+ *
+ * v7 changes (issue #100):
+ *   - `papers_fts` indexes `authors` with the letters arXiv's author search
+ *     spells in ASCII folded (`author-fold.ts`), and reads its content through
+ *     the view `papers_fts_source`, which folds them the same way. See
+ *     {@link MIRROR_FTS_STATEMENTS}; the migration rebuilds the index as v3's
+ *     does (`rebuildFtsIndex` in `store.ts`). No `papers` row changes.
  * @module services/arxiv/mirror/schema
  */
 
-export const MIRROR_SCHEMA_VERSION = 6;
+import { foldAuthorsSql } from './author-fold.js';
+
+export const MIRROR_SCHEMA_VERSION = 7;
 
 /**
- * The FTS5 index and its `papers` sync triggers. Split out of the main schema
- * so the v3 migration can drop and recreate them from this single definition
- * rather than a transcribed copy that would drift on the next column change.
+ * The FTS5 index, the view it reads as its external content, and its `papers`
+ * sync triggers, as v7 defines them. A new file runs them in the transaction
+ * that creates it; an older one, after {@link MIRROR_FTS_DROP_STATEMENTS}, as
+ * the index rebuild of its v3 or v7 migration. Kept out of
+ * {@link MIRROR_SCHEMA_STATEMENTS}: against an older file `IF NOT EXISTS`
+ * would skip each redefinition.
  *
- * The triggers enumerate their columns explicitly, so every column added here
- * has to be added to all three of them — a column missing from a trigger leaves
- * the index silently diverging from `papers` on the next write.
+ * `authors` is folded in SQL, in the view and in every trigger, so every
+ * writer and driver keeps the index in step with `papers`, a pre-v7 writer
+ * included (its own schema pass finds these objects and keeps them). The view
+ * makes FTS5's `'rebuild'` and its content-reading `'integrity-check'` read
+ * the folded text too; with `papers` as the content, both would compare the
+ * index against the unfolded column. The triggers enumerate their columns
+ * explicitly, so a column added here has to be added to the view and all three
+ * triggers — a column missing from one leaves the index silently diverging
+ * from `papers` on the next write.
  */
 export const MIRROR_FTS_STATEMENTS: readonly string[] = [
-  `CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
+  `CREATE VIEW papers_fts_source AS
+  SELECT rowid AS rid, title, ${foldAuthorsSql('authors')} AS authors, abstract, comment, journal_ref
+  FROM papers`,
+  `CREATE VIRTUAL TABLE papers_fts USING fts5(
   title,
   authors,
   abstract,
   comment,
   journal_ref,
-  content='papers',
-  content_rowid='rowid',
+  content='papers_fts_source',
+  content_rowid='rid',
   tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
 )`,
-  `CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
+  `CREATE TRIGGER papers_ai AFTER INSERT ON papers BEGIN
   INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
-  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+  VALUES (new.rowid, new.title, ${foldAuthorsSql('new.authors')}, new.abstract, new.comment, new.journal_ref);
 END`,
-  `CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
+  `CREATE TRIGGER papers_ad AFTER DELETE ON papers BEGIN
   INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  VALUES ('delete', old.rowid, old.title, ${foldAuthorsSql('old.authors')}, old.abstract, old.comment, old.journal_ref);
 END`,
-  `CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
+  `CREATE TRIGGER papers_au AFTER UPDATE ON papers BEGIN
   INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  VALUES ('delete', old.rowid, old.title, ${foldAuthorsSql('old.authors')}, old.abstract, old.comment, old.journal_ref);
   INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
-  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+  VALUES (new.rowid, new.title, ${foldAuthorsSql('new.authors')}, new.abstract, new.comment, new.journal_ref);
 END`,
 ];
 
 /**
- * Drops the FTS index and its triggers so the v3 migration can recreate them
- * from {@link MIRROR_FTS_STATEMENTS}. Triggers go first: a v2 trigger firing
- * against a v3 index would leave the index diverging from `papers`.
+ * Drops the FTS index, its triggers, and its content view, whichever version
+ * defined them, so a migration can recreate them from
+ * {@link MIRROR_FTS_STATEMENTS}. Triggers go first: an older trigger firing
+ * against the new index would leave the index diverging from `papers`.
  */
 export const MIRROR_FTS_DROP_STATEMENTS: readonly string[] = [
   'DROP TRIGGER IF EXISTS papers_ai',
   'DROP TRIGGER IF EXISTS papers_ad',
   'DROP TRIGGER IF EXISTS papers_au',
   'DROP TABLE IF EXISTS papers_fts',
+  'DROP VIEW IF EXISTS papers_fts_source',
 ];
 
 /**
@@ -119,12 +142,14 @@ export const MIRROR_PRAGMA_STATEMENTS: readonly string[] = [
 
 /**
  * The schema a writer applies on every open, in order, inside one write
- * transaction (issue #71). Each entry is idempotent. It holds the v3 shape v4
- * left as it was; what v4 adds or redefines is {@link MIRROR_V4_STATEMENTS},
- * which a new file runs in the same transaction and an older one runs as its
- * migration. Kept out of this list on purpose: against a v3 file, an index on
- * the junction's `published` fails (no such column) and a redefined index under
- * an existing name is skipped by `IF NOT EXISTS`.
+ * transaction (issue #71). Each entry is idempotent. It holds the shape no
+ * later version redefines; what v4, v5, and v7 add or redefine is
+ * {@link MIRROR_V4_STATEMENTS}, {@link MIRROR_V5_STATEMENTS}, and
+ * {@link MIRROR_FTS_STATEMENTS}, which a new file runs in the same transaction
+ * and an older one runs as its migration. Kept out of this list on purpose:
+ * against a v3 file, an index on the junction's `published` fails (no such
+ * column), and a redefined index, trigger, or table under an existing name is
+ * skipped by `IF NOT EXISTS`.
  */
 export const MIRROR_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS schema_version (
@@ -159,7 +184,6 @@ export const MIRROR_SCHEMA_STATEMENTS: readonly string[] = [
   doi TEXT
 )`,
   'CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_category)',
-  ...MIRROR_FTS_STATEMENTS,
   // Junction table: one row per (paper, category) pair, with the paper's ISO
   // updated value (and, from v4, its published value) denormalized in. Enables
   // index-backed category filtering without a full-table scan or LIKE queries

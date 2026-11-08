@@ -7,7 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
-import { normalizePaperId, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
+import { normalizePaperId, PAPER_ID_FORMS, PAPER_SEARCH_HINT } from '@/services/arxiv/paper-id.js';
 import {
   type OutlineEntry,
   OutlineEntrySchema,
@@ -71,8 +71,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
       reason: 'invalid_id',
       code: JsonRpcErrorCode.ValidationError,
       when: 'paper_id is not an arXiv identifier in an accepted form.',
-      recovery:
-        'Send an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works.',
+      recovery: `Send an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it); an arXiv: prefix or an arxiv.org abs, pdf, or html URL also works. ${PAPER_SEARCH_HINT}`,
     },
     {
       reason: 'no_match',
@@ -104,7 +103,7 @@ export const arxivReadPaper = tool('arxiv_read_paper', {
     {
       reason: 'version_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'A version-pinned paper_id was requested, arXiv is unreachable, and the local mirror holds only a different version — per-version reads require the live API.',
+      when: 'A version-pinned paper_id was requested, arXiv is unreachable, and the local mirror holds only a different version — a version the mirror does not hold needs the live API.',
       retryable: true,
       recovery:
         'Retry once arXiv is reachable, or request the version reported in error.data.mirrorVersion.',

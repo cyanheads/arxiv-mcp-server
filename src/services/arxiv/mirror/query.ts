@@ -20,6 +20,7 @@
 
 import { categorySearchTerm, categorySubtree } from '../categories.js';
 import { intersectBounds, stampToIso } from '../date-window.js';
+import { foldAuthorText } from './author-fold.js';
 
 /** Inclusive ISO 8601 bounds on `papers.published`. */
 interface Bounds {
@@ -644,11 +645,27 @@ function emitMatch(root: Node): string {
   return out.join('');
 }
 
+/** Every FTS column but `authors`, as one FTS5 column filter. */
+const UNFOLDED_COLUMNS = `{${ALL_COLUMNS.filter((col) => col !== FTS_COLUMN.au).join(' ')}}`;
+
+/**
+ * The FTS5 operand for one text value. Wherever it reaches `authors` — an
+ * `au:` value, and the authors arm of `all:` and of an unprefixed term — the
+ * value is folded to arXiv's ASCII spellings as the index folds that column
+ * (issue #100); every other column matches it as written. An unprefixed term
+ * splits into a column filter and the authors arm only when the fold changes
+ * the value, so one with no letter to fold emits what it always has.
+ */
 function ftsOperand(field: TextField | undefined, raw: string): string {
   const value = quoteFtsValue(raw);
-  if (field === undefined) return value;
-  if (field === 'all') return `(${ALL_COLUMNS.map((col) => `${col}:${value}`).join(' OR ')})`;
-  return `${FTS_COLUMN[field]}:${value}`;
+  if (field !== undefined && field !== 'au' && field !== 'all')
+    return `${FTS_COLUMN[field]}:${value}`;
+  const author = quoteFtsValue(foldAuthorText(raw));
+  if (field === 'au') return `${FTS_COLUMN.au}:${author}`;
+  if (field === 'all') {
+    return `(${ALL_COLUMNS.map((col) => `${col}:${col === FTS_COLUMN.au ? author : value}`).join(' OR ')})`;
+  }
+  return author === value ? value : `(${UNFOLDED_COLUMNS}:${value} OR ${FTS_COLUMN.au}:${author})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,9 +721,12 @@ export function translateQuery(query: string): TranslatedQuery {
  * `cat:` operand means one thing regardless of which backend answers — which is
  * also what the tool's `query` description has always claimed. See issue #36.
  *
- * A leaf code, a standalone archive, and an already-wildcarded operand all
- * rewrite to themselves. `translateQuery` needs no counterpart because it
- * expands `cat:` through the same taxonomy on the way into its category filter.
+ * An alias code rewrites to its canonical code (`cat:cs.NA` → `cat:math.NA`),
+ * which is the only code arXiv's search matches, and a subtree or wildcard that
+ * spans an alias gains its canonical code (issue #99). Any other leaf code, a
+ * standalone archive, and a wildcard spanning no alias rewrite to themselves.
+ * `translateQuery` needs no counterpart because it expands `cat:` through the
+ * same taxonomy on the way into its category filter.
  */
 export function expandCategoryOperands(query: string): string {
   let out = '';

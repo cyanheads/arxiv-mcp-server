@@ -1,5 +1,7 @@
 /**
- * @fileoverview Static arXiv category taxonomy (~155 categories).
+ * @fileoverview Static arXiv category taxonomy (~155 categories), arXiv's
+ * category equivalences (alias and subsumed-archive codes), and the subtree
+ * expansions both search paths read.
  * Source: arxiv.org taxonomy, last major addition: econ group (2017).
  * @module services/arxiv/categories
  */
@@ -228,6 +230,54 @@ export const VALID_CATEGORY_CODES: ReadonlySet<string> = new Set(
 );
 
 /**
+ * arXiv's category aliases: an alias code and the canonical code arXiv reports
+ * in its place. This map and {@link ARCHIVES_SUBSUMED} copy arxiv-base
+ * `arxiv/taxonomy/definitions.py` `CATEGORY_ALIASES` and `ARCHIVES_SUBSUMED` at
+ * commit a5985f621b07a4031c9e9b4f870a2206a9aa15a7 (unchanged on `develop`
+ * through 02c6b6910f69995a37c200f3dba70b0b49c2ab1d). The Atom API lists, and its
+ * search indexes, only the right-hand codes; arXivRaw, which the mirror stores,
+ * keeps the left-hand codes beside them. See issue #99.
+ */
+const CATEGORY_ALIASES: ReadonlyMap<string, string> = new Map([
+  ['math.MP', 'math-ph'],
+  ['stat.TH', 'math.ST'],
+  ['math.IT', 'cs.IT'],
+  ['q-fin.EC', 'econ.GN'],
+  ['cs.SY', 'eess.SY'],
+  ['cs.NA', 'math.NA'],
+]);
+
+/** arXiv's subsumed archives: a defunct archive and the category that subsumed it. */
+const ARCHIVES_SUBSUMED: ReadonlyMap<string, string> = new Map([
+  ['cmp-lg', 'cs.CL'],
+  ['adap-org', 'nlin.AO'],
+  ['comp-gas', 'nlin.CG'],
+  ['chao-dyn', 'nlin.CD'],
+  ['solv-int', 'nlin.SI'],
+  ['patt-sol', 'nlin.PS'],
+  ['alg-geom', 'math.AG'],
+  ['dg-ga', 'math.DG'],
+  ['funct-an', 'math.FA'],
+  ['q-alg', 'math.QA'],
+  ['mtrl-th', 'cond-mat.mtrl-sci'],
+  ['supr-con', 'cond-mat.supr-con'],
+  ['acc-phys', 'physics.acc-ph'],
+  ['ao-sci', 'physics.ao-ph'],
+  ['atom-ph', 'physics.atom-ph'],
+  ['bayes-an', 'physics.data-an'],
+  ['chem-ph', 'physics.chem-ph'],
+  ['plasm-ph', 'physics.plasm-ph'],
+]);
+
+/**
+ * The code the arXiv API reports for `code`: an alias's canonical code, a
+ * subsumed archive's successor, otherwise `code` as written.
+ */
+export function canonicalCategory(code: string): string {
+  return CATEGORY_ALIASES.get(code) ?? ARCHIVES_SUBSUMED.get(code) ?? code;
+}
+
+/**
  * Archives that were subdivided into dotted subject classes (`astro-ph`, `cs`,
  * `math`, …). Derived from the taxonomy rather than listed, so adding an `x.YY`
  * leaf makes the bare `x` searchable without a second edit. Standalone archives
@@ -271,15 +321,24 @@ export const SEARCHABLE_CATEGORY_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Concrete category codes a filter covers. A leaf or standalone archive covers
- * only itself; a subdivided archive covers its dotted subject classes plus the
- * bare archive code that legacy flat papers still carry. arXiv's own subtree
- * wildcards are accepted in the same vocabulary — `X*` matches every code with
- * that string prefix (including a neighbouring archive, as on the live API),
- * `X.*` only the dotted children. Unknown codes come back verbatim so callers
+ * Concrete category codes a filter covers, as the mirror matches them. A leaf or
+ * standalone archive covers only itself; a subdivided archive covers its dotted
+ * subject classes plus the bare archive code that legacy flat papers still
+ * carry. arXiv's own subtree wildcards are accepted in the same vocabulary —
+ * `X*` matches every code with that string prefix (including a neighbouring
+ * archive, as on the live API), `X.*` only the dotted children. An alias code
+ * comes back as its canonical code, so `cs.NA` covers `math.NA` alone and `cs`
+ * covers `math.NA` and `eess.SY` in place of `cs.NA` and `cs.SY`: arXiv's search
+ * matches the canonical code only, and arXivRaw lists it beside every alias.
+ * Unknown codes, subsumed archives among them, come back verbatim so callers
  * can decide whether to warn.
  */
 export function categorySubtree(code: string): string[] {
+  return [...new Set(taxonomySubtree(code).map((c) => CATEGORY_ALIASES.get(c) ?? c))];
+}
+
+/** The codes a filter names before {@link categorySubtree} maps its aliases. */
+function taxonomySubtree(code: string): string[] {
   const trimmed = code.trim();
   if (!trimmed) return [];
   if (trimmed.endsWith('.*')) return codesStartingWith(trimmed.slice(0, -1));
@@ -298,18 +357,38 @@ function codesStartingWith(prefix: string): string[] {
 
 /**
  * The `cat:` operand a category filter becomes on the live arXiv API. Leaves and
- * standalone archives match exactly. A subdivided archive becomes the `cat:X*`
+ * standalone archives match exactly, an alias as its canonical code
+ * (`cat:cs.NA` → `cat:math.NA`). A subdivided archive becomes the `cat:X*`
  * subtree wildcard, which covers its subject classes and the legacy flat papers
  * a bare `cat:X` would match alone. Where that wildcard would leak a neighbouring
  * archive sharing the prefix, the subtree is spelled out as `(cat:X.* OR cat:X)`
- * so the neighbour stays out and the legacy flat papers stay in.
+ * so the neighbour stays out and the legacy flat papers stay in. A subtree or
+ * wildcard holding an alias also ORs in the alias's canonical code, unless the
+ * pattern already reaches it: `cat:cs` → `(cat:cs* OR cat:math.NA OR cat:eess.SY)`.
+ * The codes it reaches are the ones {@link categorySubtree} returns.
  */
 export function categorySearchTerm(code: string): string {
   const trimmed = code.trim();
-  if (!SUBDIVIDED_ARCHIVES.has(trimmed)) return `cat:${trimmed}`;
-  return PREFIX_COLLIDING_ARCHIVES.has(trimmed)
-    ? `(cat:${trimmed}.* OR cat:${trimmed})`
-    : `cat:${trimmed}*`;
+  const pattern = subtreePattern(trimmed);
+  if (!pattern) return `cat:${CATEGORY_ALIASES.get(trimmed) ?? trimmed}`;
+  const reached = taxonomySubtree(trimmed);
+  const covered = new Set(reached);
+  const added = new Set(
+    reached.flatMap((c) => {
+      const canonical = CATEGORY_ALIASES.get(c);
+      return canonical && !covered.has(canonical) ? [`cat:${canonical}`] : [];
+    }),
+  );
+  const operands = [...pattern, ...added];
+  const joined = operands.join(' OR ');
+  return operands.length > 1 ? `(${joined})` : joined;
+}
+
+/** The `cat:` operands arXiv reads as a subtree or wildcard filter, or undefined for one code. */
+function subtreePattern(code: string): string[] | undefined {
+  if (code.endsWith('*')) return [`cat:${code}`];
+  if (!SUBDIVIDED_ARCHIVES.has(code)) return undefined;
+  return PREFIX_COLLIDING_ARCHIVES.has(code) ? [`cat:${code}.*`, `cat:${code}`] : [`cat:${code}*`];
 }
 
 /**

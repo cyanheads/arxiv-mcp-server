@@ -6,7 +6,12 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getArxivService } from '@/services/arxiv/arxiv-service.js';
-import { normalizePaperId, noSuchPaperMessage, PAPER_ID_FORMS } from '@/services/arxiv/paper-id.js';
+import {
+  normalizePaperId,
+  noSuchPaperMessage,
+  PAPER_ID_FORMS,
+  PAPER_SEARCH_HINT,
+} from '@/services/arxiv/paper-id.js';
 
 /**
  * Percent-decode a URI-template variable. Template matching yields the raw text
@@ -49,8 +54,7 @@ export const paperResource = resource('arxiv://paper/{paperId}', {
       reason: 'invalid_id',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The decoded paper ID is not an arXiv identifier in an accepted form.',
-      recovery:
-        'Read the URI with an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it; percent-encode the slash).',
+      recovery: `Read the URI with an ID like "2401.12345", "2401.12345v2", or "hep-th/9901001" (a pre-2007 archive spelled as arXiv issued it; percent-encode the slash). ${PAPER_SEARCH_HINT}`,
     },
     {
       reason: 'no_match',

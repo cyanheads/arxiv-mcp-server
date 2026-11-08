@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   ARXIV_CATEGORIES,
+  canonicalCategory,
   categorySearchTerm,
   categorySubtree,
   GROUPS,
@@ -14,6 +15,41 @@ import {
   suggestCategories,
   VALID_CATEGORY_CODES,
 } from '@/services/arxiv/categories.js';
+
+/**
+ * arxiv-base `arxiv/taxonomy/definitions.py` `CATEGORY_ALIASES`: alias → the
+ * canonical code, which is the one the Atom API returns and indexes.
+ */
+const ALIASES: [alias: string, canonical: string][] = [
+  ['math.MP', 'math-ph'],
+  ['stat.TH', 'math.ST'],
+  ['math.IT', 'cs.IT'],
+  ['q-fin.EC', 'econ.GN'],
+  ['cs.SY', 'eess.SY'],
+  ['cs.NA', 'math.NA'],
+];
+
+/** arxiv-base `ARCHIVES_SUBSUMED`: defunct archive → the category that subsumed it. */
+const SUBSUMED: [archive: string, successor: string][] = [
+  ['cmp-lg', 'cs.CL'],
+  ['adap-org', 'nlin.AO'],
+  ['comp-gas', 'nlin.CG'],
+  ['chao-dyn', 'nlin.CD'],
+  ['solv-int', 'nlin.SI'],
+  ['patt-sol', 'nlin.PS'],
+  ['alg-geom', 'math.AG'],
+  ['dg-ga', 'math.DG'],
+  ['funct-an', 'math.FA'],
+  ['q-alg', 'math.QA'],
+  ['mtrl-th', 'cond-mat.mtrl-sci'],
+  ['supr-con', 'cond-mat.supr-con'],
+  ['acc-phys', 'physics.acc-ph'],
+  ['ao-sci', 'physics.ao-ph'],
+  ['atom-ph', 'physics.atom-ph'],
+  ['bayes-an', 'physics.data-an'],
+  ['chem-ph', 'physics.chem-ph'],
+  ['plasm-ph', 'physics.plasm-ph'],
+];
 
 describe('getGroup', () => {
   it('returns "physics" for physics archives', () => {
@@ -124,17 +160,21 @@ describe('categorySubtree', () => {
     expect(astro.filter((c) => c.startsWith('astro-ph.')).length).toBe(6);
   });
 
-  it('scopes a group code to its own archive, never a prefix neighbour', () => {
-    // math-ph is a physics archive that merely shares math's string prefix.
+  it('scopes a group code to its own archive, reaching a prefix neighbour only as an alias', () => {
+    // math-ph is a physics archive that merely shares math's string prefix. It
+    // enters the math subtree once, as the canonical code of math.MP (#99).
     const math = categorySubtree('math');
     expect(math).toContain('math');
     expect(math).toContain('math.AG');
-    expect(math).not.toContain('math-ph');
+    expect(math.filter((code) => code === 'math-ph')).toEqual(['math-ph']);
+    expect(math).not.toContain('math.MP');
   });
 
   it('reads the subtree wildcards emitted on the live path', () => {
     expect(categorySubtree('astro-ph*')).toEqual(categorySubtree('astro-ph'));
-    expect(categorySubtree('math.*')).not.toContain('math-ph');
+    // `X.*` names the dotted children only, never the bare legacy code.
+    expect(categorySubtree('math.*')).not.toContain('math');
+    expect(categorySubtree('math.*')).toContain('math.AG');
     // `X*` mirrors arXiv's own wildcard, which does reach a prefix neighbour.
     expect(categorySubtree('math*')).toContain('math-ph');
   });
@@ -154,23 +194,23 @@ describe('categorySearchTerm', () => {
   it('wildcards a subdivided archive so the subtree is covered', () => {
     // cat:astro-ph alone is 105,380 legacy flat papers; cat:astro-ph* is 388,854.
     expect(categorySearchTerm('astro-ph')).toBe('cat:astro-ph*');
-    expect(categorySearchTerm('cs')).toBe('cat:cs*');
+    expect(categorySearchTerm('cs')).toBe('(cat:cs* OR cat:math.NA OR cat:eess.SY)');
     expect(categorySearchTerm('q-bio')).toBe('cat:q-bio*');
   });
 
   it('spells out the subtree where a wildcard would leak a prefix neighbour', () => {
-    // cat:math* is 722,677 and pulls in math-ph (91,063 standalone). The spelled
-    // form keeps math-ph out while leaving room for legacy flat math papers.
-    expect(categorySearchTerm('math')).toBe('(cat:math.* OR cat:math)');
+    // cat:math* is 722,677 and pulls in math-ph (91,063 standalone) by prefix.
+    // The spelled form keeps the prefix out while leaving room for legacy flat
+    // math papers; math-ph comes back only as math.MP's canonical code (#99).
+    expect(categorySearchTerm('math')).toBe('(cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)');
+    expect(categorySearchTerm('math')).not.toContain('cat:math*');
   });
 
-  it('leaves every other archive on the plain wildcard', () => {
-    for (const code of ['astro-ph', 'cond-mat', 'nlin', 'physics', 'q-bio', 'q-fin']) {
+  it('leaves every archive holding no alias on the plain wildcard', () => {
+    for (const code of ['astro-ph', 'cond-mat', 'nlin', 'physics', 'q-bio', 'econ', 'eess']) {
       expect(categorySearchTerm(code)).toBe(`cat:${code}*`);
     }
-    for (const code of ['cs', 'econ', 'eess', 'stat']) {
-      expect(categorySearchTerm(code)).toBe(`cat:${code}*`);
-    }
+    expect(categorySearchTerm('astro-ph.*')).toBe('cat:astro-ph.*');
   });
 
   it('agrees with categorySubtree on which codes name a subtree', () => {
@@ -180,6 +220,81 @@ describe('categorySearchTerm', () => {
       const isSubtree = categorySubtree(code).length > 1;
       expect(categorySearchTerm(code).includes('*')).toBe(isSubtree);
     }
+  });
+});
+
+// Issue #99: the Atom API returns, and its search indexes, only canonical codes,
+// while arXivRaw (the mirror's source) keeps the alias and subsumed codes too.
+describe('canonicalCategory', () => {
+  it.each(ALIASES)('maps the alias %s to %s', (alias, canonical) => {
+    expect(canonicalCategory(alias)).toBe(canonical);
+  });
+
+  it.each(SUBSUMED)('maps the subsumed archive %s to %s', (archive, successor) => {
+    expect(canonicalCategory(archive)).toBe(successor);
+  });
+
+  it('leaves every other taxonomy code, and a code it does not know, as written', () => {
+    const aliases = new Set(ALIASES.map(([alias]) => alias));
+    for (const { code } of ARXIV_CATEGORIES) {
+      if (!aliases.has(code)) expect(canonicalCategory(code)).toBe(code);
+    }
+    expect(canonicalCategory('astro-ph')).toBe('astro-ph');
+    expect(canonicalCategory('zz.UNKNOWN')).toBe('zz.UNKNOWN');
+  });
+
+  it('maps every code onto a taxonomy code that maps to itself', () => {
+    for (const [, target] of [...ALIASES, ...SUBSUMED]) {
+      expect(VALID_CATEGORY_CODES.has(target)).toBe(true);
+      expect(canonicalCategory(target)).toBe(target);
+    }
+  });
+});
+
+describe('alias codes in search (#99)', () => {
+  it.each(ALIASES)('reads the alias %s as %s on the mirror', (alias, canonical) => {
+    // One code, so a term-less mirror search on it counts exactly.
+    expect(categorySubtree(alias)).toEqual([canonical]);
+  });
+
+  it.each(ALIASES)('sends the alias %s live as cat:%s', (alias, canonical) => {
+    // arXiv's search matches no alias code: `cat:cs.NA` totals 0.
+    expect(categorySearchTerm(alias)).toBe(`cat:${canonical}`);
+  });
+
+  it.each([
+    ['cs', ['math.NA', 'eess.SY'], ['cs.NA', 'cs.SY']],
+    ['math', ['cs.IT', 'math-ph'], ['math.IT', 'math.MP']],
+    ['stat', ['math.ST'], ['stat.TH']],
+    ['q-fin', ['econ.GN'], ['q-fin.EC']],
+  ])('puts the canonical code in place of each alias in the %s subtree', (archive, added, gone) => {
+    const subtree = categorySubtree(archive);
+    for (const code of added) expect(subtree).toContain(code);
+    for (const code of gone) expect(subtree).not.toContain(code);
+    expect(new Set(subtree).size).toBe(subtree.length);
+  });
+
+  it.each([
+    ['cs', '(cat:cs* OR cat:math.NA OR cat:eess.SY)'],
+    ['math', '(cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)'],
+    ['stat', '(cat:stat* OR cat:math.ST)'],
+    ['q-fin', '(cat:q-fin* OR cat:econ.GN)'],
+    // A wildcard the caller wrote reaches the canonical codes of the aliases it spans.
+    ['cs*', '(cat:cs* OR cat:math.NA OR cat:eess.SY)'],
+    ['cs.*', '(cat:cs.* OR cat:math.NA OR cat:eess.SY)'],
+    ['cs.N*', '(cat:cs.N* OR cat:math.NA)'],
+    ['math.*', '(cat:math.* OR cat:cs.IT OR cat:math-ph)'],
+    // `cat:math*` already reaches math-ph by prefix, so only cs.IT is added.
+    ['math*', '(cat:math* OR cat:cs.IT)'],
+  ])('sends %s live with the canonical codes of its aliases: %s', (code, term) => {
+    expect(categorySearchTerm(code)).toBe(term);
+  });
+
+  it('leaves a subsumed archive code as written in search', () => {
+    // Outside the searchable taxonomy: `category` rejects it, and a `cat:` operand
+    // naming one keeps its literal meaning on each path.
+    expect(categorySubtree('chao-dyn')).toEqual(['chao-dyn']);
+    expect(categorySearchTerm('chao-dyn')).toBe('cat:chao-dyn');
   });
 });
 

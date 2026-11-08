@@ -87,6 +87,13 @@ export const PAPER_ID_FORMS =
   '"2401.12345", "2401.12345v2", or a pre-2007 ID like "hep-th/9901001" (archive spelled as arXiv issued it), optionally prefixed "arXiv:", or an arxiv.org abs, pdf, or html URL, with or without https:// or a ?query or #fragment';
 
 /**
+ * The closing sentence of every `invalid_id` recovery and not-an-ID detail: a
+ * title, author name, or search query sent as an ID is answered by search.
+ */
+export const PAPER_SEARCH_HINT =
+  'To find a paper by title, author, or topic, search with arxiv_search_papers.';
+
+/**
  * Canonical arXiv ID for `raw`, or `undefined` when it is not an arXiv ID.
  *
  * Every spelling with one certain reading maps to the form arXiv itself

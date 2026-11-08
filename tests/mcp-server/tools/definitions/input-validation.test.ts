@@ -80,6 +80,41 @@ describe('arxivSearchPapers input validation', () => {
     expect(() => arxivSearchPapers.input.parse({ query: 'test', sort_by: 'bogus' })).toThrow();
   });
 
+  it("reads arXiv's own sortBy names, in any case and padding, as the canonical sort_by (#105)", () => {
+    const readings: [sent: string, canonical: string][] = [
+      ['submittedDate', 'submitted'],
+      ['lastUpdatedDate', 'updated'],
+      ['SubmittedDate', 'submitted'],
+      ['submitteddate', 'submitted'],
+      ['LASTUPDATEDDATE', 'updated'],
+      [' lastUpdatedDate\n', 'updated'],
+      ['Submitted', 'submitted'],
+      ['RELEVANCE', 'relevance'],
+      [' updated ', 'updated'],
+      ['relevance', 'relevance'],
+      ['submitted', 'submitted'],
+      ['updated', 'updated'],
+    ];
+    for (const [sort_by, canonical] of readings) {
+      expect(arxivSearchPapers.input.parse({ query: 'test', sort_by }).sort_by, sort_by).toBe(
+        canonical,
+      );
+    }
+  });
+
+  it('rejects a sort_by with no one reading with the enum message', () => {
+    for (const sort_by of ['bogus', 'submitted_date', 'lastUpdated', 'date', '', 3]) {
+      const parsed = arxivSearchPapers.input.safeParse({ query: 'test', sort_by });
+      expect(parsed.success, JSON.stringify(sort_by)).toBe(false);
+      expect(parsed.error?.issues.map(({ path, message }) => ({ path, message }))).toEqual([
+        {
+          path: ['sort_by'],
+          message: 'Invalid option: expected one of "relevance"|"submitted"|"updated"',
+        },
+      ]);
+    }
+  });
+
   it('rejects invalid sort_order value', () => {
     expect(() =>
       arxivSearchPapers.input.parse({ query: 'test', sort_order: 'sideways' }),

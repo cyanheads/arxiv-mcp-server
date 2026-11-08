@@ -7,7 +7,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { arxivSearchPapers } from '@/mcp-server/tools/definitions/arxiv-search-papers.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
-import type { PaperMetadata, SearchResult } from '@/services/arxiv/types.js';
+import type { PaperMetadata, SearchOptions, SearchResult } from '@/services/arxiv/types.js';
 import {
   COMMONMARK_PRESETS,
   readCommonMarkFences,
@@ -40,12 +40,17 @@ const MOCK_RESULT: SearchResult = {
   effective_query: 'au:bengio AND ti:attention',
 };
 
-const mockSearch = vi.fn<() => Promise<SearchResult>>();
+const mockSearch =
+  vi.fn<(query: string, options: SearchOptions, ctx: unknown) => Promise<SearchResult>>();
 
 beforeEach(() => {
   mockSearch.mockReset();
   vi.mocked(getArxivService).mockReturnValue({ search: mockSearch } as any);
 });
+
+/** Every content block's text, joined — what a format-only client reads. */
+const textOf = (result: { content: { type: string; text?: string }[] }): string =>
+  result.content.map((block) => block.text ?? '').join('\n');
 
 describe('arxivSearchPapers', () => {
   // Issue #46: the search tool names its object; the old bare name is gone, with no alias.
@@ -266,6 +271,58 @@ describe('arxivSearchPapers', () => {
     expect(input.sort_by).toBe('relevance');
     expect(input.sort_order).toBe('descending');
     expect(input.start).toBe(0);
+  });
+
+  it("hands service.search the canonical sort_by for arXiv's own sortBy names (#105)", async () => {
+    mockSearch.mockResolvedValue(MOCK_RESULT);
+    for (const sort_by of ['submittedDate', 'lastUpdatedDate', 'Relevance']) {
+      const result = await runToolContract(arxivSearchPapers, { query: 'q', sort_by } as never);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    }
+    expect(mockSearch.mock.calls.map(([, options]) => options?.sortBy)).toEqual([
+      'submitted',
+      'updated',
+      'relevance',
+    ]);
+  });
+
+  it('sorts by relevance when sort_by is omitted or null', async () => {
+    mockSearch.mockResolvedValue(MOCK_RESULT);
+    for (const args of [{ query: 'q' }, { query: 'q', sort_by: null }]) {
+      const result = await runToolContract(arxivSearchPapers, args as never);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    }
+    expect(mockSearch.mock.calls.map(([, options]) => options?.sortBy)).toEqual([
+      'relevance',
+      'relevance',
+    ]);
+  });
+
+  it('refuses a sort_by with no one reading before any search', async () => {
+    for (const sort_by of ['bogus', 'submitted_date', 3]) {
+      const result = await runToolContract(arxivSearchPapers, { query: 'q', sort_by } as never);
+      expect(result.isError, JSON.stringify(sort_by)).toBe(true);
+      // An error's text is Markdown-encoded: read it back as a CommonMark parse does.
+      expect(readCommonMarkText(textOf(result))).toContain(
+        'sort_by: Invalid option: expected one of "relevance"|"submitted"|"updated"',
+      );
+    }
+    expect(mockSearch).not.toHaveBeenCalled();
+  });
+
+  it('advertises sort_by as the three canonical values, relevance by default', () => {
+    // The inputSchema tools/list carries. Parsed JSON, so key order is not compared.
+    const schema = arxivSearchPapers.input['~standard'].jsonSchema.input({
+      target: 'draft-2020-12',
+    }) as { properties: Record<string, unknown>; required: string[] };
+    expect(schema.properties.sort_by).toStrictEqual({
+      type: 'string',
+      enum: ['relevance', 'submitted', 'updated'],
+      default: 'relevance',
+      description:
+        'Sort criterion. Use "submitted" for newest papers, "relevance" for best query matches.',
+    });
+    expect(schema.required).toStrictEqual(['query']);
   });
 
   it('sets empty-result notice in enrichment when no papers match', async () => {
@@ -537,8 +594,6 @@ describe('arxivSearchPapers — a mirror total that stopped at the cap', () => {
       id: `2401.${String(i + 1).padStart(5, '0')}v1`,
     }));
   }
-  const textOf = (result: { content: { type: string; text?: string }[] }): string =>
-    result.content.map((block) => block.text ?? '').join('\n');
   const capped = (start: number, count: number): SearchResult => ({
     total_results: 50_000,
     total_is_lower_bound: true,

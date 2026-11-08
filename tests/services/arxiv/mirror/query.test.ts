@@ -117,7 +117,8 @@ describe('translateQuery', () => {
     // The bare archive code carries legacy flat papers filed before the archive
     // was subdivided; dropping it makes the mirror narrower than live (#32).
     expect(codes).toContain('cs');
-    expect(codes.every((c) => c === 'cs' || c.startsWith('cs.'))).toBe(true);
+    // cs.NA and cs.SY are aliases: their canonical codes stand in for them (#99).
+    expect(codes.filter((c) => c !== 'cs' && !c.startsWith('cs.'))).toEqual(['math.NA', 'eess.SY']);
   });
 
   it('drops dangling boolean operators when cat: is the sole non-operator term', () => {
@@ -773,6 +774,129 @@ describe('translateQuery — arXiv’s query grammar (issue #82)', () => {
   });
 });
 
+// Issue #100 — arXiv's author search spells ł, ø, ß, and the other letters FTS5's
+// unicode61 leaves unfolded in ASCII; its title and abstract search folds nothing.
+describe('translateQuery — author values folded to ASCII (issue #100)', () => {
+  /** An unprefixed term whose authors arm folds: the other four columns keep it as written. */
+  const splitArms = (value: string, folded: string): string =>
+    `({title abstract comment journal_ref}:"${value}" OR authors:"${folded}")`;
+
+  it.each([
+    ['au:Tworzydlo', 'authors:"Tworzydlo"'],
+    ['au:Atilgan AND cat:astro-ph.GA', 'authors:"Atilgan"'],
+    // A letter that decomposes is folded by the index's tokenizer, in the query too.
+    ['au:müller', 'authors:"müller"'],
+    ['au:Sánchez', 'authors:"Sánchez"'],
+    ['all:Lojasiewicz', allCols('Lojasiewicz')],
+    ['all:Poincaré', allCols('Poincaré')],
+    ['Tworzydlo', '"Tworzydlo"'],
+    ['"Sánchez Fernán"', '"Sánchez Fernán"'],
+    ['a ANDNOT Tworzydlo', '"a" NOT "Tworzydlo"'],
+    [
+      '(Tworzydlo OR Beenakker) AND ti:transport',
+      '("Tworzydlo" OR "Beenakker") AND title:"transport"',
+    ],
+    // Title, abstract, comment, and journal ref keep every letter as written, as arXiv does.
+    ['ti:Łojasiewicz', 'title:"Łojasiewicz"'],
+    ['abs:Łojasiewicz', 'abstract:"Łojasiewicz"'],
+    ['co:Kjærgaard', 'comment:"Kjærgaard"'],
+    ['jr:Øresund', 'journal_ref:"Øresund"'],
+  ])('emits %j as it always has', (query, matchExpr) => {
+    expect(mirrored(query).matchExpr).toBe(matchExpr);
+  });
+
+  // The fold's letter table is pinned in author-fold.test.ts; these cases wire it to each prefix.
+  it.each([
+    ['au:Tworzydło', 'authors:"Tworzydlo"'],
+    ['au:Atılgan', 'authors:"Atilgan"'],
+    ['au:Mikołaj AND au:Krupski', 'authors:"Mikolaj" AND authors:"Krupski"'],
+    ['au:"Tworzydło"', 'authors:"Tworzydlo"'],
+    ['au:Łącki-Kowalski', 'authors:"Lącki-Kowalski"'],
+    ['AU:ØSTERGÅRD', 'authors:"OSTERGÅRD"'],
+    ['au:Þorsteinsson', 'authors:"Thorsteinsson"'],
+    ['au:Meißner AND cat:nucl-th', 'authors:"Meissner"'],
+    ['au:Tworzydło AND cat:cond-mat', 'authors:"Tworzydlo"'],
+    [
+      'all:Tworzydło',
+      '(title:"Tworzydło" OR authors:"Tworzydlo" OR abstract:"Tworzydło" OR comment:"Tworzydło" OR journal_ref:"Tworzydło")',
+    ],
+    [
+      'all:Kjærgaard',
+      '(title:"Kjærgaard" OR authors:"Kjaergaard" OR abstract:"Kjærgaard" OR comment:"Kjærgaard" OR journal_ref:"Kjærgaard")',
+    ],
+    ['Tworzydło', splitArms('Tworzydło', 'Tworzydlo')],
+    ['Məmmədov', splitArms('Məmmədov', 'Mammadov')],
+    ['"Jakub Łącki"', splitArms('Jakub Łącki', 'Jakub Lącki')],
+    ['Tworzydło"J', splitArms('Tworzydło""J', 'Tworzydlo""J')],
+    // The split arms are one operand: every operator around them keeps its grouping.
+    ['a ANDNOT Tworzydło', `"a" NOT ${splitArms('Tworzydło', 'Tworzydlo')}`],
+    ['Tworzydło ANDNOT a', `${splitArms('Tworzydło', 'Tworzydlo')} NOT "a"`],
+    ['Beenakker Tworzydło', `"Beenakker" OR ${splitArms('Tworzydło', 'Tworzydlo')}`],
+    [
+      'ti:transport AND (Tworzydło OR all:Nørskov)',
+      `title:"transport" AND (${splitArms('Tworzydło', 'Tworzydlo')} OR (title:"Nørskov" OR authors:"Norskov" OR abstract:"Nørskov" OR comment:"Nørskov" OR journal_ref:"Nørskov"))`,
+    ],
+    ['ti:Tworzydło OR au:Tworzydło', 'title:"Tworzydło" OR authors:"Tworzydlo"'],
+  ])('emits %j with its author values folded', (query, matchExpr) => {
+    expect(mirrored(query).matchExpr).toBe(matchExpr);
+  });
+
+  // Folding maps a letter to letters, so a value is as many words folded as raw.
+  it.each(['au:"Mikołaj Krupski"', 'au:"Łącki J"', 'au:Łącki_J', 'au:Tworzydło,J'])(
+    'still routes %j live as more than one author word',
+    (query) => {
+      expect(translateQuery(query)).toEqual({ route: 'live', reason: 'multiword_author' });
+    },
+  );
+});
+
+// The bound is thread CPU; the wall-clock timeout only has to outlast a loaded machine.
+describe('translateQuery — linear on caller-sized author folds (issue #100)', {
+  timeout: 60_000,
+}, () => {
+  /**
+   * Per-call thread CPU of translating `input`, in ms: the least of five
+   * samples, each repeating the call until it has used ~20 ms of CPU.
+   */
+  const cpuMs = (input: string): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let sample = 0; sample < 5; sample++) {
+      const start = process.threadCpuUsage();
+      let calls = 0;
+      let usedMs = 0;
+      do {
+        translateQuery(input);
+        calls++;
+        const used = process.threadCpuUsage(start);
+        usedMs = (used.user + used.system) / 1000;
+      } while (usedMs < 20);
+      best = Math.min(best, usedMs / calls);
+    }
+    return best;
+  };
+
+  it.each([
+    ['one long au: word of fold letters', (n: number) => `au:${'ł'.repeat(n)}`],
+    ['one long au: word of two-letter folds', (n: number) => `au:${'ß'.repeat(n)}`],
+    ['an unprefixed phrase of fold letters', (n: number) => `"${'Tworzydło '.repeat(n / 10)}"`],
+    ['an all: phrase of fold letters', (n: number) => `all:"${'Nørskov '.repeat(n / 8)}"`],
+    ['adjacent unprefixed terms that each split', (n: number) => 'ł '.repeat(n / 2)],
+    ['a long au: digit run', (n: number) => `au:${'7'.repeat(n)}`],
+    ['a long line ending in a break', (n: number) => `${'§1 ł'.repeat(n / 4)}\ny`],
+    ['breaks throughout', (n: number) => 'ł \r\n'.repeat(n / 4)],
+  ])('stays linear for %s from 5k to 320k characters', (_shape, build) => {
+    const times: number[] = [];
+    for (let size = 5_000; size <= 320_000; size *= 2) {
+      const input = build(size);
+      const ms = cpuMs(input);
+      // Each size meets its bound before the next runs: 320k characters inside 325 ms of CPU.
+      expect(ms, `${size} characters took ${ms.toFixed(3)} ms`).toBeLessThan(5 + size / 1_000);
+      times.push(ms);
+    }
+    expect((times.at(-1) ?? 0) / (times[0] ?? 1), JSON.stringify(times)).toBeLessThan(256);
+  });
+});
+
 describe('translateQuery — linear on caller-sized input (issue #65)', () => {
   /** Thread CPU microseconds spent translating `input` once. */
   const cpuOf = (input: string): number => {
@@ -1380,7 +1504,7 @@ describe('cat: operand expansion', () => {
     expect(mirrored('cat:astro-ph*').categoryGroups.flat()).toContain('astro-ph.CO');
     expect(mirrored('cat:astro-ph*').categoryGroups.flat()).toContain('astro-ph');
     expect(mirrored('cat:math.*').categoryGroups.flat()).toContain('math.AG');
-    expect(mirrored('cat:math.*').categoryGroups.flat()).not.toContain('math-ph');
+    expect(mirrored('cat:math.*').categoryGroups.flat()).not.toContain('math');
   });
 });
 
@@ -1389,13 +1513,17 @@ describe('expandCategoryOperands — cat: in query text on the live path (issue 
     // arXiv matches `cat:cs` literally and never assigns the bare group name, so
     // the unexpanded operand reaches nothing at all upstream.
     expect(expandCategoryOperands('cat:cs')).toBe(categorySearchTerm('cs'));
-    expect(expandCategoryOperands('cat:cs')).toBe('cat:cs*');
+    // cs holds two aliases, whose canonical codes ride along (#99).
+    expect(expandCategoryOperands('cat:cs')).toBe('(cat:cs* OR cat:math.NA OR cat:eess.SY)');
     expect(expandCategoryOperands('cat:astro-ph')).toBe('cat:astro-ph*');
   });
 
   it('spells out an archive whose wildcard would leak a neighbouring archive', () => {
-    // `cat:math*` would also match math-ph, a physics archive.
-    expect(expandCategoryOperands('cat:math')).toBe('(cat:math.* OR cat:math)');
+    // `cat:math*` would also match math-ph, a physics archive, by prefix; it
+    // comes back only as the canonical code of math.MP (#99).
+    expect(expandCategoryOperands('cat:math')).toBe(
+      '(cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph)',
+    );
   });
 
   it('leaves a leaf code and a standalone archive exactly as written', () => {
@@ -1403,17 +1531,18 @@ describe('expandCategoryOperands — cat: in query text on the live path (issue 
     expect(expandCategoryOperands('cat:hep-th')).toBe('cat:hep-th');
   });
 
-  it('leaves an already-wildcarded operand alone', () => {
+  it('leaves an already-wildcarded operand alone unless it spans an alias', () => {
     expect(expandCategoryOperands('cat:astro-ph*')).toBe('cat:astro-ph*');
-    expect(expandCategoryOperands('cat:math.*')).toBe('cat:math.*');
+    expect(expandCategoryOperands('cat:astro-ph.*')).toBe('cat:astro-ph.*');
+    expect(expandCategoryOperands('cat:math.*')).toBe('(cat:math.* OR cat:cs.IT OR cat:math-ph)');
   });
 
   it('rewrites only the cat: operand, leaving the rest of the query byte-identical', () => {
     expect(expandCategoryOperands('ti:"deep learning" AND cat:cs ANDNOT au:hinton')).toBe(
-      'ti:"deep learning" AND cat:cs* ANDNOT au:hinton',
+      'ti:"deep learning" AND (cat:cs* OR cat:math.NA OR cat:eess.SY) ANDNOT au:hinton',
     );
     expect(expandCategoryOperands('(cat:cs OR cat:math.AG)  AND   spacing')).toBe(
-      '(cat:cs* OR cat:math.AG)  AND   spacing',
+      '((cat:cs* OR cat:math.NA OR cat:eess.SY) OR cat:math.AG)  AND   spacing',
     );
   });
 
@@ -1431,7 +1560,7 @@ describe('expandCategoryOperands — cat: in query text on the live path (issue 
   it('rewrites the same operands whatever the operator words around them', () => {
     // The live path forwards operator words as written; only the cat: operand changes.
     expect(expandCategoryOperands('ti:a and cat:cs AND NOT cat:math or cat:hep-th')).toBe(
-      'ti:a and cat:cs* AND NOT (cat:math.* OR cat:math) or cat:hep-th',
+      'ti:a and (cat:cs* OR cat:math.NA OR cat:eess.SY) AND NOT (cat:math.* OR cat:math OR cat:cs.IT OR cat:math-ph) or cat:hep-th',
     );
     // A prefix with nothing after it rewrites to itself, leaving the next word alone.
     expect(expandCategoryOperands('cat: cs')).toBe('cat: cs');
@@ -1454,6 +1583,40 @@ describe('expandCategoryOperands — cat: in query text on the live path (issue 
       expect([...viaLive].sort()).toEqual([...viaMirror].sort());
       expect(viaMirror).toEqual(categorySubtree(code));
     }
+  });
+});
+
+// Issue #99: arXiv's search indexes canonical codes only (`cat:cs.NA` totals 0
+// live), while the mirror's arXivRaw lists also carry the alias codes.
+describe('cat: naming an alias code (issue #99)', () => {
+  it('sends the canonical code live in place of an alias', () => {
+    expect(expandCategoryOperands('ti:polytopic AND ti:inequalities AND cat:cs.NA')).toBe(
+      'ti:polytopic AND ti:inequalities AND cat:math.NA',
+    );
+    expect(expandCategoryOperands('(cat:cs.SY OR cat:math.MP) AND au:smith')).toBe(
+      '(cat:eess.SY OR cat:math-ph) AND au:smith',
+    );
+  });
+
+  it('adds the canonical codes of the aliases a wildcard spans', () => {
+    expect(expandCategoryOperands('ti:polytopic AND cat:cs.*')).toBe(
+      'ti:polytopic AND (cat:cs.* OR cat:math.NA OR cat:eess.SY)',
+    );
+  });
+
+  it('filters the mirror on the canonical code alone, one code per alias', () => {
+    expect(mirrored('ti:polytopic AND cat:cs.NA').categoryGroups).toEqual([['math.NA']]);
+    expect(mirrored('cat:stat.TH').categoryGroups).toEqual([['math.ST']]);
+    // An OR set naming an alias and its canonical is one code.
+    expect(mirrored('cat:cs.NA OR cat:math.NA').categoryGroups).toEqual([['math.NA']]);
+  });
+
+  it('reads the live form of an archive holding aliases as the archive itself', () => {
+    const [group] = mirrored(expandCategoryOperands('cat:cs')).categoryGroups;
+    expect(group).toContain('math.NA');
+    expect(group).toContain('eess.SY');
+    expect(group).not.toContain('cs.NA');
+    expect([...(group ?? [])].sort()).toEqual([...categorySubtree('cs')].sort());
   });
 });
 

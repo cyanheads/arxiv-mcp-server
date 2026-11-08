@@ -1,17 +1,19 @@
--- arxiv-mcp-server OAI-PMH mirror schema v6 (issues #18 + #19 + #37 + #78 + #88 + #85 + #89)
+-- arxiv-mcp-server OAI-PMH mirror schema v7 (issues #18 + #19 + #37 + #78 + #88 + #85 + #89 + #100)
 -- v5's migration repairs the quote references a pre-v5 harvester stored
 -- undecoded in the papers text columns (repairQuoteReferences in store.ts),
 -- then defines the junction's paper_id index (the v5 block below). v6 changes
 -- no DDL: its migration converts the TeX a pre-v6 harvester stored in the
 -- papers text columns to Unicode, as the arXiv API serves it (convertTexText
--- in store.ts).
+-- in store.ts). v7 folds authors in the FTS index (the v7 block below) and
+-- its migration rebuilds the index (rebuildFtsIndex in store.ts).
 -- Review copy of schema.ts, which the writers' MirrorStore.open executes one
 -- statement at a time: the PRAGMAs first, then everything after them in one
--- write transaction (issue #71). The v4 and v5 blocks in the paper_categories
--- section run in that transaction only when it creates the file; on an older
--- file the same statements are the migration (migrateToV4 and migrateToV5 in
--- store.ts), so neither block's DDL runs up front against an older file. The
--- server's query-only connection runs none of it.
+-- write transaction (issue #71). The v7 block and the v4 and v5 blocks in the
+-- paper_categories section run in that transaction only when it creates the
+-- file; on an older file the same statements are the migration
+-- (rebuildFtsIndex, migrateToV4, and migrateToV5 in store.ts), so no block's
+-- DDL runs up front against an older file. The server's query-only
+-- connection runs none of it.
 
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -61,42 +63,52 @@ CREATE INDEX IF NOT EXISTS papers_primary_category_idx ON papers(primary_categor
 -- The date indexes on papers are defined in the v4 block below.
 
 -- ---------------------------------------------------------------------------
--- papers_fts — full-text index over title, authors, abstract, comment, and
--- journal_ref. The last two arrived in v3 so the documented `co:` and `jr:`
--- prefixes resolve on the mirror as they do on the live API (issue #37).
--- Tokenizer pinned: unicode61 with diacritic stripping and hyphen/underscore
--- preserved (issue #12 decision). No stemming — keeps results aligned with
--- arXiv's literal-match behavior.
+-- v7 (issue #100): papers_fts — full-text index over title, authors, abstract,
+-- comment, and journal_ref. The last two arrived in v3 so the documented `co:`
+-- and `jr:` prefixes resolve on the mirror as they do on the live API (issue
+-- #37). Tokenizer pinned: unicode61 with diacritic stripping and
+-- hyphen/underscore preserved (issue #12 decision). No stemming — keeps
+-- results aligned with arXiv's literal-match behavior.
+-- unicode61 folds only a letter that decomposes into a base letter and a mark;
+-- arXiv's author search also spells ł, ı, ø, đ, ð, þ, ħ, ŋ, ə, æ, œ, and ß in
+-- ASCII, so `authors` is folded by the nested replace() below (author-fold.ts
+-- generates it) in the content view and in every trigger. The index reads the
+-- view as its external content, so FTS5's 'rebuild' and its content-reading
+-- 'integrity-check' see the folded text too. Every column of papers_fts must
+-- appear in the view and all three triggers, or the index diverges from
+-- `papers` on the next write. Run at creation only, like the v4 and v5 blocks.
 -- ---------------------------------------------------------------------------
-CREATE VIRTUAL TABLE IF NOT EXISTS papers_fts USING fts5(
+CREATE VIEW papers_fts_source AS
+  SELECT rowid AS rid, title, replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(authors, 'ł', 'l'), 'Ł', 'L'), 'ı', 'i'), 'ø', 'o'), 'Ø', 'O'), 'đ', 'd'), 'Đ', 'D'), 'ð', 'd'), 'Ð', 'D'), 'þ', 'th'), 'Þ', 'Th'), 'ħ', 'h'), 'Ħ', 'H'), 'ŋ', 'n'), 'Ŋ', 'N'), 'ə', 'a'), 'Ə', 'A'), 'æ', 'ae'), 'Æ', 'Ae'), 'œ', 'oe'), 'Œ', 'Oe'), 'ß', 'ss'), 'ẞ', 'Ss') AS authors, abstract, comment, journal_ref
+  FROM papers;
+
+CREATE VIRTUAL TABLE papers_fts USING fts5(
   title,
   authors,
   abstract,
   comment,
   journal_ref,
-  content='papers',
-  content_rowid='rowid',
+  content='papers_fts_source',
+  content_rowid='rid',
   tokenize="unicode61 remove_diacritics 2 tokenchars '-_'"
 );
 
--- Sync triggers so writes to `papers` propagate to the FTS index. Every column
--- of papers_fts must appear in all three, or the index diverges from `papers`
--- on the next write.
-CREATE TRIGGER IF NOT EXISTS papers_ai AFTER INSERT ON papers BEGIN
+-- Sync triggers so writes to `papers` propagate to the FTS index.
+CREATE TRIGGER papers_ai AFTER INSERT ON papers BEGIN
   INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
-  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+  VALUES (new.rowid, new.title, replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(new.authors, 'ł', 'l'), 'Ł', 'L'), 'ı', 'i'), 'ø', 'o'), 'Ø', 'O'), 'đ', 'd'), 'Đ', 'D'), 'ð', 'd'), 'Ð', 'D'), 'þ', 'th'), 'Þ', 'Th'), 'ħ', 'h'), 'Ħ', 'H'), 'ŋ', 'n'), 'Ŋ', 'N'), 'ə', 'a'), 'Ə', 'A'), 'æ', 'ae'), 'Æ', 'Ae'), 'œ', 'oe'), 'Œ', 'Oe'), 'ß', 'ss'), 'ẞ', 'Ss'), new.abstract, new.comment, new.journal_ref);
 END;
 
-CREATE TRIGGER IF NOT EXISTS papers_ad AFTER DELETE ON papers BEGIN
+CREATE TRIGGER papers_ad AFTER DELETE ON papers BEGIN
   INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  VALUES ('delete', old.rowid, old.title, replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(old.authors, 'ł', 'l'), 'Ł', 'L'), 'ı', 'i'), 'ø', 'o'), 'Ø', 'O'), 'đ', 'd'), 'Đ', 'D'), 'ð', 'd'), 'Ð', 'D'), 'þ', 'th'), 'Þ', 'Th'), 'ħ', 'h'), 'Ħ', 'H'), 'ŋ', 'n'), 'Ŋ', 'N'), 'ə', 'a'), 'Ə', 'A'), 'æ', 'ae'), 'Æ', 'Ae'), 'œ', 'oe'), 'Œ', 'Oe'), 'ß', 'ss'), 'ẞ', 'Ss'), old.abstract, old.comment, old.journal_ref);
 END;
 
-CREATE TRIGGER IF NOT EXISTS papers_au AFTER UPDATE ON papers BEGIN
+CREATE TRIGGER papers_au AFTER UPDATE ON papers BEGIN
   INSERT INTO papers_fts(papers_fts, rowid, title, authors, abstract, comment, journal_ref)
-  VALUES ('delete', old.rowid, old.title, old.authors, old.abstract, old.comment, old.journal_ref);
+  VALUES ('delete', old.rowid, old.title, replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(old.authors, 'ł', 'l'), 'Ł', 'L'), 'ı', 'i'), 'ø', 'o'), 'Ø', 'O'), 'đ', 'd'), 'Đ', 'D'), 'ð', 'd'), 'Ð', 'D'), 'þ', 'th'), 'Þ', 'Th'), 'ħ', 'h'), 'Ħ', 'H'), 'ŋ', 'n'), 'Ŋ', 'N'), 'ə', 'a'), 'Ə', 'A'), 'æ', 'ae'), 'Æ', 'Ae'), 'œ', 'oe'), 'Œ', 'Oe'), 'ß', 'ss'), 'ẞ', 'Ss'), old.abstract, old.comment, old.journal_ref);
   INSERT INTO papers_fts(rowid, title, authors, abstract, comment, journal_ref)
-  VALUES (new.rowid, new.title, new.authors, new.abstract, new.comment, new.journal_ref);
+  VALUES (new.rowid, new.title, replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(new.authors, 'ł', 'l'), 'Ł', 'L'), 'ı', 'i'), 'ø', 'o'), 'Ø', 'O'), 'đ', 'd'), 'Đ', 'D'), 'ð', 'd'), 'Ð', 'D'), 'þ', 'th'), 'Þ', 'Th'), 'ħ', 'h'), 'Ħ', 'H'), 'ŋ', 'n'), 'Ŋ', 'N'), 'ə', 'a'), 'Ə', 'A'), 'æ', 'ae'), 'Æ', 'Ae'), 'œ', 'oe'), 'Œ', 'Oe'), 'ß', 'ss'), 'ẞ', 'Ss'), new.abstract, new.comment, new.journal_ref);
 END;
 
 -- ---------------------------------------------------------------------------
