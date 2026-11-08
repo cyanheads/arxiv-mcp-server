@@ -53,7 +53,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 
 - Query supports field prefixes `ti:`, `au:`, `abs:`, `cat:`, `co:`, `jr:`, `all:` and `AND` / `OR` / `ANDNOT`, up to 1000 characters; `category` takes a code (`cs.CL`) or a whole archive (`astro-ph`, `cs`, `math`)
 - Query grammar follows arXiv's: space-separated terms are joined with `OR` (write `AND` to require every term), operators are uppercase only, and all three share one precedence grouped to the right (`a AND b OR c` is `a AND (b OR c)`). Quote a multi-word topic (`"graph neural networks" AND cat:cs.LG`) and put alternatives in parentheses before a filter; arXiv ignores common words such as `of` and `the` outside a quoted phrase
-- Sorts by `sort_by` (`relevance` / `submitted` / `updated`) and `sort_order`, with `submitted_from` / `submitted_to` as inclusive UTC `YYYY-MM-DD` bounds; up to 50 results per call (a larger `max_results` returns 50)
+- Sorts by `sort_by` (`relevance` / `submitted` / `updated`, in any case; arXiv's own `submittedDate` / `lastUpdatedDate` read as `submitted` / `updated`) and `sort_order`, with `submitted_from` / `submitted_to` as inclusive UTC `YYYY-MM-DD` bounds; up to 50 results per call (a larger `max_results` returns 50)
 - arXiv serves only the first 10,000 results of a query; a `start` of 10,000 fails `start_beyond_result_limit`. Use date windows to go further
 - Output echoes the effective query, total match count, and page offset; empty pages carry recovery guidance instead of an error. A total that is a floor (the local mirror counting to 50,000) carries `totalFoundIsLowerBound: true`
 
@@ -74,7 +74,7 @@ arXiv papers, metadata, and full text from the arXiv API and its OAI-PMH metadat
 - ar5iv keeps one render per paper, so an ar5iv body may be another revision than `paper_id` and carries `revision_unconfirmed: true`, unless the read named no version and arXiv's API reported v1 as the paper's only version; `pdf_url` is exactly the `paper_id` revision
 - `max_characters` defaults to 100,000 (pass `null` for the whole paper); page with `start`. The first page carries an `outline` of section headings with offsets
 - `paper_id` accepts the same ID spellings as `arxiv_get_metadata`
-- Fails `invalid_id`, `no_match` (arXiv has no such paper, or no such version of it), `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (the PDF has no text layer or does not parse), `version_unavailable` (version-pinned ID needs the live API), or `version_not_served` (a superseded pre-2007 version arXiv will not serve; names the latest version and this version's PDF)
+- Fails `invalid_id`, `no_match` (arXiv has no such paper, or no such version of it), `content_unavailable` (no render, no PDF), `pdf_extraction_failed` (the PDF has no text layer or does not parse), `version_unavailable` (arXiv is unreachable and the local mirror holds another version of the pinned ID), or `version_not_served` (a superseded pre-2007 version arXiv will not serve; names the latest version and this version's PDF)
 
 ---
 
@@ -186,7 +186,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 ### Installation
 

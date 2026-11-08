@@ -4,7 +4,7 @@ description: Resolve citations to arXiv IDs, find an author's papers, follow a p
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## Scope
@@ -25,20 +25,21 @@ References carry IDs in forms the tools reject. Strip them first:
 |:--|:--|
 | `CoRR abs/1409.0473` (DBLP-style computer-science references) | `1409.0473` |
 | `10.48550/arXiv.1706.03762`, or its doi.org URL (arXiv's own DOI) | `1706.03762` |
-| `arXiv preprint arXiv:1607.06450`, an `arxiv.org/abs/…` URL | as written |
+| `arXiv preprint arXiv:1607.06450` | `arXiv:1607.06450` |
+| an `arxiv.org/abs/…` URL | as written |
 
-A paper's `doi` field is the journal version's DOI, never arXiv's. The `id` the tools return carries the latest version suffix; an ID without one means the latest version.
+A paper's `doi` field is the journal version's DOI, never arXiv's. An ID without a version suffix means the latest version, and the `id` the tools return for it carries the latest version's suffix (on a mirror, the latest as of its last refresh); a pinned ID comes back as that version.
 
 ## Gates
 
 - **Missing `journal_ref` or `doi` does not mean unpublished.** Authors add both by hand, and many never do: 1706.03762, a NeurIPS 2017 paper, has neither. arXiv tells authors to put acceptance notes in `comment` instead (1206.4635's reads "ICML2012"). Check `comment`, then a scholarly-graph server, before calling a paper unpublished.
-- **A quoted full name can miss name variants.** Author names are free text that differ from paper to paper: middle initials come and go. A quoted name such as `au:"geoffrey hinton"` matches a paper when one author's name holds every quoted word, in any order and with other words between them, so `Geoffrey E. Hinton` matches; an initial does not match a spelled-out first name, so `au:"hinton g"` misses him. For an author's papers, search the surname alone, narrow with a category, a topic word, or a co-author's surname, then check each `authors` list yourself. arXiv has no author identifiers, so one name can be several people: confirm by co-authors and subject.
-- **A category filter includes cross-lists.** `cat:cs.LG`, or `cs.LG` as `category`, matches every paper listing cs.LG in `categories`, primary or not: 1206.6445, primary cs.CV, comes back for cs.LG. For a field's own papers, keep those whose `primary_category` matches.
+- **A quoted full name can miss name variants.** Author names are free text that differ from paper to paper: middle initials come and go. A quoted name such as `au:"geoffrey hinton"` matches a paper when one author's name holds every quoted word, in any order and with other words between them, so `Geoffrey E. Hinton` matches; an initial does not match a spelled-out first name, so `au:"hinton g"` misses him. For an author's papers, search the surname alone, narrow with a category, a topic word, or a co-author's surname, then check each `authors` list yourself. A surname holding `ł`, `ı`, `ø`, `đ`, `ð`, `þ`, `ħ`, `ŋ`, `ə`, `æ`, `œ`, or `ß` matches its ASCII spelling too, whether arXiv or a deployment's local mirror answers: `au:Tworzydlo` and `au:Tworzydło` find the same papers. A digraph spelling may not: arXiv matches `au:Mueller` to `Müller` and `au:Noerskov` to `Nørskov`, a mirror only to the spelling written, so search both spellings. arXiv has no author identifiers, so one name can be several people: confirm by co-authors and subject.
+- **A category filter includes cross-lists.** `cat:cs.LG`, or `cs.LG` as `category`, matches every paper listing cs.LG in `categories`, primary or not: 1206.6445, primary cs.CV, comes back for cs.LG. For a field's own papers, keep those whose `primary_category` matches. `categories` and `primary_category` hold canonical codes only: an alias filter such as `cs.NA` matches the papers listing math.NA, and no paper lists cs.NA, so compare against the canonical code (cs.NA → math.NA, cs.SY → eess.SY, math.IT → cs.IT, math.MP → math-ph, stat.TH → math.ST, q-fin.EC → econ.GN).
 - **The date window is the first version's date.** `submitted_from` and `submitted_to` filter on `published`, the v1 submission: a paper posted in 2022 and revised in 2024 falls outside a 2024 window. To find recent revisions, sort by `updated`.
 - **A citation's year is the venue's, not arXiv's.** The two can be years apart: 1205.2614, posted in 2012, carries the comment "Appears in … UAI2009". Widen a year window, or drop it and match on author and title words.
 - **Absence needs a second search.** Before reporting that arXiv has no such paper, search again with the first author's surname and one distinctive title word, no window and no category.
 - **arXiv's API is one shared lane.** The server sends arXiv API requests one at a time, 3 s apart, across every caller, so parallel calls only queue. Batch IDs into one `arxiv_get_metadata` call (10 looked up per call) rather than one call per paper. A timeout usually means arXiv itself is slow: retry later, not at once.
-- **A pinned version always needs arXiv's live API.** A deployment's local mirror holds only the latest version, so while arXiv is slow a `vN` lookup can time out where the same ID without the suffix still answers.
+- **A pinned version the mirror does not hold needs arXiv's live API.** A deployment's local mirror holds each paper at one version, the latest as of its last refresh, and answers a pin of that version itself. While arXiv is slow, a pin of any other version can time out where the same ID without the suffix still answers.
 
 ## Workflows
 
